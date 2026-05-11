@@ -1,0 +1,6 @@
+{
+  "name": "Algorithm Inversion Visualizer",
+  "description": "An interactive visualizer for XOR, OR, SHA-256 hashes, and Transformer architectures, exploring the mathematical limits of reversibility and information loss.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
