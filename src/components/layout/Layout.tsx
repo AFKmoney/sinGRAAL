@@ -7,6 +7,7 @@ import { HashVisualizer } from '../visualizers/HashVisualizer';
 import { TransformerVisualizer } from '../visualizers/TransformerVisualizer';
 import { InvertibleTransformerVisualizer } from '../visualizers/InvertibleTransformerVisualizer';
 import { SATInverterVisualizer } from '../visualizers/SATInverterVisualizer';
+import { ECPuzzleVisualizer } from '../visualizers/ECPuzzleVisualizer';
 
 export function Layout() {
   const [selectedAlg, setSelectedAlg] = useState<AlgorithmType>('and');
@@ -23,6 +24,7 @@ export function Layout() {
         {selectedAlg === 'transformer' && <TransformerVisualizer />}
         {selectedAlg === 'invertible-transformer' && <InvertibleTransformerVisualizer />}
         {selectedAlg === 'sat-inverter' && <SATInverterVisualizer />}
+        {selectedAlg === 'ec-puzzle' && <ECPuzzleVisualizer />}
       </main>
     </div>
   );
