@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import {
   encodeSHA256,
   constrainHash,
-  solveDPLL,
+  solveCDCL,
   extractInput,
   type SolveStats,
 } from '../../sat/sha256sat';
@@ -71,7 +71,10 @@ interface SolverState {
   status: 'sat' | 'unsat' | 'cancelled' | null;
 }
 
-const EMPTY_STATS: SolveStats = { decisions: 0, propagations: 0, backtracks: 0, nodesExplored: 0 };
+const EMPTY_STATS: SolveStats = {
+  decisions: 0, propagations: 0, conflicts: 0,
+  learnedClauses: 0, backjumps: 0, maxBackjump: 0,
+};
 
 export function SATInverterVisualizer() {
   const [rounds, setRounds] = useState(4);
@@ -124,10 +127,11 @@ export function SATInverterVisualizer() {
     await new Promise(r => setTimeout(r, 30));
     if (cancelRef.current.cancelled) return;
 
-    const result = await solveDPLL(
+    const result = await solveCDCL(
       allClauses,
-      (stats, assignment) => {
-        setSolver(s => ({ ...s, stats: { ...stats }, numAssigned: assignment.size }));
+      enc.numVars,
+      (stats, assigned) => {
+        setSolver(s => ({ ...s, stats: { ...stats }, numAssigned: assigned }));
       },
       cancelRef.current
     );
@@ -177,12 +181,12 @@ export function SATInverterVisualizer() {
           {/* Header */}
           <header className="space-y-2">
             <h2 className="text-2xl font-light tracking-widest text-white uppercase">
-              CNF / DPLL
+              CNF / CDCL
               <span className="text-[10px] text-zinc-500 font-mono align-top ml-3">SHA-256 RÉDUIT — ENCODAGE BOOLÉEN</span>
             </h2>
             <p className="text-[10px] text-zinc-500 uppercase tracking-tighter max-w-3xl leading-relaxed">
               SHA-256 réduit encodé comme système de clauses CNF (Tseitin).
-              Le solveur DPLL explore le préimage par propagation de contraintes + backtracking.
+              Le solveur CDCL encode SHA-256 en clauses CNF (Tseitin), apprend des clauses aux conflits (First UIP), et backjumpe de façon non-chronologique — state of the art.
               Contrairement au brute-force, chaque contradiction élimine un sous-espace entier.
             </p>
           </header>
@@ -260,7 +264,7 @@ export function SATInverterVisualizer() {
                 disabled={targetHash.length !== 64 || solver.phase === 'solving' || solver.phase === 'building'}
                 className="px-5 py-2.5 bg-zinc-100 text-black text-[10px] font-bold uppercase tracking-widest hover:bg-white rounded transition disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2"
               >
-                <Play className="w-3 h-3" /> Résoudre (DPLL)
+                <Play className="w-3 h-3" /> Résoudre (CDCL)
               </button>
               {(solver.phase === 'solving' || solver.phase === 'building') && (
                 <button onClick={stop}
@@ -295,7 +299,7 @@ export function SATInverterVisualizer() {
               <div className="space-y-3">
                 <div className="text-[9px] text-zinc-500 uppercase tracking-widest flex items-center gap-2">
                   {solver.phase === 'solving' && <Zap className="w-3 h-3 animate-pulse text-yellow-500" />}
-                  {solver.phase === 'solving' ? 'DPLL en cours...' :
+                  {solver.phase === 'solving' ? 'CDCL en cours...' :
                    solver.status === 'sat' ? 'SAT — préimage trouvée' :
                    solver.status === 'unsat' ? 'UNSAT — aucun préimage dans cet espace' :
                    'Annulé'}
@@ -320,16 +324,18 @@ export function SATInverterVisualizer() {
                 )}
 
                 {/* Stats grid */}
-                <div className="grid grid-cols-4 gap-2 text-[9px] font-mono">
+                <div className="grid grid-cols-3 gap-2 text-[9px] font-mono">
                   {[
                     { label: 'Décisions', val: solver.stats.decisions, color: 'text-cyan-400' },
+                    { label: 'Conflits', val: solver.stats.conflicts, color: 'text-red-400' },
                     { label: 'Propagations', val: solver.stats.propagations, color: 'text-purple-400' },
-                    { label: 'Backtracks', val: solver.stats.backtracks, color: 'text-orange-400' },
-                    { label: 'Noeuds', val: solver.stats.nodesExplored, color: 'text-zinc-300' },
-                  ].map(({ label, val, color }) => (
+                    { label: 'Clauses apprises', val: solver.stats.learnedClauses, color: 'text-yellow-400' },
+                    { label: 'Backjumps', val: solver.stats.backjumps, color: 'text-orange-400' },
+                    { label: 'Max backjump', val: solver.stats.maxBackjump, color: 'text-emerald-400', suffix: ' niveaux' },
+                  ].map(({ label, val, color, suffix }) => (
                     <div key={label} className="bg-zinc-900/50 border border-zinc-800 p-2 rounded">
                       <div className="text-zinc-600 uppercase tracking-widest text-[8px] mb-1">{label}</div>
-                      <div className={`font-bold ${color}`}>{val.toLocaleString()}</div>
+                      <div className={`font-bold ${color}`}>{val.toLocaleString()}{suffix ?? ''}</div>
                     </div>
                   ))}
                 </div>
@@ -349,9 +355,11 @@ export function SATInverterVisualizer() {
                   </div>
                   <div className="font-mono text-2xl text-emerald-400">"{solver.result}"</div>
                   <div className="text-[9px] text-zinc-500 font-mono pt-2 border-t border-emerald-500/10 space-y-0.5">
-                    <div>{solver.stats.propagations.toLocaleString()} propagations · {solver.stats.decisions} décisions · {solver.stats.backtracks} backtracks</div>
+                    <div>
+                      {solver.stats.conflicts} conflits · {solver.stats.learnedClauses} clauses apprises · backjump max {solver.stats.maxBackjump} niveaux
+                    </div>
                     <div className="text-zinc-600">
-                      Le solveur a exploré {solver.stats.nodesExplored} nœuds au lieu de 2^{inputBytes * 8} = {Math.pow(2, inputBytes * 8).toLocaleString()} pour un brute-force exhaustif.
+                      CDCL: {solver.stats.decisions} décisions vs 2^{inputBytes * 8} = {Math.pow(2, inputBytes * 8).toLocaleString()} pour un brute-force. Chaque conflit élimine un sous-espace entier.
                     </div>
                   </div>
                 </motion.div>
@@ -377,8 +385,7 @@ export function SATInverterVisualizer() {
             <div className="text-[10px] text-zinc-400 uppercase tracking-widest font-bold">Roadmap</div>
             {[
               { label: 'Encodage Tseitin + DPLL', done: true, desc: 'XOR/AND/NOT/ADD → clauses CNF · propagation de contraintes' },
-              { label: 'CDCL (Conflict-Driven Clause Learning)', done: false, desc: 'Apprendre des conflits pour éviter de les répéter — état de l\'art des SAT solvers' },
-              { label: 'VSIDS heuristic', done: false, desc: 'Variable State Independent Decaying Sum — meilleur choix de variable à brancher' },
+              { label: 'CDCL + First UIP + VSIDS', done: true, desc: 'Conflict-Driven Clause Learning · backjump non-chronologique · activité des variables' },
               { label: 'Analyse différentielle', done: false, desc: 'Propager les différences pour contraindre le schedule W' },
               { label: 'Extension à SHA-256 complet (64R)', done: false, desc: 'Horizon ouvert — nécessite des avancées en cryptanalyse' },
             ].map((step, i) => (

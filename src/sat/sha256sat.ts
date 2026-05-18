@@ -308,16 +308,24 @@ export function constrainHash(enc: EncodedSHA256, targetHash: string): Clause[] 
   return extra;
 }
 
-// ─── DPLL Solver ──────────────────────────────────────────────────────────────
+// ─── CDCL Solver ─────────────────────────────────────────────────────────────
+//
+// Conflict-Driven Clause Learning with:
+//   - First UIP conflict analysis
+//   - Non-chronological backjumping
+//   - VSIDS variable activity heuristic
+//   - Naive (non-watched) clause evaluation (sufficient for our instances)
 
 export interface SolveStats {
   decisions: number;
   propagations: number;
-  backtracks: number;
-  nodesExplored: number;
+  conflicts: number;
+  learnedClauses: number;
+  backjumps: number;
+  maxBackjump: number;
 }
 
-export type SolveStatus = 'sat' | 'unsat' | 'running' | 'cancelled';
+export type SolveStatus = 'sat' | 'unsat' | 'cancelled';
 
 export interface SolveResult {
   status: SolveStatus;
@@ -325,147 +333,281 @@ export interface SolveResult {
   stats: SolveStats;
 }
 
-function evalClause(
-  clause: Clause,
-  assignment: Map<number, boolean>
-): boolean | undefined {
-  let hasUndef = false;
-  for (const lit of clause) {
+class CDCLSolver {
+  private readonly n: number;               // numVars
+  private readonly base: Clause[];          // original clauses
+  private learned: Clause[] = [];
+
+  // Per-variable state (indexed 1..n)
+  private val: (boolean | undefined)[];     // current assignment
+  private lvl: number[];                    // decision level of assignment
+  private rsn: (Clause | null)[];           // reason clause (null = decision)
+  private act: number[];                    // VSIDS activity
+  private varInc = 1.0;
+  private readonly varDecay = 0.95;
+
+  // Trail
+  private trail: number[] = [];
+  private trailLim: number[] = [];          // trail[trailLim[d]] = first var decided at level d+1
+  private dl = 0;                           // current decision level
+
+  constructor(n: number, clauses: Clause[]) {
+    this.n = n;
+    this.base = clauses;
+    this.val  = new Array(n + 1).fill(undefined);
+    this.lvl  = new Array(n + 1).fill(-1);
+    this.rsn  = new Array(n + 1).fill(null);
+    this.act  = new Array(n + 1).fill(0);
+  }
+
+  // ── Literal evaluation ──────────────────────────────────────────────────────
+
+  private litVal(lit: Lit): boolean | undefined {
     const v = Math.abs(lit);
-    const val = assignment.get(v);
-    if (val === undefined) { hasUndef = true; continue; }
-    if (val === (lit > 0)) return true;
+    const a = this.val[v];
+    if (a === undefined) return undefined;
+    return lit > 0 ? a : !a;
   }
-  return hasUndef ? undefined : false;
-}
 
-function unitPropagate(
-  clauses: Clause[],
-  assignment: Map<number, boolean>,
-  stats: SolveStats,
-  added: number[]
-): boolean {
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const clause of clauses) {
-      const e = evalClause(clause, assignment);
-      if (e === true) continue;
-      if (e === false) return true; // conflict
+  // ── Assignment / unassignment ───────────────────────────────────────────────
 
-      // Find unset literals
-      let forceLit: Lit | null = null;
-      let unsetCount = 0;
-      for (const lit of clause) {
-        if (!assignment.has(Math.abs(lit))) {
-          unsetCount++;
-          forceLit = lit;
+  private assign(v: number, polarity: boolean, reason: Clause | null): void {
+    this.val[v] = polarity;
+    this.lvl[v] = this.dl;
+    this.rsn[v] = reason;
+    this.trail.push(v);
+  }
+
+  private unassign(v: number): void {
+    this.val[v] = undefined;
+    this.lvl[v] = -1;
+    this.rsn[v] = null;
+  }
+
+  // ── Unit propagation ────────────────────────────────────────────────────────
+  // Returns the first conflict clause found, or null if no conflict.
+
+  private propagate(): Clause | null {
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const clause of this.allClauses()) {
+        let unset: Lit | null = null;
+        let unsetCnt = 0;
+        let sat = false;
+
+        for (const lit of clause) {
+          const lv = this.litVal(lit);
+          if (lv === true) { sat = true; break; }
+          if (lv === undefined) { unset = lit; unsetCnt++; if (unsetCnt > 1) break; }
         }
-      }
-      if (unsetCount === 0) return true; // conflict (all false)
-      if (unsetCount === 1 && forceLit !== null) {
-        const v = Math.abs(forceLit);
-        if (!assignment.has(v)) {
-          assignment.set(v, forceLit > 0);
-          added.push(v);
-          stats.propagations++;
-          changed = true;
+
+        if (sat) continue;
+        if (unsetCnt === 0) return clause;   // all-false → conflict
+
+        if (unsetCnt === 1 && unset !== null) {
+          const v = Math.abs(unset);
+          if (this.val[v] === undefined) {
+            this.assign(v, unset > 0, clause);
+            changed = true;
+            break; // restart scan after new assignment
+          }
         }
       }
     }
-  }
-  return false;
-}
-
-async function dpllRecurse(
-  clauses: Clause[],
-  assignment: Map<number, boolean>,
-  stats: SolveStats,
-  onProgress: ((s: SolveStats, a: Map<number, boolean>) => void) | undefined,
-  cancelRef: { cancelled: boolean },
-  progressCounter: { n: number }
-): Promise<boolean> {
-  if (cancelRef.cancelled) return false;
-
-  stats.nodesExplored++;
-  progressCounter.n++;
-
-  if (progressCounter.n % 200 === 0) {
-    onProgress?.(stats, assignment);
-    await new Promise(r => setTimeout(r, 0)); // yield to UI
-    if (cancelRef.cancelled) return false;
+    return null;
   }
 
-  const propagated: number[] = [];
-  const conflict = unitPropagate(clauses, assignment, stats, propagated);
-
-  if (conflict) {
-    for (const v of propagated) assignment.delete(v);
-    return false;
+  private allClauses(): Clause[] {
+    return this.base.concat(this.learned);
   }
 
-  // Check all clauses
-  let allSat = true;
-  for (const clause of clauses) {
-    const e = evalClause(clause, assignment);
-    if (e === false) {
-      for (const v of propagated) assignment.delete(v);
-      return false;
-    }
-    if (e === undefined) allSat = false;
-  }
-  if (allSat) return true;
+  // ── Conflict analysis — First UIP scheme ────────────────────────────────────
 
-  // Choose first unassigned variable from first undetermined clause
-  let chosen: number | null = null;
-  outer: for (const clause of clauses) {
-    if (evalClause(clause, assignment) !== undefined) continue;
-    for (const lit of clause) {
+  private analyze(conflict: Clause): [Clause, number] {
+    const seen = new Uint8Array(this.n + 1);
+    const learnt: Lit[] = [];
+    let counter = 0; // # vars at current level still to resolve
+
+    const markLit = (lit: Lit) => {
       const v = Math.abs(lit);
-      if (!assignment.has(v)) { chosen = v; break outer; }
+      if (seen[v] || this.lvl[v] === 0) return;
+      seen[v] = 1;
+      this.bumpVar(v);
+      if (this.lvl[v] === this.dl) counter++;
+      else learnt.push(lit);
+    };
+
+    for (const lit of conflict) markLit(lit);
+
+    let ti = this.trail.length - 1;
+    let uip = 0;
+
+    while (counter > 0) {
+      // Walk trail backwards to find last-assigned seen variable
+      while (!seen[this.trail[ti]]) ti--;
+      const v = this.trail[ti--];
+      seen[v] = 0;
+      counter--;
+
+      if (counter === 0) { uip = v; break; }
+
+      const reason = this.rsn[v];
+      if (reason !== null) {
+        for (const lit of reason) {
+          if (Math.abs(lit) !== v) markLit(lit);
+        }
+      } else {
+        // Decision variable encountered before UIP: treat as terminal
+        uip = v;
+        break;
+      }
+    }
+
+    // UIP literal (negated polarity → will be forced after backjump)
+    learnt.push(this.val[uip] ? -uip : uip);
+
+    // Backjump level = highest level among non-UIP literals in learnt
+    let backLvl = 0;
+    for (const lit of learnt) {
+      if (Math.abs(lit) === uip) continue;
+      const lv = this.lvl[Math.abs(lit)];
+      if (lv > backLvl) backLvl = lv;
+    }
+
+    // Swap UIP literal to position 0 for easy access after backjump
+    const last = learnt.length - 1;
+    [learnt[0], learnt[last]] = [learnt[last], learnt[0]];
+
+    return [learnt, backLvl];
+  }
+
+  // ── VSIDS ───────────────────────────────────────────────────────────────────
+
+  private bumpVar(v: number): void {
+    this.act[v] += this.varInc;
+    if (this.act[v] > 1e100) {
+      for (let i = 1; i <= this.n; i++) this.act[i] *= 1e-100;
+      this.varInc *= 1e-100;
     }
   }
 
-  if (chosen === null) {
-    for (const v of propagated) assignment.delete(v);
-    return false;
+  private decayVars(): void { this.varInc /= this.varDecay; }
+
+  private pickVar(): number | null {
+    let best = -1, bestA = -1;
+    for (let v = 1; v <= this.n; v++) {
+      if (this.val[v] !== undefined) continue;
+      if (this.act[v] > bestA) { bestA = this.act[v]; best = v; }
+    }
+    return best === -1 ? null : best;
   }
 
-  stats.decisions++;
+  // ── Backjump ────────────────────────────────────────────────────────────────
 
-  // Branch true
-  assignment.set(chosen, true);
-  if (await dpllRecurse(clauses, assignment, stats, onProgress, cancelRef, progressCounter)) return true;
-  assignment.delete(chosen);
+  private backjump(toLvl: number): void {
+    while (this.trail.length > 0 && this.lvl[this.trail[this.trail.length - 1]] > toLvl) {
+      this.unassign(this.trail.pop()!);
+    }
+    while (this.trailLim.length > toLvl) this.trailLim.pop();
+    this.dl = toLvl;
+  }
 
-  stats.backtracks++;
+  // ── Main CDCL loop ──────────────────────────────────────────────────────────
 
-  // Branch false
-  assignment.set(chosen, false);
-  if (await dpllRecurse(clauses, assignment, stats, onProgress, cancelRef, progressCounter)) return true;
-  assignment.delete(chosen);
+  async solve(
+    onProgress?: (stats: SolveStats, assigned: number) => void,
+    cancelRef?: { cancelled: boolean }
+  ): Promise<SolveResult> {
+    const stats: SolveStats = {
+      decisions: 0, propagations: 0, conflicts: 0,
+      learnedClauses: 0, backjumps: 0, maxBackjump: 0,
+    };
 
-  for (const v of propagated) assignment.delete(v);
-  return false;
+    let iter = 0;
+
+    while (true) {
+      if (cancelRef?.cancelled) {
+        return { status: 'cancelled', assignment: new Map(), stats };
+      }
+
+      iter++;
+      if (iter % 400 === 0) {
+        onProgress?.(stats, this.trail.length);
+        await new Promise(r => setTimeout(r, 0));
+        if (cancelRef?.cancelled) return { status: 'cancelled', assignment: new Map(), stats };
+      }
+
+      // ── Propagate ──────────────────────────────────────────────────────────
+      const conflict = this.propagate();
+      stats.propagations++;
+
+      if (conflict !== null) {
+        stats.conflicts++;
+
+        if (this.dl === 0) {
+          return { status: 'unsat', assignment: new Map(), stats };
+        }
+
+        const [learnedClause, backLvl] = this.analyze(conflict);
+        const jump = this.dl - backLvl;
+        if (jump > stats.maxBackjump) stats.maxBackjump = jump;
+        stats.backjumps++;
+        stats.learnedClauses++;
+
+        this.learned.push(learnedClause);
+        this.backjump(backLvl);
+        this.decayVars();
+
+        // Force the UIP literal (now the only unset lit in the learned clause)
+        const uipLit = learnedClause[0];
+        const uipVar = Math.abs(uipLit);
+        if (this.val[uipVar] === undefined) {
+          this.assign(uipVar, uipLit > 0, learnedClause);
+        }
+
+      } else {
+        // ── Check satisfaction ──────────────────────────────────────────────
+        let allAssigned = true;
+        for (let v = 1; v <= this.n; v++) {
+          if (this.val[v] === undefined) { allAssigned = false; break; }
+        }
+
+        if (allAssigned) {
+          const asgn = new Map<number, boolean>();
+          for (let v = 1; v <= this.n; v++) {
+            if (this.val[v] !== undefined) asgn.set(v, this.val[v]!);
+          }
+          return { status: 'sat', assignment: asgn, stats };
+        }
+
+        // ── Decide ─────────────────────────────────────────────────────────
+        const v = this.pickVar();
+        if (v === null) {
+          const asgn = new Map<number, boolean>();
+          for (let i = 1; i <= this.n; i++) {
+            if (this.val[i] !== undefined) asgn.set(i, this.val[i]!);
+          }
+          return { status: 'sat', assignment: asgn, stats };
+        }
+
+        this.dl++;
+        this.trailLim.push(this.trail.length);
+        stats.decisions++;
+        this.assign(v, true, null);
+      }
+    }
+  }
 }
 
-export async function solveDPLL(
+export async function solveCDCL(
   allClauses: Clause[],
-  onProgress?: (stats: SolveStats, assignment: Map<number, boolean>) => void,
+  numVars: number,
+  onProgress?: (stats: SolveStats, assigned: number) => void,
   cancelRef?: { cancelled: boolean }
 ): Promise<SolveResult> {
-  const stats: SolveStats = { decisions: 0, propagations: 0, backtracks: 0, nodesExplored: 0 };
-  const assignment = new Map<number, boolean>();
-  const cancel = cancelRef ?? { cancelled: false };
-  const counter = { n: 0 };
-
-  const sat = await dpllRecurse(allClauses, assignment, stats, onProgress, cancel, counter);
-
-  return {
-    status: cancel.cancelled ? 'cancelled' : sat ? 'sat' : 'unsat',
-    assignment,
-    stats,
-  };
+  const solver = new CDCLSolver(numVars, allClauses);
+  return solver.solve(onProgress, cancelRef);
 }
 
 // ─── Extract input bytes from a satisfying assignment ────────────────────────
