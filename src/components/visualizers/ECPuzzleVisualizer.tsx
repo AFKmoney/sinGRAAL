@@ -11,7 +11,7 @@ import {
   type TinyCurveParams,
   type ECDLPEncoding,
 } from '../../sat/ecsat';
-import { solveCDCL, type SolveStats } from '../../sat/sha256sat';
+import { solveRust as solveCDCL, type RustSolveStats as SolveStats } from '../../sat/rustSolver';
 
 // Mersenne primes only (required for our efficient modular reduction encoding)
 

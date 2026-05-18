@@ -4,10 +4,10 @@ import { motion, AnimatePresence } from 'motion/react';
 import {
   encodeSHA256,
   constrainHash,
-  solveCDCL,
   extractInput,
   type SolveStats,
 } from '../../sat/sha256sat';
+import { solveRust as solveCDCL } from '../../sat/rustSolver';
 
 // ─── Reduced SHA-256 (for the hash generator) ─────────────────────────────────
 
