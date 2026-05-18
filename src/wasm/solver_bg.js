@@ -56,6 +56,26 @@ export class WasmSolver {
         return v1;
     }
     /**
+     * Return all unit-forced literals as JSON array [{var, val}].
+     * These are bits of k that CDCL has proven must have a specific value.
+     * @param {Int32Array} k_lits
+     * @returns {string}
+     */
+    get_forced_bits(k_lits) {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ptr0 = passArray32ToWasm0(k_lits, wasm.__wbindgen_malloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ret = wasm.wasmsolver_get_forced_bits(this.__wbg_ptr, ptr0, len0);
+            deferred2_0 = ret[0];
+            deferred2_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
      * @param {number} num_vars
      */
     constructor(num_vars) {
@@ -63,6 +83,17 @@ export class WasmSolver {
         this.__wbg_ptr = ret;
         WasmSolverFinalization.register(this, this.__wbg_ptr, this);
         return this;
+    }
+    /**
+     * Number of bits proven at level-0 (invariant constraints from CDCL)
+     * @param {Int32Array} k_lits
+     * @returns {number}
+     */
+    proven_bit_count(k_lits) {
+        const ptr0 = passArray32ToWasm0(k_lits, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmsolver_proven_bit_count(this.__wbg_ptr, ptr0, len0);
+        return ret >>> 0;
     }
     /**
      * Run up to max_conflicts CDCL steps. Returns JSON status string.

@@ -26,7 +26,16 @@ export class WasmSolver {
      * val[i] = 1 (true), -1 (false), 0 (unset)
      */
     get_assignment(): Int8Array;
+    /**
+     * Return all unit-forced literals as JSON array [{var, val}].
+     * These are bits of k that CDCL has proven must have a specific value.
+     */
+    get_forced_bits(k_lits: Int32Array): string;
     constructor(num_vars: number);
+    /**
+     * Number of bits proven at level-0 (invariant constraints from CDCL)
+     */
+    proven_bit_count(k_lits: Int32Array): number;
     /**
      * Run up to max_conflicts CDCL steps. Returns JSON status string.
      */

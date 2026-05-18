@@ -441,4 +441,32 @@ impl WasmSolver {
     pub fn assigned_count(&self) -> u32 {
         self.inner.assigned
     }
+
+    /// Return all unit-forced literals as JSON array [{var, val}].
+    /// These are bits of k that CDCL has proven must have a specific value.
+    pub fn get_forced_bits(&self, k_lits: &[i32]) -> String {
+        let mut forced = Vec::new();
+        for (bit_idx, &lit) in k_lits.iter().enumerate() {
+            let v = (lit.unsigned_abs() - 1) as usize;
+            if v < self.inner.n && self.inner.val[v] != 0 {
+                // Check this was forced at level 0 (invariant, not guessed)
+                if self.inner.level[v] == 0 {
+                    let val = if lit > 0 { self.inner.val[v] == 1 }
+                              else       { self.inner.val[v] == -1 };
+                    forced.push(format!(r#"{{"bit":{bit},"val":{val}}}"#,
+                        bit = bit_idx,
+                        val = if val { 1 } else { 0 }));
+                }
+            }
+        }
+        format!("[{}]", forced.join(","))
+    }
+
+    /// Number of bits proven at level-0 (invariant constraints from CDCL)
+    pub fn proven_bit_count(&self, k_lits: &[i32]) -> u32 {
+        k_lits.iter().filter(|&&lit| {
+            let v = (lit.unsigned_abs() - 1) as usize;
+            v < self.inner.n && self.inner.val[v] != 0 && self.inner.level[v] == 0
+        }).count() as u32
+    }
 }

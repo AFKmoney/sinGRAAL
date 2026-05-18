@@ -7,7 +7,9 @@ export const wasmsolver_add_clauses_packed: (a: number, b: number, c: number) =>
 export const wasmsolver_assigned_count: (a: number) => number;
 export const wasmsolver_clause_count: (a: number) => number;
 export const wasmsolver_get_assignment: (a: number) => [number, number];
+export const wasmsolver_get_forced_bits: (a: number, b: number, c: number) => [number, number];
 export const wasmsolver_new: (a: number) => number;
+export const wasmsolver_proven_bit_count: (a: number, b: number, c: number) => number;
 export const wasmsolver_step: (a: number, b: number) => [number, number];
 export const __wbindgen_externrefs: WebAssembly.Table;
 export const __wbindgen_malloc: (a: number, b: number) => number;
