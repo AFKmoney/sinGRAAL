@@ -1,7 +1,7 @@
 import React from 'react';
-import { ArrowLeftRight, Split, GitCommit, Network, Filter, Layers } from 'lucide-react';
+import { ArrowLeftRight, Split, GitCommit, Network, Filter, Layers, ScanSearch, KeyRound, Cpu, Rabbit } from 'lucide-react';
 
-export type AlgorithmType = 'and' | 'or' | 'xor' | 'hash' | 'transformer' | 'invertible-transformer';
+export type AlgorithmType = 'and' | 'or' | 'xor' | 'hash' | 'transformer' | 'invertible-transformer' | 'sat-inverter' | 'ec-puzzle' | 'hybrid-solver' | 'kangaroo';
 
 interface SidebarProps {
   selectedAlg: AlgorithmType;
@@ -15,6 +15,10 @@ const navItems: { id: AlgorithmType; label: string; icon: React.ReactNode; desc:
   { id: 'hash', label: 'SHA-256 Hash', icon: <GitCommit className="w-4 h-4" />, desc: 'Pseudo-Chaos Pipeline' },
   { id: 'transformer', label: 'Transformer (ReLU)', icon: <Network className="w-4 h-4" />, desc: 'Non-Linear Loss' },
   { id: 'invertible-transformer', label: 'Invertible Transformer', icon: <Layers className="w-4 h-4" />, desc: 'XOR-based Reversal Matrix' },
+  { id: 'sat-inverter', label: 'SHA-256 Réduit', icon: <ScanSearch className="w-4 h-4" />, desc: 'Recherche de Préimage' },
+  { id: 'ec-puzzle', label: 'EC Puzzle Solver', icon: <KeyRound className="w-4 h-4" />, desc: 'ECDLP via CNF/CDCL' },
+  { id: 'hybrid-solver', label: 'Hybrid SAT+BSGS', icon: <Cpu className="w-4 h-4" />, desc: '135 → 2×2⁴⁰ Complexity' },
+  { id: 'kangaroo', label: 'Kangaroo 6-Aut', icon: <Rabbit className="w-4 h-4" />, desc: '√6 speedup via ψ²' },
 ];
 
 export function Sidebar({ selectedAlg, onSelectAlg }: SidebarProps) {
