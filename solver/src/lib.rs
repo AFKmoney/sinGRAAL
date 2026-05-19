@@ -1,5 +1,10 @@
 use wasm_bindgen::prelude::*;
 
+mod secp;
+mod kangaroo;
+use secp::*;
+use kangaroo::*;
+
 // ─── Literal helpers ─────────────────────────────────────────────────────────
 
 // Literal: positive int = var true, negative = var false.
@@ -469,4 +474,88 @@ impl WasmSolver {
             v < self.inner.n && self.inner.val[v] != 0 && self.inner.level[v] == 0
         }).count() as u32
     }
+}
+
+// ─── WASM Kangaroo Engine ─────────────────────────────────────────────────────
+
+#[wasm_bindgen]
+pub struct WasmKangaroo {
+    engine: KangarooEngine,
+}
+
+#[wasm_bindgen]
+impl WasmKangaroo {
+    /// Create a new Kangaroo for ECDLP: find k such that k·G = (target_x, target_y)
+    /// range_low, target_x, target_y: 64-char hex strings (no 0x prefix)
+    /// range_bits: 2^range_bits is the search range size
+    /// dp_bits: number of leading zero bits for distinguished points (higher = fewer DPs, faster per DP)
+    #[wasm_bindgen(constructor)]
+    pub fn new(
+        target_x: &str,
+        target_y: &str,
+        range_low: &str,
+        range_bits: u32,
+        num_tames: u32,
+        dp_bits: u32,
+    ) -> Result<WasmKangaroo, JsValue> {
+        let tx = fe_from_hex(target_x).ok_or("bad target_x")?;
+        let ty = fe_from_hex(target_y).ok_or("bad target_y")?;
+        let rl = fe_from_hex(range_low).ok_or("bad range_low")?;
+        let target = Pt { x: tx, y: ty, inf: false };
+        let engine = KangarooEngine::new(target, rl, range_bits, num_tames as usize, dp_bits);
+        Ok(WasmKangaroo { engine })
+    }
+
+    /// Step the engine by `iterations` per animal per call.
+    /// Returns JSON: {status, steps, dps, key, wildX, tameX}
+    pub fn step(&mut self, iterations: u32) -> String {
+        let found = self.engine.step(iterations);
+        let status = if found { "found" } else { "running" };
+        let key = self.engine.solution
+            .map(|k| fe_to_hex(k))
+            .unwrap_or_default();
+        format!(
+            r#"{{"status":"{s}","steps":{st},"dps":{dp},"key":"{k}","wildX":"{wx}","tameX":"{tx}"}}"#,
+            s  = status,
+            st = self.engine.steps,
+            dp = self.engine.dps_found,
+            k  = key,
+            wx = fe_to_hex(self.engine.last_wild_x),
+            tx = fe_to_hex(self.engine.last_tame_x),
+        )
+    }
+
+    /// Show the 6-orbit for a given point (educational / visualization)
+    /// Returns JSON array: [{name, x, y}, ...]
+    pub fn orbit_demo(x: &str, y: &str) -> Result<String, JsValue> {
+        let fx = fe_from_hex(x).ok_or("bad x")?;
+        let fy = fe_from_hex(y).ok_or("bad y")?;
+        let p = Pt { x: fx, y: fy, inf: false };
+        let orb = orbit_demo(p);
+        let items: Vec<String> = orb.iter().map(|(name, ox, oy)| {
+            format!(r#"{{"name":"{}","x":"{}","y":"{}"}}"#, name, ox, oy)
+        }).collect();
+        Ok(format!("[{}]", items.join(",")))
+    }
+
+    /// Verify that k·G = target (sanity check after solve)
+    pub fn verify(k_hex: &str, target_x: &str, target_y: &str) -> bool {
+        let k  = match fe_from_hex(k_hex)   { Some(v) => v, None => return false };
+        let tx = match fe_from_hex(target_x) { Some(v) => v, None => return false };
+        let ty = match fe_from_hex(target_y) { Some(v) => v, None => return false };
+        let pt = scalar_mul(gen(), k);
+        !pt.inf && pt.x == tx && pt.y == ty
+    }
+
+    /// Compute k·G and return hex (x, y) – useful for testing
+    pub fn scalar_mul_hex(k_hex: &str) -> Result<String, JsValue> {
+        let k = fe_from_hex(k_hex).ok_or("bad k")?;
+        let pt = scalar_mul(gen(), k);
+        if pt.inf { return Ok(r#"{"inf":true}"#.to_string()); }
+        Ok(format!(r#"{{"x":"{}","y":"{}"}}"#, fe_to_hex(pt.x), fe_to_hex(pt.y)))
+    }
+
+    pub fn steps(&self) -> f64 { self.engine.steps as f64 }
+    pub fn dps(&self) -> u32   { self.engine.dps_found as u32 }
+    pub fn solved(&self) -> bool { self.engine.solved }
 }

@@ -5,5 +5,5 @@ import { __wbg_set_wasm } from "./solver_bg.js";
 __wbg_set_wasm(wasm);
 wasm.__wbindgen_start();
 export {
-    WasmSolver
+    WasmKangaroo, WasmSolver
 } from "./solver_bg.js";
