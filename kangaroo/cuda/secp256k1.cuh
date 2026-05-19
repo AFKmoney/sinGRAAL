@@ -5,9 +5,9 @@
 #pragma once
 #include <stdint.h>
 
-typedef unsigned long long      u64;
-typedef unsigned __int128       u128;
-typedef unsigned int            u32;
+typedef unsigned long long  u64;
+typedef unsigned __int128   u128;
+typedef unsigned int        u32;
 
 // ─── secp256k1 constants ──────────────────────────────────────────────────────
 
@@ -17,10 +17,10 @@ typedef unsigned int            u32;
 #define P2  0xFFFFFFFFFFFFFFFFULL
 #define P3  0xFFFFFFFFFFFFFFFFULL
 
-// β: cube root of unity mod p  →  ψ(x,y) = (β·x, y)
+// β: primitive cube root of 1 mod p  →  ψ(x,y) = (β·x, y)
 #define BETA0  0xC1396C28719501EEULL
 #define BETA1  0x9CF0497512F58995ULL
-#define BETA2  0x6E64479EAC3434E9ULL
+#define BETA2_  0x6E64479EAC3434E9ULL   // trailing _ to avoid collision with BETA2_ prefix macros
 #define BETA3  0x7AE96A2B657C0710ULL
 
 // β² = p − 1 − β
@@ -35,7 +35,7 @@ typedef unsigned int            u32;
 #define N2  0xFFFFFFFFFFFFFFFEULL
 #define N3  0xFFFFFFFFFFFFFFFFULL
 
-// λ = GLV eigenvalue (ψ(P) = λ·P in the scalar field)
+// λ = GLV eigenvalue (ψ(P) = λ·P in scalar field)
 #define LAM0  0xDF02967C1B23BD72ULL
 #define LAM1  0x122E22EA20816678ULL
 #define LAM2  0xA5261C028812645AULL
@@ -44,12 +44,12 @@ typedef unsigned int            u32;
 // ─── Comparison ───────────────────────────────────────────────────────────────
 
 __device__ __forceinline__
-bool fe_gte(const u64 a[4], const u64 b[4]) {
+bool fe_lt(const u64 a[4], const u64 b[4]) {
     for (int i = 3; i >= 0; i--) {
-        if (a[i] > b[i]) return true;
-        if (a[i] < b[i]) return false;
+        if (a[i] < b[i]) return true;
+        if (a[i] > b[i]) return false;
     }
-    return true; // equal
+    return false;
 }
 
 __device__ __forceinline__
@@ -60,14 +60,9 @@ bool fe_eq(const u64 a[4], const u64 b[4]) {
 // ─── Field mod p ──────────────────────────────────────────────────────────────
 
 __device__ __forceinline__
-void fp_load_p(u64 p[4]) {
-    p[0]=P0; p[1]=P1; p[2]=P2; p[3]=P3;
-}
-
-__device__ __forceinline__
 void fp_sub_p_inplace(u64 r[4]) {
+    const u64 p[4] = {P0, P1, P2, P3};
     u128 s; u64 borrow = 0;
-    u64 p[4] = {P0, P1, P2, P3};
     for (int i = 0; i < 4; i++) {
         s = (u128)r[i] - p[i] - borrow;
         r[i] = (u64)s;
@@ -80,50 +75,44 @@ void fp_add(const u64 a[4], const u64 b[4], u64 r[4]) {
     u128 s; u64 carry = 0;
     for (int i = 0; i < 4; i++) {
         s = (u128)a[i] + b[i] + carry;
-        r[i] = (u64)s;
-        carry = (u64)(s >> 64);
+        r[i] = (u64)s; carry = (u64)(s >> 64);
     }
-    u64 p[4] = {P0, P1, P2, P3};
-    if (carry || fe_gte(r, p)) fp_sub_p_inplace(r);
+    const u64 p[4] = {P0, P1, P2, P3};
+    if (carry || !fe_lt(r, p)) fp_sub_p_inplace(r);
 }
 
 __device__ __forceinline__
 void fp_sub(const u64 a[4], const u64 b[4], u64 r[4]) {
-    u64 p[4] = {P0, P1, P2, P3};
-    if (fe_gte(a, b)) {
+    if (!fe_lt(a, b)) {
         u128 s; u64 borrow = 0;
         for (int i = 0; i < 4; i++) {
             s = (u128)a[i] - b[i] - borrow;
-            r[i] = (u64)s;
-            borrow = (s >> 127) & 1;
+            r[i] = (u64)s; borrow = (s >> 127) & 1;
         }
     } else {
-        // a < b → result = p - (b - a)
         u64 tmp[4];
         u128 s; u64 borrow = 0;
         for (int i = 0; i < 4; i++) {
             s = (u128)b[i] - a[i] - borrow;
-            tmp[i] = (u64)s;
-            borrow = (s >> 127) & 1;
+            tmp[i] = (u64)s; borrow = (s >> 127) & 1;
         }
+        const u64 p[4] = {P0, P1, P2, P3};
         borrow = 0;
         for (int i = 0; i < 4; i++) {
             s = (u128)p[i] - tmp[i] - borrow;
-            r[i] = (u64)s;
-            borrow = (s >> 127) & 1;
+            r[i] = (u64)s; borrow = (s >> 127) & 1;
         }
     }
 }
 
 __device__ __forceinline__
 void fp_neg(const u64 a[4], u64 r[4]) {
-    bool is_zero = (a[0]|a[1]|a[2]|a[3]) == 0;
-    if (is_zero) { r[0]=r[1]=r[2]=r[3]=0; return; }
-    u64 p[4] = {P0, P1, P2, P3};
+    if ((a[0]|a[1]|a[2]|a[3]) == 0) { r[0]=r[1]=r[2]=r[3]=0; return; }
+    const u64 p[4] = {P0, P1, P2, P3};
     fp_sub(p, a, r);
 }
 
-// 256×256 → 8-limb product
+// 256×256 → 512-bit product
 __device__ __forceinline__
 void mul512(const u64 a[4], const u64 b[4], u64 t[8]) {
     for (int i = 0; i < 8; i++) t[i] = 0;
@@ -131,53 +120,42 @@ void mul512(const u64 a[4], const u64 b[4], u64 t[8]) {
         u64 carry = 0;
         for (int j = 0; j < 4; j++) {
             u128 prod = (u128)a[i] * b[j] + t[i+j] + carry;
-            t[i+j] = (u64)prod;
-            carry   = (u64)(prod >> 64);
+            t[i+j] = (u64)prod; carry = (u64)(prod >> 64);
         }
         t[i+4] += carry;
     }
 }
 
-// Reduce 512-bit number mod p  (p = 2^256 − 2^32 − 977)
+// Montgomery-style reduction mod p = 2^256 − 2^32 − 977
 __device__ __forceinline__
 void reduce512(u64 t[8], u64 r[4]) {
-    u64 lo[4] = {t[0], t[1], t[2], t[3]};
-    u64 hi[4] = {t[4], t[5], t[6], t[7]};
+    const u64 lo[4] = {t[0], t[1], t[2], t[3]};
+    const u64 hi[4] = {t[4], t[5], t[6], t[7]};
 
-    // c = hi * (2^32 + 977)
-    u64 c[5] = {0};
+    u64 c[5] = {};
     u128 s; u64 carry = 0;
 
-    // hi * 977
     for (int i = 0; i < 4; i++) {
         s = (u128)hi[i] * 977ULL + c[i] + carry;
-        c[i]  = (u64)s;
-        carry = (u64)(s >> 64);
+        c[i] = (u64)s; carry = (u64)(s >> 64);
     }
-    c[4] = carry;
+    c[4] = carry; carry = 0;
 
-    // hi * 2^32 (shift hi left 32 bits)
-    carry = 0;
     s = (u128)c[0] + (hi[0] << 32);
     c[0] = (u64)s; carry = (u64)(s >> 64);
     for (int i = 1; i < 4; i++) {
         s = (u128)c[i] + (hi[i] << 32) + (hi[i-1] >> 32) + carry;
-        c[i]  = (u64)s;
-        carry = (u64)(s >> 64);
+        c[i] = (u64)s; carry = (u64)(s >> 64);
     }
     c[4] += (hi[3] >> 32) + carry;
 
-    // r5 = lo + c[0..3]
-    u64 r5[5] = {0};
-    carry = 0;
+    u64 r5[5] = {}; carry = 0;
     for (int i = 0; i < 4; i++) {
         s = (u128)lo[i] + c[i] + carry;
-        r5[i] = (u64)s;
-        carry  = (u64)(s >> 64);
+        r5[i] = (u64)s; carry = (u64)(s >> 64);
     }
     r5[4] = c[4] + carry;
 
-    // Second pass if r5[4] > 0 (r5[4] < 2^33)
     if (r5[4] > 0) {
         u64 e = r5[4];
         u128 ex = (u128)e * (977ULL + ((u128)1ULL << 32));
@@ -187,121 +165,112 @@ void reduce512(u64 t[8], u64 r[4]) {
         r5[1] = (u64)s; carry = (u64)(s >> 64);
         s = (u128)r5[2] + carry;
         r5[2] = (u64)s; carry = (u64)(s >> 64);
-        r5[3] += carry;
-        r5[4] = 0;
+        r5[3] += carry; r5[4] = 0;
     }
 
     for (int i = 0; i < 4; i++) r[i] = r5[i];
-
-    u64 p[4] = {P0, P1, P2, P3};
-    if (fe_gte(r, p)) fp_sub_p_inplace(r);
+    const u64 p[4] = {P0, P1, P2, P3};
+    if (!fe_lt(r, p)) fp_sub_p_inplace(r);
 }
 
 __device__ __forceinline__
 void fp_mul(const u64 a[4], const u64 b[4], u64 r[4]) {
-    u64 t[8];
-    mul512(a, b, t);
-    reduce512(t, r);
+    u64 t[8]; mul512(a, b, t); reduce512(t, r);
 }
 
 __device__ __forceinline__
 void fp_sqr(const u64 a[4], u64 r[4]) { fp_mul(a, a, r); }
 
-// a^e mod p — binary exponentiation
+// a^e mod p — constant-time binary exponentiation
 __device__
 void fp_pow(const u64 a[4], const u64 e[4], u64 r[4]) {
-    u64 base[4] = {a[0], a[1], a[2], a[3]};
-    r[0] = 1; r[1] = r[2] = r[3] = 0;
-    u64 exp[4] = {e[0], e[1], e[2], e[3]};
+    u64 base[4] = {a[0],a[1],a[2],a[3]};
+    r[0]=1; r[1]=r[2]=r[3]=0;
+    u64 exp[4] = {e[0],e[1],e[2],e[3]};
     while (exp[0]|exp[1]|exp[2]|exp[3]) {
         if (exp[0] & 1) { u64 tmp[4]; fp_mul(r, base, tmp); for(int i=0;i<4;i++) r[i]=tmp[i]; }
-        // exp >>= 1
-        for (int i = 0; i < 3; i++) exp[i] = (exp[i] >> 1) | (exp[i+1] << 63);
-        exp[3] >>= 1;
+        for (int i=0;i<3;i++) exp[i]=(exp[i]>>1)|(exp[i+1]<<63); exp[3]>>=1;
         u64 tmp[4]; fp_sqr(base, tmp); for(int i=0;i<4;i++) base[i]=tmp[i];
     }
 }
 
-// Modular inverse: a^(p−2)
-__device__
+__device__ __forceinline__
 void fp_inv(const u64 a[4], u64 r[4]) {
-    // p−2 = [0xFFFFFFFEFFFFFC2D, 0xFFFF...FF ×3]
-    u64 pm2[4] = {0xFFFFFFFEFFFFFC2DULL, P1, P2, P3};
+    // p − 2 = 0xFFFFFFFEFFFFFC2D || 0xFF...FF × 3
+    const u64 pm2[4] = {0xFFFFFFFEFFFFFC2DULL, P1, P2, P3};
     fp_pow(a, pm2, r);
 }
 
-// ─── GLV endomorphisms ────────────────────────────────────────────────────────
+// ─── GLV endomorphisms (affine, no inversion) ────────────────────────────────
 
-// ψ(x, y) = (β·x, y)
 __device__ __forceinline__
-void psi_x(const u64 x[4], u64 r[4]) {
-    u64 beta[4] = {BETA0, BETA1, BETA2, BETA3};
-    fp_mul(beta, x, r);
+void psi_x(const u64 ax[4], u64 r[4]) {
+    const u64 beta[4] = {BETA0, BETA1, BETA2_, BETA3};
+    fp_mul(beta, ax, r);
 }
 
-// ψ²(x, y) = (β²·x, y)
 __device__ __forceinline__
-void psi2_x(const u64 x[4], u64 r[4]) {
-    u64 beta2[4] = {BETA2_0, BETA2_1, BETA2_2, BETA2_3};
-    fp_mul(beta2, x, r);
+void psi2_x(const u64 ax[4], u64 r[4]) {
+    const u64 beta2[4] = {BETA2_0, BETA2_1, BETA2_2, BETA2_3};
+    fp_mul(beta2, ax, r);
 }
 
-// canonical x = min(x, β·x, β²·x)
-__device__
-void canonical_x(const u64 x[4], const u64 z[4], u64 r[4]) {
-    // First convert to affine: ax = x / z^2
-    u64 z2[4], z2_inv[4], ax[4];
-    fp_sqr(z, z2);
-    fp_inv(z2, z2_inv);
-    fp_mul(x, z2_inv, ax);
-
+// canonical affine x = min(ax, β·ax, β²·ax)
+// Takes AFFINE x only — no Jacobian Z parameter
+__device__ __forceinline__
+void canonical_x_affine(const u64 ax[4], u64 r[4]) {
     u64 x1[4], x2[4];
     psi_x(ax, x1);
     psi2_x(ax, x2);
-
-    // min of {ax, x1, x2}
     for (int i = 0; i < 4; i++) r[i] = ax[i];
-    if (!fe_gte(r, x1) ? false : fe_gte(x1, r)) { for(int i=0;i<4;i++) r[i]=x1[i]; }
-    // simpler:
-    bool ax_lt_x1 = !fe_gte(ax, x1) || fe_eq(ax, x1);
-    // Just pick the minimum:
-    u64 m[4]; for(int i=0;i<4;i++) m[i]=ax[i];
-    if (fe_gte(m, x1) && !fe_eq(m, x1)) for(int i=0;i<4;i++) m[i]=x1[i];
-    if (fe_gte(m, x2) && !fe_eq(m, x2)) for(int i=0;i<4;i++) m[i]=x2[i];
-    for(int i=0;i<4;i++) r[i]=m[i];
+    if (fe_lt(x1, r)) for (int i = 0; i < 4; i++) r[i] = x1[i];
+    if (fe_lt(x2, r)) for (int i = 0; i < 4; i++) r[i] = x2[i];
 }
 
-// ─── Jacobian point arithmetic ────────────────────────────────────────────────
+// ─── Jacobian → affine normalization ─────────────────────────────────────────
 
-// Mixed addition: Jacobian P + Affine Q  →  Jacobian R
-// Formula: madd-2007-bl (EFD), cost 7M + 4S
+// Converts (X:Y:Z) Jacobian to affine (ax, ay).
+// Cost: 1 fp_inv + 4 fp_mul + 1 fp_sqr  (amortize with NORM_INTERVAL)
+__device__
+void pt_normalize(const u64 X[4], const u64 Y[4], const u64 Z[4],
+                  u64 ax[4], u64 ay[4]) {
+    u64 zinv[4], z2[4], z3[4];
+    fp_inv(Z, zinv);
+    fp_sqr(zinv, z2);
+    fp_mul(zinv, z2, z3);
+    fp_mul(X, z2, ax);
+    fp_mul(Y, z3, ay);
+}
+
+// ─── Jacobian mixed add: Jacobian P + Affine Q → Jacobian R ──────────────────
+// madd-2007-bl (EFD), cost 7M + 4S, no inversion
+
 __device__
 void pt_add_mixed(
     const u64 px[4], const u64 py[4], const u64 pz[4],
     const u64 qx[4], const u64 qy[4],
     u64 rx[4], u64 ry[4], u64 rz[4]
 ) {
-    u64 z1z1[4], u2[4], s2[4], h[4], r_[4], hh[4], hhh[4], v[4];
-    u64 tmp[4], tmp2[4];
+    u64 z1z1[4], u2[4], s2[4], h[4], r_[4], hh[4], hhh[4], v[4], tmp[4], tmp2[4];
 
-    fp_sqr(pz, z1z1);                      // Z1Z1 = Z1^2
-    fp_mul(qx, z1z1, u2);                  // U2 = X2*Z1Z1
-    fp_mul(pz, z1z1, tmp);                 // Z1^3
-    fp_mul(qy, tmp, s2);                   // S2 = Y2*Z1^3
-    fp_sub(u2, px, h);                     // H = U2 - X1
-    fp_sub(s2, py, r_);                    // R = S2 - Y1
-    fp_sqr(h, hh);                         // HH = H^2
-    fp_mul(h, hh, hhh);                    // HHH = H*HH
-    fp_mul(px, hh, v);                     // V = X1*HH
-    fp_sqr(r_, tmp);                       // R^2
-    fp_sub(tmp, hhh, tmp2);                // R^2 - HHH
-    fp_add(v, v, tmp);                     // 2V
-    fp_sub(tmp2, tmp, rx);                 // X3 = R^2 - HHH - 2V
-    fp_sub(v, rx, tmp);                    // V - X3
-    fp_mul(r_, tmp, tmp2);                 // R*(V-X3)
-    fp_mul(py, hhh, tmp);                  // Y1*HHH
-    fp_sub(tmp2, tmp, ry);                 // Y3 = R*(V-X3) - Y1*HHH
-    fp_mul(h, pz, rz);                     // Z3 = H*Z1
+    fp_sqr(pz,  z1z1);          // Z1Z1 = Z1²
+    fp_mul(qx,  z1z1, u2);      // U2   = X2·Z1Z1
+    fp_mul(pz,  z1z1, tmp);     // Z1³
+    fp_mul(qy,  tmp,  s2);      // S2   = Y2·Z1³
+    fp_sub(u2,  px,   h);       // H    = U2 − X1
+    fp_sub(s2,  py,   r_);      // R    = S2 − Y1
+    fp_sqr(h,   hh);            // HH   = H²
+    fp_mul(h,   hh,   hhh);     // HHH  = H·HH
+    fp_mul(px,  hh,   v);       // V    = X1·HH
+    fp_sqr(r_,  tmp);           // R²
+    fp_sub(tmp, hhh,  tmp2);    // R² − HHH
+    fp_add(v,   v,    tmp);     // 2V
+    fp_sub(tmp2,tmp,  rx);      // X3   = R² − HHH − 2V
+    fp_sub(v,   rx,   tmp);     // V − X3
+    fp_mul(r_,  tmp,  tmp2);    // R·(V−X3)
+    fp_mul(py,  hhh,  tmp);     // Y1·HHH
+    fp_sub(tmp2,tmp,  ry);      // Y3   = R·(V−X3) − Y1·HHH
+    fp_mul(h,   pz,   rz);      // Z3   = H·Z1
 }
 
 // ─── Scalar arithmetic mod n ──────────────────────────────────────────────────
@@ -311,39 +280,37 @@ void sc_add(const u64 a[4], const u64 b[4], u64 r[4]) {
     u128 s; u64 carry = 0;
     for (int i = 0; i < 4; i++) {
         s = (u128)a[i] + b[i] + carry;
-        r[i]  = (u64)s;
-        carry = (u64)(s >> 64);
+        r[i] = (u64)s; carry = (u64)(s >> 64);
     }
-    u64 n[4] = {N0, N1, N2, N3};
-    if (carry || fe_gte(r, n)) {
+    const u64 n[4] = {N0, N1, N2, N3};
+    if (carry || !fe_lt(r, n)) {
         u64 borrow = 0;
         for (int i = 0; i < 4; i++) {
             s = (u128)r[i] - n[i] - borrow;
-            r[i]  = (u64)s;
-            borrow = (s >> 127) & 1;
+            r[i] = (u64)s; borrow = (s >> 127) & 1;
         }
     }
 }
 
-// ─── Jump and DP structures ───────────────────────────────────────────────────
+// ─── Structures ───────────────────────────────────────────────────────────────
 
 struct JumpPoint {
-    u64 x[4];
-    u64 y[4];
-    u64 s[4]; // scalar mod n
+    u64 x[4];   // affine
+    u64 y[4];   // affine
+    u64 s[4];   // scalar mod n
 };
 
 struct Animal {
-    u64 x[4], y[4], z[4]; // Jacobian
-    u64 scalar[4];          // accumulated jump scalar
+    u64 x[4], y[4], z[4];  // Jacobian
+    u64 scalar[4];           // accumulated jump scalar mod n
     u32 is_wild;
     u32 pad[3];
 };
 
+// DPEntry carries the NORMALIZED canonical x (no Z conversion needed on host)
 struct DPEntry {
-    u64 x_jac[4];   // Jacobian X (host converts to affine canonical)
-    u64 z_jac[4];   // Jacobian Z
-    u64 scalar[4];
+    u64 canon_x[4];  // exact affine canonical x = min(x, β·x, β²·x)
+    u64 scalar[4];   // accumulated scalar mod n at the DP
     u32 is_wild;
     u32 pad[3];
 };
