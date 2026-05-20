@@ -15,6 +15,7 @@
 
 mod secp;
 mod glv;
+mod coordinator;
 
 use clap::Parser;
 use secp::*;
@@ -70,6 +71,22 @@ struct Args {
     /// Disable checkpoint save/load
     #[arg(long)]
     no_checkpoint: bool,
+
+    // ── Distributed mode ────────────────────────────────────────────────────────
+
+    /// Run as DP coordinator — GPU workers on other machines connect here.
+    /// Example: kangaroo --serve --target-x ... --target-y ...
+    #[arg(long)]
+    serve: bool,
+
+    /// Bind address for coordinator server
+    #[arg(long, default_value = "0.0.0.0:5135")]
+    bind: String,
+
+    /// Connect to a coordinator instead of using a local DP table.
+    /// Example: kangaroo --coordinator 10.0.0.1:5135 --all-gpus
+    #[arg(long, value_name = "HOST:PORT")]
+    coordinator: Option<String>,
 }
 
 // ─── CUDA FFI ────────────────────────────────────────────────────────────────
@@ -395,6 +412,15 @@ fn run_gpu(
     let dp_cap = 1u32 << 21;
     let mut dp_buf: Vec<DPEntry> = (0..dp_cap).map(|_| unsafe { std::mem::zeroed() }).collect();
 
+    // Coordinator connection (distributed mode) — one per GPU thread
+    let mut coord: Option<coordinator::CoordConn> = args.coordinator
+        .as_deref()
+        .and_then(|addr| {
+            coordinator::CoordConn::connect(addr)
+                .map_err(|e| eprintln!("[GPU {}] coordinator connect failed: {}", dev, e))
+                .ok()
+        });
+
     let mut total_steps = 0u64;
     let mut total_dps   = 0u64;
     let t0 = Instant::now();
@@ -408,7 +434,34 @@ fn run_gpu(
         let n_dps = unsafe { kangaroo_read_dps(ctx, dp_buf.as_mut_ptr(), dp_cap) } as usize;
         total_dps += n_dps as u64;
 
-        {
+        if let Some(ref mut conn) = coord {
+            // ── Distributed mode: send DPs to coordinator ──────────────────────
+            let batch: Vec<_> = dp_buf[..n_dps]
+                .iter()
+                .map(|dp| (dp.canon_x, dp.scalar, dp.is_wild != 0))
+                .collect();
+            match conn.send_batch(&batch) {
+                Ok(Some(k)) => {
+                    found.store(true, Ordering::Relaxed);
+                    *result.lock().unwrap() = Some(k);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("[GPU {}] coordinator error: {} — falling back to local", dev, e);
+                    coord = None;   // drop conn, fall through to local mode below
+                    // Re-process this batch locally
+                    let mut table = dp_table.lock().unwrap();
+                    for dp in &dp_buf[..n_dps] {
+                        if let Some(k) = process_dp(dp.canon_x, dp.scalar, dp.is_wild != 0, &mut table, target) {
+                            found.store(true, Ordering::Relaxed);
+                            *result.lock().unwrap() = Some(k);
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            // ── Standalone mode: local DP table ────────────────────────────────
             let mut table = dp_table.lock().unwrap();
             for dp in &dp_buf[..n_dps] {
                 if let Some(k) = process_dp(dp.canon_x, dp.scalar, dp.is_wild != 0, &mut table, target) {
@@ -463,11 +516,27 @@ fn main() {
     let ty = fe_from_hex(&args.target_y).expect("--target-y: need 64 hex chars");
     let target = Pt { x: tx, y: ty, inf: false };
 
-    eprintln!("sinGRAAL Kangaroo v2 — 6-automorphism secp256k1 ECDLP");
-    eprintln!("  target  = {}:{}", fe_to_hex(tx), fe_to_hex(ty));
+    eprintln!("sinGRAAL Kangaroo v4 — 6-automorphism secp256k1 ECDLP");
+    eprintln!("  target  = 0x{}:0x{}", fe_to_hex(tx), fe_to_hex(ty));
     eprintln!("  range   = [0, 2^{})", args.range_bits);
     eprintln!("  animals = {} per device", args.num_animals);
     eprintln!("  dp_bits = {}", args.dp_bits);
+    if let Some(ref c) = args.coordinator { eprintln!("  coord   = {c}"); }
+
+    // ── Coordinator (server) mode ────────────────────────────────────────────
+    if args.serve {
+        eprintln!("  mode    = COORDINATOR  bind={}", args.bind);
+        if let Some(k) = coordinator::serve(&args.bind, target) {
+            println!("\n*** SOLUTION ***  k = 0x{}", fe_to_hex(k));
+            let check = scalar_mul(G, k);
+            if check.x == tx && check.y == ty && !check.inf {
+                println!("[VERIFIED] k·G == target ✓");
+            } else {
+                eprintln!("[ERROR] k·G ≠ target");
+            }
+        }
+        return;
+    }
 
     // Load checkpoint if available
     let dp_table: DpTable = Arc::new(Mutex::new(
