@@ -178,10 +178,43 @@ void fp_mul(const u64 a[4], const u64 b[4], u64 r[4]) {
     u64 t[8]; mul512(a, b, t); reduce512(t, r);
 }
 
+// 256×256 → 512-bit squaring: 10 products instead of 16
 __device__ __forceinline__
-void fp_sqr(const u64 a[4], u64 r[4]) { fp_mul(a, a, r); }
+void sqr512(const u64 a[4], u64 t[8]) {
+    // Accumulate off-diagonal cross products (i < j) into t
+    for (int i = 0; i < 8; i++) t[i] = 0;
+    for (int i = 0; i < 4; i++) {
+        u64 carry = 0;
+        for (int j = i + 1; j < 4; j++) {
+            u128 prod = (u128)a[i] * a[j] + t[i+j] + carry;
+            t[i+j] = (u64)prod; carry = (u64)(prod >> 64);
+        }
+        t[i+4] += carry;
+    }
+    // Double (cross products appear twice in a^2)
+    u64 carry = 0;
+    for (int i = 0; i < 8; i++) {
+        u64 v = (t[i] << 1) | carry;
+        carry = t[i] >> 63;
+        t[i] = v;
+    }
+    // Add diagonal products a[i]^2 at positions 2i, 2i+1
+    carry = 0;
+    for (int i = 0; i < 4; i++) {
+        u128 d = (u128)a[i] * a[i];
+        u128 s = (u128)t[2*i]   + (u64)d        + carry;
+        t[2*i]   = (u64)s; carry = (u64)(s >> 64);
+        s        = (u128)t[2*i+1] + (u64)(d >> 64) + carry;
+        t[2*i+1] = (u64)s; carry = (u64)(s >> 64);
+    }
+}
 
-// a^e mod p — constant-time binary exponentiation
+__device__ __forceinline__
+void fp_sqr(const u64 a[4], u64 r[4]) {
+    u64 t[8]; sqr512(a, t); reduce512(t, r);
+}
+
+// a^e mod p — binary exponentiation (kept for generic use)
 __device__
 void fp_pow(const u64 a[4], const u64 e[4], u64 r[4]) {
     u64 base[4] = {a[0],a[1],a[2],a[3]};
@@ -194,11 +227,58 @@ void fp_pow(const u64 a[4], const u64 e[4], u64 r[4]) {
     }
 }
 
-__device__ __forceinline__
+// Optimized a^(p-2) mod p using secp256k1 addition chain
+// Cost: 256 squarings + 15 multiplications  (vs generic ~255S + 128M)
+__device__
 void fp_inv(const u64 a[4], u64 r[4]) {
-    // p − 2 = 0xFFFFFFFEFFFFFC2D || 0xFF...FF × 3
-    const u64 pm2[4] = {0xFFFFFFFEFFFFFC2DULL, P1, P2, P3};
-    fp_pow(a, pm2, r);
+    u64 x2[4], x3[4], x6[4], x9[4], x11[4],
+        x22[4], x44[4], x88[4], x176[4], x220[4], x223[4], t[4];
+    int j;
+#define SQR(dst)       fp_sqr(dst, dst)
+#define MUL(dst, src)  fp_mul(dst, src, dst)
+#define CPY(dst, src)  for(int _i=0;_i<4;_i++) dst[_i]=src[_i]
+
+    fp_sqr(a, x2);  fp_mul(x2, a, x2);          // x2  = a^3        1S+1M
+    fp_sqr(x2, x3); fp_mul(x3, a, x3);           // x3  = a^7        1S+1M
+
+    CPY(x6, x3);
+    for(j=0;j<3;j++) SQR(x6); MUL(x6, x3);      // x6  = a^(2^6-1)  3S+1M
+
+    CPY(x9, x6);
+    for(j=0;j<3;j++) SQR(x9); MUL(x9, x3);      // x9  = a^(2^9-1)  3S+1M
+
+    CPY(x11, x9);
+    for(j=0;j<2;j++) SQR(x11); MUL(x11, x2);    // x11 = a^(2^11-1) 2S+1M
+
+    CPY(x22, x11);
+    for(j=0;j<11;j++) SQR(x22); MUL(x22, x11);  // x22 = a^(2^22-1) 11S+1M
+
+    CPY(x44, x22);
+    for(j=0;j<22;j++) SQR(x44); MUL(x44, x22);  // x44 = a^(2^44-1) 22S+1M
+
+    CPY(x88, x44);
+    for(j=0;j<44;j++) SQR(x88); MUL(x88, x44);  // x88 = a^(2^88-1) 44S+1M
+
+    CPY(x176, x88);
+    for(j=0;j<88;j++) SQR(x176); MUL(x176, x88); // x176=a^(2^176-1) 88S+1M
+
+    CPY(x220, x176);
+    for(j=0;j<44;j++) SQR(x220); MUL(x220, x44); // x220=a^(2^220-1) 44S+1M
+
+    CPY(x223, x220);
+    for(j=0;j<3;j++) SQR(x223); MUL(x223, x3);   // x223=a^(2^223-1) 3S+1M
+
+    // p-2 tail: x223 → a^(p-2)
+    CPY(t, x223);
+    for(j=0;j<23;j++) SQR(t); MUL(t, x22);       // 23S+1M
+    for(j=0;j< 5;j++) SQR(t); MUL(t,   a);       //  5S+1M
+    for(j=0;j< 3;j++) SQR(t); MUL(t,  x2);       //  3S+1M
+    for(j=0;j< 2;j++) SQR(t);
+    fp_mul(t, a, r);                               //  2S+1M  → a^(p-2)
+
+#undef SQR
+#undef MUL
+#undef CPY
 }
 
 // ─── GLV endomorphisms (affine, no inversion) ────────────────────────────────
@@ -273,6 +353,50 @@ void pt_add_mixed(
     fp_mul(h,   pz,   rz);      // Z3   = H·Z1
 }
 
+// ─── Pure affine + affine point addition ─────────────────────────────────────
+// Cost: 1 fp_inv + 4M + 2S  (no Z coordinate, result is affine)
+// Degenerate cases (same x) are astronomically unlikely in a Kangaroo walk;
+// handled gracefully (result = 0,0) but practically never triggered.
+
+__device__
+void affine_add(
+    const u64 ax[4], const u64 ay[4],   // animal (affine)
+    const u64 bx[4], const u64 by[4],   // jump point (affine)
+    u64 rx[4], u64 ry[4]                // result (affine)
+) {
+    u64 dx[4], dy[4], dinv[4], lam[4], lam2[4], tmp[4];
+    fp_sub(bx, ax, dx);         // dx = bx − ax
+    fp_sub(by, ay, dy);         // dy = by − ay
+
+    // Degenerate: dx == 0  (same x-coordinate)
+    if ((dx[0]|dx[1]|dx[2]|dx[3]) == 0) {
+        if ((dy[0]|dy[1]|dy[2]|dy[3]) == 0) {
+            // Point doubling: λ = 3x²/(2y)
+            u64 x2[4], num[4], den[4];
+            fp_sqr(ax, x2);
+            const u64 three[4] = {3,0,0,0};
+            fp_mul(three, x2, num);        // 3x²
+            fp_add(ay, ay, den);           // 2y
+            fp_inv(den, dinv);
+            fp_mul(num, dinv, lam);
+        } else {
+            // Opposite points: result = point at infinity (set to 0)
+            for (int i=0;i<4;i++) { rx[i]=0; ry[i]=0; }
+            return;
+        }
+    } else {
+        fp_inv(dx, dinv);
+        fp_mul(dy, dinv, lam);             // λ = dy/dx
+    }
+
+    fp_sqr(lam, lam2);                     // λ²
+    fp_sub(lam2, ax, tmp);                 // λ² − ax
+    fp_sub(tmp,  bx, rx);                  // x3 = λ² − ax − bx
+    fp_sub(ax,   rx, tmp);                 // ax − x3
+    fp_mul(lam, tmp, lam2);                // λ(ax−x3)
+    fp_sub(lam2, ay, ry);                  // y3 = λ(ax−x3) − ay
+}
+
 // ─── Scalar arithmetic mod n ──────────────────────────────────────────────────
 
 __device__ __forceinline__
@@ -300,9 +424,11 @@ struct JumpPoint {
     u64 s[4];   // scalar mod n
 };
 
+// Affine animal — no Z coordinate; jump_idx and DP check both use canonical affine x
 struct Animal {
-    u64 x[4], y[4], z[4];  // Jacobian
-    u64 scalar[4];           // accumulated jump scalar mod n
+    u64 ax[4];       // affine x
+    u64 ay[4];       // affine y
+    u64 scalar[4];   // accumulated jump scalar mod n
     u32 is_wild;
     u32 pad[3];
 };

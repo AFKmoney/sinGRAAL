@@ -83,7 +83,8 @@ mod ffi {
 
     #[repr(C)]
     pub struct Animal {
-        pub x: [u64;4], pub y: [u64;4], pub z: [u64;4],
+        pub ax: [u64;4],     // affine x
+        pub ay: [u64;4],     // affine y
         pub scalar: [u64;4],
         pub is_wild: u32, pub _pad: [u32;3],
     }
@@ -265,12 +266,9 @@ fn cpu_solve(args: &Args, target: Pt, dp_table: DpTable, found: Arc<AtomicBool>)
         for i in 0..n {
             for (animals, wild_flag) in [(&mut tames, false), (&mut wilds, true)] {
                 let (ref mut pt, ref mut sc) = animals[i];
-                let ji = jump_idx(pt.x);
-                *pt = pt_add(*pt, jumps[ji].pt);
-                *sc = sc_add(*sc, jumps[ji].scalar);
-                steps += 1;
-
                 let cx = canonical_x(pt.x);
+                let ji = jump_idx(cx);
+                // DP check BEFORE advancing (mirrors CUDA kernel order)
                 if is_dp(cx) {
                     dps += 1;
                     let mut table = dp_table.lock().unwrap();
@@ -279,6 +277,9 @@ fn cpu_solve(args: &Args, target: Pt, dp_table: DpTable, found: Arc<AtomicBool>)
                         return Some(k);
                     }
                 }
+                *pt = pt_add(*pt, jumps[ji].pt);
+                *sc = sc_add(*sc, jumps[ji].scalar);
+                steps += 1;
             }
         }
 
@@ -342,7 +343,7 @@ fn run_gpu(
     while tame_count < n_tame as u32 {
         let (pt, sc) = make_tame(global_tame_idx, args.range_bits);
         host_animals.push(Animal {
-            x: pt.x, y: pt.y, z: [1,0,0,0],
+            ax: pt.x, ay: pt.y,
             scalar: sc, is_wild: 0, _pad: [0;3],
         });
         global_tame_idx += n_gpus as u32;
@@ -351,7 +352,7 @@ fn run_gpu(
     // Wild: all start at target
     for _ in 0..n_wild {
         host_animals.push(Animal {
-            x: target.x, y: target.y, z: [1,0,0,0],
+            ax: target.x, ay: target.y,
             scalar: [0;4], is_wild: 1, _pad: [0;3],
         });
     }
