@@ -227,54 +227,57 @@ void fp_pow(const u64 a[4], const u64 e[4], u64 r[4]) {
     }
 }
 
-// Optimized a^(p-2) mod p using secp256k1 addition chain
-// Cost: 256 squarings + 15 multiplications  (vs generic ~255S + 128M)
+// Optimized a^(p-2) mod p — secp256k1 addition chain, register-minimal form
+//
+// Peak simultaneous live arrays: 6 local (x2,x3,x22,x44,x88,t) + param a = 7
+// = 28 u64s = 56 32-bit registers (vs 48 u64s / 96 regs in the naive version).
+// Shorter intermediates (x6, x9, x11, x176, x220, x223) are all routed through t.
+// Cost: 256S + 15M (same as before).
 __device__
 void fp_inv(const u64 a[4], u64 r[4]) {
-    u64 x2[4], x3[4], x6[4], x9[4], x11[4],
-        x22[4], x44[4], x88[4], x176[4], x220[4], x223[4], t[4];
+    u64 x2[4], x3[4], x22[4], x44[4], x88[4], t[4];
     int j;
-#define SQR(dst)       fp_sqr(dst, dst)
-#define MUL(dst, src)  fp_mul(dst, src, dst)
-#define CPY(dst, src)  for(int _i=0;_i<4;_i++) dst[_i]=src[_i]
+#define SQR(d)     fp_sqr(d, d)
+#define MUL(d, s)  fp_mul(d, s, d)
+#define CPY(d, s)  for(int _i=0;_i<4;_i++) (d)[_i]=(s)[_i]
 
-    fp_sqr(a, x2);  fp_mul(x2, a, x2);          // x2  = a^3        1S+1M
-    fp_sqr(x2, x3); fp_mul(x3, a, x3);           // x3  = a^7        1S+1M
+    fp_sqr(a,  x2); fp_mul(x2, a,  x2);  // x2  = a^3        1S+1M
+    fp_sqr(x2, x3); fp_mul(x3, a,  x3);  // x3  = a^7        1S+1M
 
-    CPY(x6, x3);
-    for(j=0;j<3;j++) SQR(x6); MUL(x6, x3);      // x6  = a^(2^6-1)  3S+1M
+    // x6, x9, x11 all routed through t (released before the next named value)
+    CPY(t, x3);
+    for(j=0;j<3;j++) SQR(t); MUL(t, x3); // t   = a^(2^6-1) 3S+1M
+    for(j=0;j<3;j++) SQR(t); MUL(t, x3); // t   = a^(2^9-1) 3S+1M
+    for(j=0;j<2;j++) SQR(t); MUL(t, x2); // t   = a^(2^11-1) 2S+1M
 
-    CPY(x9, x6);
-    for(j=0;j<3;j++) SQR(x9); MUL(x9, x3);      // x9  = a^(2^9-1)  3S+1M
+    // x22: need t (=x11) and x22 simultaneously for the final mul only
+    CPY(x22, t);
+    for(j=0;j<11;j++) SQR(x22); MUL(x22, t); // x22=a^(2^22-1) 11S+1M
+    // t (=x11) released here
 
-    CPY(x11, x9);
-    for(j=0;j<2;j++) SQR(x11); MUL(x11, x2);    // x11 = a^(2^11-1) 2S+1M
+    // x44 through t, then saved — both live briefly during x88
+    CPY(t, x22);
+    for(j=0;j<22;j++) SQR(t); MUL(t, x22);   // t  = a^(2^44-1) 22S+1M
+    CPY(x44, t);   // save x44; t still used for x88
 
-    CPY(x22, x11);
-    for(j=0;j<11;j++) SQR(x22); MUL(x22, x11);  // x22 = a^(2^22-1) 11S+1M
+    for(j=0;j<44;j++) SQR(t); MUL(t, x44);   // t  = a^(2^88-1) 44S+1M
+    CPY(x88, t);   // save x88; t reused for x176 (peak: a,x2,x3,x22,x44,x88,t=7)
 
-    CPY(x44, x22);
-    for(j=0;j<22;j++) SQR(x44); MUL(x44, x22);  // x44 = a^(2^44-1) 22S+1M
+    for(j=0;j<88;j++) SQR(t); MUL(t, x88);   // t  = a^(2^176-1) 88S+1M
+    // x88 released — 6 live: a,x2,x3,x22,x44,t
 
-    CPY(x88, x44);
-    for(j=0;j<44;j++) SQR(x88); MUL(x88, x44);  // x88 = a^(2^88-1) 44S+1M
+    for(j=0;j<44;j++) SQR(t); MUL(t, x44);   // t  = a^(2^220-1) 44S+1M
+    // x44 released — 5 live: a,x2,x3,x22,t
 
-    CPY(x176, x88);
-    for(j=0;j<88;j++) SQR(x176); MUL(x176, x88); // x176=a^(2^176-1) 88S+1M
+    for(j=0;j< 3;j++) SQR(t); MUL(t,  x3);   // t  = a^(2^223-1)  3S+1M
+    // x3 released — 4 live: a,x2,x22,t
 
-    CPY(x220, x176);
-    for(j=0;j<44;j++) SQR(x220); MUL(x220, x44); // x220=a^(2^220-1) 44S+1M
-
-    CPY(x223, x220);
-    for(j=0;j<3;j++) SQR(x223); MUL(x223, x3);   // x223=a^(2^223-1) 3S+1M
-
-    // p-2 tail: x223 → a^(p-2)
-    CPY(t, x223);
-    for(j=0;j<23;j++) SQR(t); MUL(t, x22);       // 23S+1M
-    for(j=0;j< 5;j++) SQR(t); MUL(t,   a);       //  5S+1M
-    for(j=0;j< 3;j++) SQR(t); MUL(t,  x2);       //  3S+1M
+    // p-2 tail
+    for(j=0;j<23;j++) SQR(t); MUL(t, x22);   // 23S+1M; x22 released
+    for(j=0;j< 5;j++) SQR(t); MUL(t,   a);   //  5S+1M
+    for(j=0;j< 3;j++) SQR(t); MUL(t,  x2);   //  3S+1M; x2 released
     for(j=0;j< 2;j++) SQR(t);
-    fp_mul(t, a, r);                               //  2S+1M  → a^(p-2)
+    fp_mul(t, a, r);                           //  2S+1M  → a^(p-2)
 
 #undef SQR
 #undef MUL
