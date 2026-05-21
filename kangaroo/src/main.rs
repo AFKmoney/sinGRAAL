@@ -49,7 +49,7 @@ struct Args {
     dp_bits: u32,
 
     /// Affine steps per GPU launch — larger = less kernel-launch overhead
-    #[arg(long, default_value = "16384")]
+    #[arg(long, default_value = "65536")]
     steps_per_launch: u32,
 
     /// Use all available CUDA GPUs

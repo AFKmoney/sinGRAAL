@@ -72,36 +72,40 @@ void fp_sub_p_inplace(u64 r[4]) {
 
 __device__ __forceinline__
 void fp_add(const u64 a[4], const u64 b[4], u64 r[4]) {
-    u128 s; u64 carry = 0;
-    for (int i = 0; i < 4; i++) {
-        s = (u128)a[i] + b[i] + carry;
-        r[i] = (u64)s; carry = (u64)(s >> 64);
-    }
+    u64 r0, r1, r2, r3, carry;
+    asm("add.cc.u64   %0, %4, %8;\n\t"
+        "addc.cc.u64  %1, %5, %9;\n\t"
+        "addc.cc.u64  %2, %6, %10;\n\t"
+        "addc.cc.u64  %3, %7, %11;\n\t"
+        "addc.u64     %4, 0, 0;"
+        : "=l"(r0),"=l"(r1),"=l"(r2),"=l"(r3),"=l"(carry)
+        : "l"(a[0]),"l"(a[1]),"l"(a[2]),"l"(a[3]),
+          "l"(b[0]),"l"(b[1]),"l"(b[2]),"l"(b[3]));
+    r[0]=r0; r[1]=r1; r[2]=r2; r[3]=r3;
     const u64 p[4] = {P0, P1, P2, P3};
     if (carry || !fe_lt(r, p)) fp_sub_p_inplace(r);
 }
 
 __device__ __forceinline__
 void fp_sub(const u64 a[4], const u64 b[4], u64 r[4]) {
-    if (!fe_lt(a, b)) {
-        u128 s; u64 borrow = 0;
-        for (int i = 0; i < 4; i++) {
-            s = (u128)a[i] - b[i] - borrow;
-            r[i] = (u64)s; borrow = (s >> 127) & 1;
-        }
-    } else {
-        u64 tmp[4];
-        u128 s; u64 borrow = 0;
-        for (int i = 0; i < 4; i++) {
-            s = (u128)b[i] - a[i] - borrow;
-            tmp[i] = (u64)s; borrow = (s >> 127) & 1;
-        }
-        const u64 p[4] = {P0, P1, P2, P3};
-        borrow = 0;
-        for (int i = 0; i < 4; i++) {
-            s = (u128)p[i] - tmp[i] - borrow;
-            r[i] = (u64)s; borrow = (s >> 127) & 1;
-        }
+    u64 r0, r1, r2, r3, borrow;
+    asm("sub.cc.u64   %0, %4, %8;\n\t"
+        "subc.cc.u64  %1, %5, %9;\n\t"
+        "subc.cc.u64  %2, %6, %10;\n\t"
+        "subc.cc.u64  %3, %7, %11;\n\t"
+        "subc.u64     %4, 0, 0;"
+        : "=l"(r0),"=l"(r1),"=l"(r2),"=l"(r3),"=l"(borrow)
+        : "l"(a[0]),"l"(a[1]),"l"(a[2]),"l"(a[3]),
+          "l"(b[0]),"l"(b[1]),"l"(b[2]),"l"(b[3]));
+    r[0]=r0; r[1]=r1; r[2]=r2; r[3]=r3;
+    if (borrow & 1) {
+        // a < b: add p back
+        asm("add.cc.u64   %0, %0, %4;\n\t"
+            "addc.cc.u64  %1, %1, %5;\n\t"
+            "addc.cc.u64  %2, %2, %6;\n\t"
+            "addc.u64     %3, %3, %7;"
+            : "+l"(r[0]),"+l"(r[1]),"+l"(r[2]),"+l"(r[3])
+            : "l"((u64)P0),"l"((u64)P1),"l"((u64)P2),"l"((u64)P3));
     }
 }
 
@@ -112,18 +116,63 @@ void fp_neg(const u64 a[4], u64 r[4]) {
     fp_sub(p, a, r);
 }
 
-// 256×256 → 512-bit product
+// 256×256 → 512-bit product — PTX carry-chain (mad.lo.cc / madc.hi)
 __device__ __forceinline__
 void mul512(const u64 a[4], const u64 b[4], u64 t[8]) {
-    for (int i = 0; i < 8; i++) t[i] = 0;
-    for (int i = 0; i < 4; i++) {
-        u64 carry = 0;
-        for (int j = 0; j < 4; j++) {
-            u128 prod = (u128)a[i] * b[j] + t[i+j] + carry;
-            t[i+j] = (u64)prod; carry = (u64)(prod >> 64);
-        }
-        t[i+4] += carry;
-    }
+    u64 t0,t1,t2,t3,t4,t5,t6,t7;
+    asm(
+        // ── Row 0: a0 × b[0..3] ─────────────────────────────────────────
+        "mul.lo.u64     %0,  %8, %12;\n\t"
+        "mul.hi.u64     %1,  %8, %12;\n\t"
+        "mad.lo.cc.u64  %1,  %8, %13, %1;\n\t"
+        "madc.hi.u64    %2,  %8, %13,  0;\n\t"
+        "mad.lo.cc.u64  %2,  %8, %14, %2;\n\t"
+        "madc.hi.u64    %3,  %8, %14,  0;\n\t"
+        "mad.lo.cc.u64  %3,  %8, %15, %3;\n\t"
+        "madc.hi.u64    %4,  %8, %15,  0;\n\t"
+        // ── Row 1: a1 × b[0..3] ─────────────────────────────────────────
+        "mad.lo.cc.u64  %1,  %9, %12, %1;\n\t"
+        "madc.hi.cc.u64 %2,  %9, %12, %2;\n\t"
+        "addc.u64       %3, %3,  0;\n\t"
+        "mad.lo.cc.u64  %2,  %9, %13, %2;\n\t"
+        "madc.hi.cc.u64 %3,  %9, %13, %3;\n\t"
+        "addc.u64       %4, %4,  0;\n\t"
+        "mad.lo.cc.u64  %3,  %9, %14, %3;\n\t"
+        "madc.hi.cc.u64 %4,  %9, %14, %4;\n\t"
+        "addc.u64       %5,  0,  0;\n\t"
+        "mad.lo.cc.u64  %4,  %9, %15, %4;\n\t"
+        "madc.hi.u64    %5,  %9, %15, %5;\n\t"
+        // ── Row 2: a2 × b[0..3] ─────────────────────────────────────────
+        "mad.lo.cc.u64  %2, %10, %12, %2;\n\t"
+        "madc.hi.cc.u64 %3, %10, %12, %3;\n\t"
+        "addc.u64       %4, %4,  0;\n\t"
+        "mad.lo.cc.u64  %3, %10, %13, %3;\n\t"
+        "madc.hi.cc.u64 %4, %10, %13, %4;\n\t"
+        "addc.u64       %5, %5,  0;\n\t"
+        "mad.lo.cc.u64  %4, %10, %14, %4;\n\t"
+        "madc.hi.cc.u64 %5, %10, %14, %5;\n\t"
+        "addc.u64       %6,  0,  0;\n\t"
+        "mad.lo.cc.u64  %5, %10, %15, %5;\n\t"
+        "madc.hi.u64    %6, %10, %15, %6;\n\t"
+        // ── Row 3: a3 × b[0..3] ─────────────────────────────────────────
+        "mad.lo.cc.u64  %3, %11, %12, %3;\n\t"
+        "madc.hi.cc.u64 %4, %11, %12, %4;\n\t"
+        "addc.u64       %5, %5,  0;\n\t"
+        "mad.lo.cc.u64  %4, %11, %13, %4;\n\t"
+        "madc.hi.cc.u64 %5, %11, %13, %5;\n\t"
+        "addc.u64       %6, %6,  0;\n\t"
+        "mad.lo.cc.u64  %5, %11, %14, %5;\n\t"
+        "madc.hi.cc.u64 %6, %11, %14, %6;\n\t"
+        "addc.u64       %7,  0,  0;\n\t"
+        "mad.lo.cc.u64  %6, %11, %15, %6;\n\t"
+        "madc.hi.u64    %7, %11, %15, %7;\n\t"
+        : "=l"(t0),"=l"(t1),"=l"(t2),"=l"(t3),
+          "=l"(t4),"=l"(t5),"=l"(t6),"=l"(t7)
+        : "l"(a[0]),"l"(a[1]),"l"(a[2]),"l"(a[3]),
+          "l"(b[0]),"l"(b[1]),"l"(b[2]),"l"(b[3])
+    );
+    t[0]=t0; t[1]=t1; t[2]=t2; t[3]=t3;
+    t[4]=t4; t[5]=t5; t[6]=t6; t[7]=t7;
 }
 
 // Montgomery-style reduction mod p = 2^256 − 2^32 − 977
@@ -178,35 +227,67 @@ void fp_mul(const u64 a[4], const u64 b[4], u64 r[4]) {
     u64 t[8]; mul512(a, b, t); reduce512(t, r);
 }
 
-// 256×256 → 512-bit squaring: 10 products instead of 16
+// 256×256 → 512-bit squaring — PTX, 10 muls (6 cross×2 + 4 diag)
 __device__ __forceinline__
 void sqr512(const u64 a[4], u64 t[8]) {
-    // Accumulate off-diagonal cross products (i < j) into t
-    for (int i = 0; i < 8; i++) t[i] = 0;
-    for (int i = 0; i < 4; i++) {
-        u64 carry = 0;
-        for (int j = i + 1; j < 4; j++) {
-            u128 prod = (u128)a[i] * a[j] + t[i+j] + carry;
-            t[i+j] = (u64)prod; carry = (u64)(prod >> 64);
-        }
-        t[i+4] += carry;
-    }
-    // Double (cross products appear twice in a^2)
-    u64 carry = 0;
-    for (int i = 0; i < 8; i++) {
-        u64 v = (t[i] << 1) | carry;
-        carry = t[i] >> 63;
-        t[i] = v;
-    }
-    // Add diagonal products a[i]^2 at positions 2i, 2i+1
-    carry = 0;
-    for (int i = 0; i < 4; i++) {
-        u128 d = (u128)a[i] * a[i];
-        u128 s = (u128)t[2*i]   + (u64)d        + carry;
-        t[2*i]   = (u64)s; carry = (u64)(s >> 64);
-        s        = (u128)t[2*i+1] + (u64)(d >> 64) + carry;
-        t[2*i+1] = (u64)s; carry = (u64)(s >> 64);
-    }
+    u64 t0,t1,t2,t3,t4,t5,t6,t7;
+    // ── Phase 1: cross products (each appears twice → computed once, doubled) ──
+    asm(
+        // (0,1) → slots 1,2
+        "mul.lo.u64     %1, %8, %9;\n\t"
+        "mul.hi.u64     %2, %8, %9;\n\t"
+        // (0,2) → slots 2,3
+        "mad.lo.cc.u64  %2, %8, %10, %2;\n\t"
+        "madc.hi.u64    %3, %8, %10,  0;\n\t"
+        // (1,2) → slots 3,4
+        "mad.lo.cc.u64  %3, %9, %10, %3;\n\t"
+        "madc.hi.u64    %4, %9, %10,  0;\n\t"
+        // (0,3) → slots 3,4  (add into existing; carry may overflow)
+        "mad.lo.cc.u64  %3, %8, %11, %3;\n\t"
+        "madc.hi.cc.u64 %4, %8, %11, %4;\n\t"
+        "addc.u64       %5,  0,  0;\n\t"
+        // (1,3) → slots 4,5
+        "mad.lo.cc.u64  %4, %9, %11, %4;\n\t"
+        "madc.hi.cc.u64 %5, %9, %11, %5;\n\t"
+        "addc.u64       %6,  0,  0;\n\t"
+        // (2,3) → slots 5,6
+        "mad.lo.cc.u64  %5, %10, %11, %5;\n\t"
+        "madc.hi.u64    %6, %10, %11, %6;\n\t"
+        "mov.u64        %0, 0;\n\t"
+        "mov.u64        %7, 0;\n\t"
+        : "=l"(t0),"=l"(t1),"=l"(t2),"=l"(t3),
+          "=l"(t4),"=l"(t5),"=l"(t6),"=l"(t7)
+        : "l"(a[0]),"l"(a[1]),"l"(a[2]),"l"(a[3])
+    );
+    // ── Phase 2: double the cross-product accumulator ─────────────────────────
+    asm(
+        "add.cc.u64   %0, %0, %0;\n\t"
+        "addc.cc.u64  %1, %1, %1;\n\t"
+        "addc.cc.u64  %2, %2, %2;\n\t"
+        "addc.cc.u64  %3, %3, %3;\n\t"
+        "addc.cc.u64  %4, %4, %4;\n\t"
+        "addc.cc.u64  %5, %5, %5;\n\t"
+        "addc.cc.u64  %6, %6, %6;\n\t"
+        "addc.u64     %7, %7, %7;\n\t"
+        : "+l"(t0),"+l"(t1),"+l"(t2),"+l"(t3),
+          "+l"(t4),"+l"(t5),"+l"(t6),"+l"(t7)
+    );
+    // ── Phase 3: add diagonal a[i]² at positions 2i, 2i+1 ────────────────────
+    asm(
+        "mad.lo.cc.u64  %0, %8, %8, %0;\n\t"
+        "madc.hi.cc.u64 %1, %8, %8, %1;\n\t"
+        "madc.lo.cc.u64 %2, %9, %9, %2;\n\t"
+        "madc.hi.cc.u64 %3, %9, %9, %3;\n\t"
+        "madc.lo.cc.u64 %4, %10, %10, %4;\n\t"
+        "madc.hi.cc.u64 %5, %10, %10, %5;\n\t"
+        "madc.lo.cc.u64 %6, %11, %11, %6;\n\t"
+        "madc.hi.u64    %7, %11, %11, %7;\n\t"
+        : "+l"(t0),"+l"(t1),"+l"(t2),"+l"(t3),
+          "+l"(t4),"+l"(t5),"+l"(t6),"+l"(t7)
+        : "l"(a[0]),"l"(a[1]),"l"(a[2]),"l"(a[3])
+    );
+    t[0]=t0; t[1]=t1; t[2]=t2; t[3]=t3;
+    t[4]=t4; t[5]=t5; t[6]=t6; t[7]=t7;
 }
 
 __device__ __forceinline__
@@ -404,18 +485,26 @@ void affine_add(
 
 __device__ __forceinline__
 void sc_add(const u64 a[4], const u64 b[4], u64 r[4]) {
-    u128 s; u64 carry = 0;
-    for (int i = 0; i < 4; i++) {
-        s = (u128)a[i] + b[i] + carry;
-        r[i] = (u64)s; carry = (u64)(s >> 64);
-    }
+    u64 r0, r1, r2, r3, carry;
+    asm("add.cc.u64   %0, %4, %8;\n\t"
+        "addc.cc.u64  %1, %5, %9;\n\t"
+        "addc.cc.u64  %2, %6, %10;\n\t"
+        "addc.cc.u64  %3, %7, %11;\n\t"
+        "addc.u64     %4, 0, 0;"
+        : "=l"(r0),"=l"(r1),"=l"(r2),"=l"(r3),"=l"(carry)
+        : "l"(a[0]),"l"(a[1]),"l"(a[2]),"l"(a[3]),
+          "l"(b[0]),"l"(b[1]),"l"(b[2]),"l"(b[3]));
+    r[0]=r0; r[1]=r1; r[2]=r2; r[3]=r3;
     const u64 n[4] = {N0, N1, N2, N3};
     if (carry || !fe_lt(r, n)) {
-        u64 borrow = 0;
-        for (int i = 0; i < 4; i++) {
-            s = (u128)r[i] - n[i] - borrow;
-            r[i] = (u64)s; borrow = (s >> 127) & 1;
-        }
+        u64 bw;
+        asm("sub.cc.u64   %0, %0, %4;\n\t"
+            "subc.cc.u64  %1, %1, %5;\n\t"
+            "subc.cc.u64  %2, %2, %6;\n\t"
+            "subc.cc.u64  %3, %3, %7;\n\t"
+            "subc.u64     %4, 0, 0;"
+            : "+l"(r[0]),"+l"(r[1]),"+l"(r[2]),"+l"(r[3]),"=l"(bw)
+            : "l"((u64)N0),"l"((u64)N1),"l"((u64)N2),"l"((u64)N3));
     }
 }
 

@@ -1,4 +1,4 @@
-// sinGRAAL — 6-automorphism Kangaroo CUDA kernel  (affine walk edition, v4)
+// sinGRAAL — 6-automorphism Kangaroo CUDA kernel  (affine walk edition, v5)
 //
 // KEY DESIGN DECISION — affine walk (normalize every step):
 //   Old Jacobian walk: 11 field-muls/step, DP check only every 512 steps
@@ -6,7 +6,12 @@
 //   Affine walk v4   : optimized fp_inv (256S+15M, 40 fewer registers),
 //                      __launch_bounds__(256,2) doubles SM occupancy to ~25%,
 //                      sqr512 (10 products vs 16) saves 37% on squarings.
-//   Combined benefit: ~2× throughput vs v3, ~25× vs original Jacobian walk.
+//   Affine walk v5   : PTX inline asm for mul512/sqr512/fp_add/fp_sub/sc_add
+//                      (mad.lo.cc.u64 / madc.hi carry chains replace u128 loops),
+//                      shared-memory jump table (12 KB/block, eliminates constant-
+//                      cache thrash), steps_per_launch 65536 (4× less launch OH).
+//   Combined benefit: ~3-4× throughput vs v3, ~40× vs original Jacobian walk.
+//                     Target: solve puzzle #135 on 1–2 RTX 4000 GPUs.
 //
 //   CORRECT: jump_idx from canonical affine x → same position always same jump.
 //
@@ -39,9 +44,12 @@ __constant__ JumpPoint g_jumps[NUM_JUMPS];
 //  5. sc_add(scalar, jp.s)              [mod-n add]
 //
 // __launch_bounds__(BLOCK_SIZE, 2):
-//   Tells nvcc: budget 65536/(2×256)=128 regs/thread → 2 concurrent blocks/SM.
-//   fp_inv registers (peak ~56 regs) + kernel frame (~44 regs) fit within 128.
-//   Without this hint nvcc may schedule only 1 block → 12% occupancy.
+//   Budgets 128 regs/thread → 2 concurrent blocks/SM → ~25% occupancy.
+//
+// Shared-memory jump table: 128 × 96 = 12 288 B loaded once per block at launch.
+//   Eliminates constant-cache pressure: with 256 threads × 16 384 steps, every
+//   thread's random ji hits a different cache line — shared mem absorbs all 128
+//   entries in L1 (Ampere: 32 KB shared + 32 KB L1, Turing: 32/32 split).
 
 __global__ __launch_bounds__(BLOCK_SIZE, 2)
 void kangaroo_walk(
@@ -53,17 +61,28 @@ void kangaroo_walk(
     u64  dp_threshold,
     u32  max_dps
 ) {
+    // ── Prefetch full jump table: constant mem → shared mem ───────────────────
+    __shared__ JumpPoint sh_jumps[NUM_JUMPS];
+    {
+        u64*       dst        = reinterpret_cast<u64*>(sh_jumps);
+        const u64* src        = reinterpret_cast<const u64*>(g_jumps);
+        const int  total_u64s = NUM_JUMPS * 12;   // 128 × 12 u64s = 1536
+        for (int k = (int)threadIdx.x; k < total_u64s; k += BLOCK_SIZE)
+            dst[k] = src[k];
+        __syncthreads();
+    }
+
     u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_animals) return;
 
     Animal a = animals[tid];
 
     for (u32 s = 0; s < steps_per_launch; s++) {
-        // ── canonical x (affine, no inversion needed — ax is already affine) ──
+        // ── canonical x ───────────────────────────────────────────────────────
         u64 cx[4];
         canonical_x_affine(a.ax, cx);
 
-        // ── DP check BEFORE advancing (record current exact position) ─────────
+        // ── DP check BEFORE advancing ─────────────────────────────────────────
         if (cx[3] < dp_threshold) {
             u32 slot = atomicAdd(dp_count, 1u) % max_dps;
             DPEntry dp;
@@ -71,16 +90,16 @@ void kangaroo_walk(
                 dp.canon_x[i] = cx[i];
                 dp.scalar[i]  = a.scalar[i];
             }
-            dp.is_wild = a.is_wild;
+            dp.is_wild   = a.is_wild;
             dp.pad[0] = dp.pad[1] = dp.pad[2] = 0;
             dp_buf[slot] = dp;
         }
 
-        // ── deterministic jump selection from canonical x ─────────────────────
+        // ── jump from shared mem (no constant-cache miss) ─────────────────────
         u32 ji = (u32)(cx[0] % (u64)NUM_JUMPS);
-        const JumpPoint jp = g_jumps[ji];
+        const JumpPoint jp = sh_jumps[ji];
 
-        // ── affine step (1 fp_inv + 4M + 2S) ─────────────────────────────────
+        // ── affine step (1 fp_inv + 4M + 2S, all PTX-accelerated) ────────────
         u64 nx[4], ny[4];
         affine_add(a.ax, a.ay, jp.x, jp.y, nx, ny);
         for (int i = 0; i < 4; i++) { a.ax[i] = nx[i]; a.ay[i] = ny[i]; }
