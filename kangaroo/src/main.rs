@@ -20,6 +20,8 @@ mod coordinator;
 use clap::Parser;
 use secp::*;
 use glv::recover_k_6aut;
+#[allow(unused_imports)]
+use secp::{phi_point, sc_mul_lambda, glv_decompose};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::time::Instant;
@@ -141,48 +143,53 @@ mod ffi {
 
 struct Jump { pt: Pt, scalar: Fe }
 
-/// Build NUM_JUMPS jump points with near-optimal torus coverage.
+/// Build NUM_JUMPS jump points with full GLV 2D torus coverage.
 ///
-/// Scalars are pseudo-random powers-of-2 drawn uniformly from the interval
-/// [2^(μ_bits-1), 2^(μ_bits+1)] where μ_bits = range_bits/2.  This gives:
-///   mean  ≈ 2^μ_bits   (≈ √range, optimal Kangaroo mean)
-///   E[s²] ≈ 4/3 * mean²  (uniform-distribution bound — minimum reachable)
-/// The 128 distinct scalars are powers of 2 so scalar_mul is fast (single
-/// double-and-add chain, no precomputation needed), yet they tile the orbit
-/// torus with minimal correlation between consecutive jumps.
+/// The secp256k1 group, viewed through the GLV endomorphism, is a hexagonal
+/// lattice (Z[ω] where ω = primitive cube root of 1).  A purely G-direction
+/// jump table covers only one axis of this lattice.  By mixing:
+///
+///   • First half  (i < N/2): G-direction jumps  δᵢ · G
+///     scalar contribution: δᵢ
+///
+///   • Second half (i ≥ N/2): φ(G)-direction jumps  φ(δᵢ · G) = δᵢ · φ(G)
+///     point:  (β·xᵢ, yᵢ)   [the GLV image of δᵢ·G]
+///     scalar contribution: λ·δᵢ mod n  [φ acts as λ in scalar space]
+///
+/// Both directions have the same magnitude (δᵢ ≈ √range), so the Kangaroo
+/// walk covers the full 2D hexagonal torus instead of a 1D slice.
+/// Jump selection (cx[0] % NUM_JUMPS) is still deterministic from canonical x,
+/// maintaining the "returning kangaroo" property.
 fn build_jumps(range_bits: u32, num_jumps: usize) -> Vec<Jump> {
-    let mu_bits = range_bits / 2;   // target mean exponent ≈ √range
+    let mu_bits = range_bits / 2;
+    let half    = num_jumps / 2;
     let mut jumps = Vec::with_capacity(num_jumps);
 
-    // Deterministic PRNG (xorshift64) seeded from range_bits for reproducibility.
-    // Each jump scalar = 2^k where k ∈ [mu_bits-1, mu_bits+1] (± 1 bit of μ).
-    // We spread k values uniformly across [mu_bits-1, mu_bits+1] so that the
-    // scalars are distinct and cover the interval with minimal repetition.
-    // For 128 jumps: 43 at 2^(μ-1), 42 at 2^μ, 43 at 2^(μ+1)  — trivially
-    // uniform, deterministic, and independent of a PRNG.
     for i in 0..num_jumps {
-        // Spread over 3 bands: lo / mid / hi  (i mod 3 → exponent offset)
-        let exp_offset: i32 = (i % 3) as i32 - 1;  // -1, 0, +1
-        let k = (mu_bits as i32 + exp_offset).max(1) as u32;
-
-        // Within the band, vary the low bits to break arithmetic correlation.
-        // Shift position within the band: add i/3 to the low word.
+        let exp_offset: i32 = (i % 3) as i32 - 1;
+        let k_exp = (mu_bits as i32 + exp_offset).max(1) as u32;
         let band_idx = (i / 3) as u64;
-        let word = (k / 64) as usize;
-        let bit  = k % 64;
+
+        let word = (k_exp / 64) as usize;
+        let bit  = k_exp % 64;
         let mut s = [0u64; 4];
-        if word < 4 {
-            s[word] = 1u64 << bit;
-        }
-        // Add band_idx scaled by 1 (so within a band scalars differ by 1 each)
-        // This keeps scalars as powers-of-2 PLUS a small low-bit offset,
-        // giving genuine 128 distinct values without hurting the mean/variance.
+        if word < 4 { s[word] = 1u64 << bit; }
         let (v, ov) = s[0].overflowing_add(band_idx);
         s[0] = v;
         if ov && 1 < 4 { s[1] += 1; }
 
-        let pt = scalar_mul(G, s);
-        jumps.push(Jump { pt, scalar: s });
+        if i < half {
+            // ── G-direction (k₁ axis of the GLV torus) ───────────────────────
+            let pt = scalar_mul(G, s);
+            jumps.push(Jump { pt, scalar: s });
+        } else {
+            // ── φ(G)-direction (k₂ axis of the GLV torus) ────────────────────
+            // φ maps (x,y) → (β·x, y) and acts as multiplication by λ on scalars.
+            let base_pt = scalar_mul(G, s);
+            let pt      = phi_point(base_pt);      // (β·x, y)
+            let scalar  = sc_mul_lambda(s);         // λ·δ mod n
+            jumps.push(Jump { pt, scalar });
+        }
     }
     jumps
 }

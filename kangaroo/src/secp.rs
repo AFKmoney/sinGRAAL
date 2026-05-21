@@ -266,6 +266,68 @@ pub fn scalar_mul(mut p: Pt, mut k: Fe) -> Pt {
     r
 }
 
+// ─── GLV endomorphism ─────────────────────────────────────────────────────────
+
+/// Apply the GLV endomorphism φ: (x, y) → (β·x, y).
+/// φ is of order 3 in the automorphism group; φ(P) = λ·P in scalar space.
+pub fn phi_point(p: Pt) -> Pt {
+    if p.inf { return p; }
+    Pt { x: fp_mul(BETA, p.x), y: p.y, inf: false }
+}
+
+/// Multiply scalar s by λ (the GLV eigenvalue) mod n.
+/// Used to track the accumulated scalar when a φ-direction jump is taken:
+///   φ(k·G) = (λ·k)·G, so adding jump φ(δ·G) increments scalar by λ·δ.
+pub fn sc_mul_lambda(s: Fe) -> Fe { sc_mul(LAMBDA, s) }
+
+/// GLV scalar decomposition: k = k1 + k2·λ  with |k1|, |k2| ≈ √k.
+///
+/// Uses the secp256k1 short basis (Bernstein et al. / bitcoin-core):
+///   a1 =  0x3086d221a7d46bcde86c90e49284eb15 (128-bit)
+///   b1 = -0xe4437ed6010e88286f547fa90abfe4c3 (128-bit)
+///   a2 =  0x114ca50f7a8e2f3f657c1108d9d44cfd8 (128-bit)
+///   b2 =  a1
+///
+/// Babai rounding: c1 = ⌊b2·k/n⌋, c2 = ⌊-b1·k/n⌋
+///                 k1 = k − c1·a1 − c2·a2  (mod n)
+///                 k2 =   − c1·b1 − c2·b2  (mod n)
+///
+/// For k < 2^135, both k1 and k2 are < 2^68.
+pub fn glv_decompose(k: Fe) -> (Fe, Fe) {
+    // Precomputed round constants g1, g2 = round(2^384 · b / n) for Babai.
+    // From secp256k1 reference: g1 = 0x3086d221a7d46bcde86c90e49284eb153dab4d1b27bb1a3e09f2c622c27d1b25
+    //                           g2 = 0xe4437ed6010e88286f547fa90abfe4c42b0a9be4fe36d6e0de9f40a6d1e7d887
+    let g1: [u64; 4] = [0x09f2c622c27d1b25, 0x3dab4d1b27bb1a3e, 0xe86c90e49284eb15, 0x3086d221a7d46bcd];
+    let g2: [u64; 4] = [0xde9f40a6d1e7d887, 0x2b0a9be4fe36d6e0, 0x6f547fa90abfe4c4, 0xe4437ed6010e8828];
+
+    // c1 = (g1 · k) >> 384, c2 = (g2 · k) >> 384  (top 256-384 bits of 512-bit product)
+    let t1 = mul512(g1, k);
+    let t2 = mul512(g2, k);
+    // >> 384 = >> (256+128) means we want bits [384..511] of the 512-bit product
+    // Since mul512 gives an 8-limb (512-bit) result, >> 384 = drop lower 6 limbs, keep limbs [6,7]
+    // But our product is only 512 bits so limbs [6] and [7] give us 128-bit quotient.
+    let c1: Fe = [t1[6], t1[7], 0, 0];
+    let c2: Fe = [t2[6], t2[7], 0, 0];
+
+    // Basis vectors
+    let a1: Fe = [0xe86c90e49284eb15, 0x3086d221a7d46bcd, 0, 0];
+    let b1: Fe = [0x6f547fa90abfe4c3, 0xe4437ed6010e8828, 0, 0]; // |b1|, b1 is negative
+    let a2: Fe = [0x57c1108d9d44cfd8, 0x114ca50f7a8e2f3f, 0, 0];
+    // b2 = a1
+
+    // k1 = k − c1·a1 − c2·a2 (mod n)
+    let c1a1 = sc_mul(c1, a1);
+    let c2a2 = sc_mul(c2, a2);
+    let k1   = sc_sub(sc_sub(k, c1a1), c2a2);
+
+    // k2 = c1·|b1| − c2·a1 (mod n)  [signs: b1<0, b2=a1>0]
+    let c1b1 = sc_mul(c1, b1);
+    let c2b2 = sc_mul(c2, a1); // b2 = a1
+    let k2   = sc_sub(c1b1, c2b2);
+
+    (k1, k2)
+}
+
 // ─── 6-automorphism canonical form ────────────────────────────────────────────
 
 pub fn canonical_x(x: Fe) -> Fe {
