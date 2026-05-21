@@ -208,6 +208,38 @@ fn make_tame(total_idx: u32, range_bits: u32) -> (Pt, Fe) {
     (scalar_mul(G, k), k)
 }
 
+/// Wild animal: starts at target + offset·G where offset is a small random-looking
+/// scalar derived from the animal index.  This ensures that different wild
+/// kangaroos follow DIFFERENT trajectories (they are deterministic given their
+/// starting position, so without distinct starts they all collapse to 1 path).
+///
+/// offset = xorshift64(gpu_idx * 2^32 + animal_idx) capped to range_bits bits,
+/// which gives 2^range_bits distinct, reproducible, well-spread starting offsets.
+fn make_wild(animal_idx: u32, gpu_idx: usize, target: Pt, range_bits: u32) -> (Pt, [u64;4]) {
+    // Deterministic xorshift64 seeded per animal — fast, no RNG state needed.
+    let seed: u64 = ((gpu_idx as u64).wrapping_mul(0x9e3779b97f4a7c15))
+        ^ (animal_idx as u64).wrapping_mul(0x6c62272e07bb0142);
+    let mut x = seed ^ 0xdeadbeefcafe0000;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+
+    // Use lower range_bits bits as the offset scalar
+    let mask_word  = ((range_bits / 64) as usize).min(3);
+    let mask_bit   = range_bits % 64;
+    let mut offset = [0u64; 4];
+    offset[0] = x;
+    // Zero out bits above range_bits to keep offset inside the search range
+    if mask_word < 4 {
+        offset[mask_word] &= if mask_bit == 0 { 0 } else { (1u64 << mask_bit) - 1 };
+        for i in (mask_word + 1)..4 { offset[i] = 0; }
+    }
+    // wild position = target + offset·G; scalar starts at offset (distance from target)
+    let offset_pt = scalar_mul(G, offset);
+    let wild_pt   = pt_add(target, offset_pt);
+    (wild_pt, offset)
+}
+
 // ─── DP table ────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -299,7 +331,7 @@ fn cpu_solve(args: &Args, target: Pt, dp_table: DpTable, found: Arc<AtomicBool>)
 
     let n = (args.num_animals / 2).max(1) as usize;
     let mut tames: Vec<(Pt, Fe)> = (0..n as u32).map(|i| make_tame(i, args.range_bits)).collect();
-    let mut wilds: Vec<(Pt, Fe)> = (0..n).map(|_| (target, [0u64; 4])).collect();
+    let mut wilds: Vec<(Pt, Fe)> = (0..n as u32).map(|i| make_wild(i, 0, target, args.range_bits)).collect();
 
     let mut steps = 0u64;
     let mut dps   = 0u64;
@@ -392,11 +424,15 @@ fn run_gpu(
         global_tame_idx += n_gpus as u32;
         tame_count += 1;
     }
-    // Wild: all start at target
-    for _ in 0..n_wild {
+    // Wild: each starts at a DISTINCT point target + offset_i·G.
+    // Without distinct starts, all n_wild animals follow the identical path
+    // (deterministic jumps) → effectively 1 kangaroo wasting n_wild threads.
+    for i in 0..n_wild {
+        let global_wild_idx = (gpu_idx * n_wild + i) as u32;
+        let (wp, ws) = make_wild(global_wild_idx, gpu_idx, target, args.range_bits);
         host_animals.push(Animal {
-            ax: target.x, ay: target.y,
-            scalar: [0;4], is_wild: 1, _pad: [0;3],
+            ax: wp.x, ay: wp.y,
+            scalar: ws, is_wild: 1, _pad: [0;3],
         });
     }
 
@@ -512,11 +548,24 @@ fn run_gpu(
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 // Resolve effective dp_bits: user override or auto-tune from range_bits.
-// Optimal: dp_bits ≈ range_bits/2 − 10 keeps the DP table at ~1M entries
-// at collision time while ensuring DPs are dense enough for fast detection.
+//
+// Optimal dp_bits so the expected DP table at collision time ≈ 2M entries:
+//   E[steps per animal] = E[total_steps] / (num_animals / 2)
+//   Optimal dp_bits ≈ log2(E[steps per animal])
+//              = range_bits/2 − log2(num_animals/2) + 1
+//
+// For 135-bit range, 262144 animals:
+//   = 67 − log2(131072) + 1 = 67 − 17 + 1 = 51
+//
+// This keeps the DP table at ~2M entries at collision time — small enough to
+// fit in RAM, large enough for fast birthday-paradox detection.
 fn effective_dp_bits(args: &Args) -> u32 {
     args.dp_bits.unwrap_or_else(|| {
-        (args.range_bits / 2).saturating_sub(10).max(16).min(40)
+        let half_range = (args.range_bits / 2) as i32;
+        let animals_per_side = (args.num_animals / 2).max(1);
+        let log_animals = (u32::BITS - animals_per_side.leading_zeros()) as i32 - 1;
+        let dp = half_range - log_animals + 1;
+        dp.max(16).min(56) as u32
     })
 }
 
