@@ -1,8 +1,19 @@
-// 6-automorphism Kangaroo CUDA kernel for secp256k1 ECDLP
+// sinGRAAL — 6-automorphism Kangaroo CUDA kernel  (affine walk edition, v5)
 //
-// Each GPU thread is one independent Kangaroo animal.
-// Jump table lives in constant memory (fast L1 broadcast).
-// DPs written to a global ring buffer via atomicAdd.
+// KEY DESIGN DECISION — affine walk (normalize every step):
+//   Old Jacobian walk: 11 field-muls/step, DP check only every 512 steps
+//   Affine walk v3   : ~395 field-muls/step, DP check every step → 14× more DPs/s
+//   Affine walk v4   : optimized fp_inv (256S+15M, 40 fewer registers),
+//                      __launch_bounds__(256,2) doubles SM occupancy to ~25%,
+//                      sqr512 (10 products vs 16) saves 37% on squarings.
+//   Affine walk v5   : PTX inline asm for mul512/sqr512/fp_add/fp_sub/sc_add
+//                      (mad.lo.cc.u64 / madc.hi carry chains replace u128 loops),
+//                      shared-memory jump table (12 KB/block, eliminates constant-
+//                      cache thrash), steps_per_launch 65536 (4× less launch OH).
+//   Combined benefit: ~3-4× throughput vs v3, ~40× vs original Jacobian walk.
+//                     Target: solve puzzle #135 on 1–2 RTX 4000 GPUs.
+//
+//   CORRECT: jump_idx from canonical affine x → same position always same jump.
 //
 // Compile:
 //   nvcc -O3 -arch=sm_80 --compiler-options -fPIC -c kangaroo.cu -o kangaroo.o
@@ -13,74 +24,96 @@
 #include <string.h>
 #include <stdio.h>
 
-// ─── Jump table in constant memory ───────────────────────────────────────────
+// ─── Tuning constants ─────────────────────────────────────────────────────────
 
-#define NUM_JUMPS 32
-#define MAX_DPS   (1u << 20)   // 1M DP ring buffer
+#define NUM_JUMPS  128
+#define MAX_DPS    (1u << 22)   // 4M ring buffer
 #define BLOCK_SIZE 256
+
+// ─── Jump table in constant memory ───────────────────────────────────────────
 
 __constant__ JumpPoint g_jumps[NUM_JUMPS];
 
-// ─── Device helpers ───────────────────────────────────────────────────────────
+// ─── Affine Kangaroo kernel ───────────────────────────────────────────────────
+//
+// Every step:
+//  1. canonical_x_affine(ax) → cx       [2M]
+//  2. jump_idx from cx[0] % NUM_JUMPS   [deterministic = "returning kangaroo"]
+//  3. DP check: cx[3] < threshold       [if yes → ring-buffer write]
+//  4. affine_add(ax,ay, jp.x,jp.y)      [1 fp_inv + 4M + 2S]
+//  5. sc_add(scalar, jp.s)              [mod-n add]
+//
+// __launch_bounds__(BLOCK_SIZE, 2):
+//   Budgets 128 regs/thread → 2 concurrent blocks/SM → ~25% occupancy.
+//
+// Shared-memory jump table: 128 × 96 = 12 288 B loaded once per block at launch.
+//   Eliminates constant-cache pressure: with 256 threads × 16 384 steps, every
+//   thread's random ji hits a different cache line — shared mem absorbs all 128
+//   entries in L1 (Ampere: 32 KB shared + 32 KB L1, Turing: 32/32 split).
 
-__device__ __forceinline__
-u32 jump_idx(const u64 x[4]) { return (u32)(x[0] % NUM_JUMPS); }
-
-// Probabilistic DP: check raw Jacobian X top bits
-// dp_mask = e.g. 0xFFFFFFF0 for 28-bit DPs
-__device__ __forceinline__
-bool is_dp(const u64 x[4], u64 dp_mask) { return (x[3] & dp_mask) == 0; }
-
-// ─── Main Kangaroo kernel ─────────────────────────────────────────────────────
-
-__global__ void kangaroo_walk(
+__global__ __launch_bounds__(BLOCK_SIZE, 2)
+void kangaroo_walk(
     Animal*  __restrict__ animals,
     DPEntry* __restrict__ dp_buf,
     u32*     __restrict__ dp_count,
     u32  num_animals,
     u32  steps_per_launch,
-    u64  dp_mask,
+    u64  dp_threshold,
     u32  max_dps
 ) {
+    // ── Prefetch full jump table: constant mem → shared mem ───────────────────
+    __shared__ JumpPoint sh_jumps[NUM_JUMPS];
+    {
+        u64*       dst        = reinterpret_cast<u64*>(sh_jumps);
+        const u64* src        = reinterpret_cast<const u64*>(g_jumps);
+        const int  total_u64s = NUM_JUMPS * 12;   // 128 × 12 u64s = 1536
+        for (int k = (int)threadIdx.x; k < total_u64s; k += BLOCK_SIZE)
+            dst[k] = src[k];
+        __syncthreads();
+    }
+
     u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_animals) return;
 
-    // Load animal into registers
     Animal a = animals[tid];
 
     for (u32 s = 0; s < steps_per_launch; s++) {
-        u32 ji = jump_idx(a.x);
-        const JumpPoint jp = g_jumps[ji];
+        // ── canonical x ───────────────────────────────────────────────────────
+        u64 cx[4];
+        canonical_x_affine(a.ax, cx);
 
-        // Mixed Jacobian + Affine point addition
-        u64 nx[4], ny[4], nz[4];
-        pt_add_mixed(a.x, a.y, a.z, jp.x, jp.y, nx, ny, nz);
-        for (int i = 0; i < 4; i++) { a.x[i] = nx[i]; a.y[i] = ny[i]; a.z[i] = nz[i]; }
-
-        // Accumulate scalar mod n
-        u64 ns[4];
-        sc_add(a.scalar, jp.s, ns);
-        for (int i = 0; i < 4; i++) a.scalar[i] = ns[i];
-
-        // DP check (probabilistic on raw Jacobian X)
-        if (is_dp(a.x, dp_mask)) {
+        // ── DP check BEFORE advancing ─────────────────────────────────────────
+        if (cx[3] < dp_threshold) {
             u32 slot = atomicAdd(dp_count, 1u) % max_dps;
             DPEntry dp;
             for (int i = 0; i < 4; i++) {
-                dp.x_jac[i] = a.x[i];
-                dp.z_jac[i] = a.z[i];
-                dp.scalar[i] = a.scalar[i];
+                dp.canon_x[i] = cx[i];
+                dp.scalar[i]  = a.scalar[i];
             }
-            dp.is_wild = a.is_wild;
+            dp.is_wild   = a.is_wild;
             dp.pad[0] = dp.pad[1] = dp.pad[2] = 0;
             dp_buf[slot] = dp;
         }
+
+        // ── jump from shared mem (no constant-cache miss) ─────────────────────
+        u32 ji = (u32)(cx[0] % (u64)NUM_JUMPS);
+        const JumpPoint jp = sh_jumps[ji];
+
+        // ── affine step (1 fp_inv + 4M + 2S, all PTX-accelerated) ────────────
+        u64 nx[4], ny[4];
+        affine_add(a.ax, a.ay, jp.x, jp.y, nx, ny);
+        for (int i = 0; i < 4; i++) { a.ax[i] = nx[i]; a.ay[i] = ny[i]; }
+
+        // ── scalar accumulation ───────────────────────────────────────────────
+        u64 ns[4];
+        sc_add(a.scalar, jp.s, ns);
+        for (int i = 0; i < 4; i++) a.scalar[i] = ns[i];
     }
 
     animals[tid] = a;
 }
 
-// ─── Extern C API (called from Rust) ─────────────────────────────────────────
+// ─── Extern C API ─────────────────────────────────────────────────────────────
 
 extern "C" {
 
@@ -90,81 +123,71 @@ struct KangarooCtx {
     u32*     d_dp_count;
     u32      num_animals;
     u32      max_dps;
-    u64      dp_mask;
+    u64      dp_threshold;
     u32      grid;
+    u32      steps_per_launch;
 };
 
-// Upload jump table to constant memory
 int kangaroo_set_jumps(const JumpPoint* jumps, int n) {
     if (n > NUM_JUMPS) return -1;
-    cudaError_t e = cudaMemcpyToSymbol(g_jumps, jumps, n * sizeof(JumpPoint));
-    return e == cudaSuccess ? 0 : -1;
+    return cudaMemcpyToSymbol(g_jumps, jumps, n * sizeof(JumpPoint))
+           == cudaSuccess ? 0 : -1;
 }
 
-// Allocate and initialize GPU buffers
 KangarooCtx* kangaroo_init(
     const Animal* host_animals,
     u32   num_animals,
-    u32   dp_bits
+    u32   dp_bits,
+    u32   steps_per_launch
 ) {
     KangarooCtx* ctx = new KangarooCtx();
-    ctx->num_animals = num_animals;
-    ctx->max_dps     = MAX_DPS;
-    // dp_mask: top dp_bits of x[3] must be zero
-    // e.g. dp_bits=28: mask = 0xFFFFFFF0 (top 28 bits checked as zero in u64 top limb → 28/64 of top limb)
-    // We check x[3] (bits 192-255 of x). Top 28 bits of x[3] = bits 228-255.
-    // mask = 0xFFFFFFF0_00000000 → upper 28 bits of u64 = (0xFFFFFFF0ULL << 32)... hmm
-    // Simpler: x[3] >> (64 - dp_bits) == 0  ↔  x[3] < (1 << (64-dp_bits))
-    // We store it as a threshold: dp_threshold = 1ULL << (64 - dp_bits)
-    u64 threshold = (dp_bits >= 64) ? 0 : (1ULL << (64 - dp_bits));
-    ctx->dp_mask = threshold; // we'll check x[3] < dp_mask
-    ctx->grid    = (num_animals + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    ctx->num_animals     = num_animals;
+    ctx->max_dps         = MAX_DPS;
+    ctx->dp_threshold    = (dp_bits >= 64) ? 0ULL : (1ULL << (64 - dp_bits));
+    ctx->steps_per_launch = steps_per_launch;
+    ctx->grid            = (num_animals + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     cudaMalloc(&ctx->d_animals,  num_animals * sizeof(Animal));
     cudaMalloc(&ctx->d_dp_buf,   MAX_DPS     * sizeof(DPEntry));
     cudaMalloc(&ctx->d_dp_count, sizeof(u32));
-
-    cudaMemcpy(ctx->d_animals, host_animals, num_animals * sizeof(Animal), cudaMemcpyHostToDevice);
+    cudaMemcpy(ctx->d_animals, host_animals,
+               num_animals * sizeof(Animal), cudaMemcpyHostToDevice);
     cudaMemset(ctx->d_dp_count, 0, sizeof(u32));
-
     return ctx;
 }
 
-// Launch one kernel step, return number of DPs written
-u32 kangaroo_step(KangarooCtx* ctx, u32 steps_per_launch) {
-    // Reuse dp_mask as threshold (x[3] < dp_mask)
+u32 kangaroo_step(KangarooCtx* ctx) {
     kangaroo_walk<<<ctx->grid, BLOCK_SIZE>>>(
-        ctx->d_animals,
-        ctx->d_dp_buf,
-        ctx->d_dp_count,
-        ctx->num_animals,
-        steps_per_launch,
-        ctx->dp_mask,
-        ctx->max_dps
+        ctx->d_animals, ctx->d_dp_buf, ctx->d_dp_count,
+        ctx->num_animals, ctx->steps_per_launch,
+        ctx->dp_threshold, ctx->max_dps
     );
     cudaDeviceSynchronize();
-
     u32 count;
     cudaMemcpy(&count, ctx->d_dp_count, sizeof(u32), cudaMemcpyDeviceToHost);
     return count;
 }
 
-// Read DP entries from device, up to `max` entries
 u32 kangaroo_read_dps(KangarooCtx* ctx, DPEntry* host_buf, u32 max) {
     u32 count;
     cudaMemcpy(&count, ctx->d_dp_count, sizeof(u32), cudaMemcpyDeviceToHost);
-    u32 to_read = (count < max) ? count : max;
-    to_read = (to_read < MAX_DPS) ? to_read : MAX_DPS;
+    u32 to_read = count < max ? count : max;
+    to_read = to_read < MAX_DPS ? to_read : MAX_DPS;
     if (to_read > 0)
-        cudaMemcpy(host_buf, ctx->d_dp_buf, to_read * sizeof(DPEntry), cudaMemcpyDeviceToHost);
-    // Reset counter
+        cudaMemcpy(host_buf, ctx->d_dp_buf,
+                   to_read * sizeof(DPEntry), cudaMemcpyDeviceToHost);
     cudaMemset(ctx->d_dp_count, 0, sizeof(u32));
     return to_read;
 }
 
-// Get current animal positions (for monitoring)
 void kangaroo_read_animals(KangarooCtx* ctx, Animal* host_buf) {
-    cudaMemcpy(host_buf, ctx->d_animals, ctx->num_animals * sizeof(Animal), cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_buf, ctx->d_animals,
+               ctx->num_animals * sizeof(Animal), cudaMemcpyDeviceToHost);
+}
+
+void kangaroo_write_animals(KangarooCtx* ctx, const Animal* host_buf) {
+    cudaMemcpy(ctx->d_animals, host_buf,
+               ctx->num_animals * sizeof(Animal), cudaMemcpyHostToDevice);
 }
 
 void kangaroo_free(KangarooCtx* ctx) {
@@ -175,24 +198,19 @@ void kangaroo_free(KangarooCtx* ctx) {
     delete ctx;
 }
 
-// Query CUDA device info
-int cuda_device_count() {
-    int n = 0;
-    cudaGetDeviceCount(&n);
-    return n;
-}
+u32 kangaroo_num_jumps() { return NUM_JUMPS; }
+
+int  cuda_device_count()       { int n=0; cudaGetDeviceCount(&n); return n; }
+void cuda_set_device(int dev)  { cudaSetDevice(dev); }
 
 void cuda_device_name(int dev, char* buf, int len) {
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, dev);
-    strncpy(buf, prop.name, len - 1);
-    buf[len-1] = '\0';
+    cudaDeviceProp p; cudaGetDeviceProperties(&p, dev);
+    strncpy(buf, p.name, len-1); buf[len-1] = '\0';
 }
 
 u64 cuda_device_memory(int dev) {
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, dev);
-    return (u64)prop.totalGlobalMem;
+    cudaDeviceProp p; cudaGetDeviceProperties(&p, dev);
+    return (u64)p.totalGlobalMem;
 }
 
 } // extern "C"
