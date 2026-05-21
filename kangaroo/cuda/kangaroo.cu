@@ -1,4 +1,4 @@
-// sinGRAAL — 6-automorphism Kangaroo CUDA kernel  (affine walk edition, v5)
+// sinGRAAL — 6-automorphism Kangaroo CUDA kernel  (affine walk edition, v6)
 //
 // KEY DESIGN DECISION — affine walk (normalize every step):
 //   Old Jacobian walk: 11 field-muls/step, DP check only every 512 steps
@@ -13,6 +13,10 @@
 //                      __launch_bounds__(256,3) → 37% SM occupancy (vs 25%),
 //                      num_animals 262144 (2×, better SM saturation),
 //                      auto-tuned dp_bits = range_bits/2 − 10.
+//   Affine walk v6   : MAX_DPS doubled to 8M (prevents ring-buffer overflow on fast
+//                      multi-GPU runs), preferred shared-mem carveout = MAX so the
+//                      12 KB sh_jumps table stays in L1 on every Ada/Ampere SM,
+//                      5-band geometric jump distribution (see main.rs build_jumps).
 //   Combined benefit: ~4-6× throughput vs v4, ~40-56× vs original Jacobian walk.
 //
 //   CORRECT: jump_idx from canonical affine x → same position always same jump.
@@ -29,7 +33,7 @@
 // ─── Tuning constants ─────────────────────────────────────────────────────────
 
 #define NUM_JUMPS  128
-#define MAX_DPS    (1u << 22)   // 4M ring buffer
+#define MAX_DPS    (1u << 23)   // 8M ring buffer — prevents overflow on fast GPUs
 #define BLOCK_SIZE 256
 
 // ─── Jump table in constant memory ───────────────────────────────────────────
@@ -157,6 +161,11 @@ KangarooCtx* kangaroo_init(
     cudaMemcpy(ctx->d_animals, host_animals,
                num_animals * sizeof(Animal), cudaMemcpyHostToDevice);
     cudaMemset(ctx->d_dp_count, 0, sizeof(u32));
+    // Prefer max shared memory over L1 cache (Ada/Ampere: up to 100 KB shared)
+    // Our sh_jumps table = 12 KB/block × 3 blocks = 36 KB — fits comfortably.
+    cudaFuncSetAttribute(kangaroo_walk,
+        cudaFuncAttributePreferredSharedMemoryCarveout,
+        cudaSharedmemCarveoutMaxShared);
     return ctx;
 }
 
