@@ -175,49 +175,80 @@ void mul512(const u64 a[4], const u64 b[4], u64 t[8]) {
     t[4]=t4; t[5]=t5; t[6]=t6; t[7]=t7;
 }
 
-// Montgomery-style reduction mod p = 2^256 − 2^32 − 977
+// Fast reduction mod p = 2^256 − 2^32 − 977 — PTX carry-chain version.
+//
+// t = lo + hi·2^256 ≡ lo + hi·(2^32 + 977)  (mod p)
+// Decompose hi·(2^32+977) = hi·977 + hi·2^32, add to lo, propagate carry.
+// All additions use PTX add.cc / addc.cc for zero-overhead carry chains.
 __device__ __forceinline__
-void reduce512(u64 t[8], u64 r[4]) {
-    const u64 lo[4] = {t[0], t[1], t[2], t[3]};
-    const u64 hi[4] = {t[4], t[5], t[6], t[7]};
+void reduce512(const u64 t[8], u64 r[4]) {
+    u64 h0=t[4], h1=t[5], h2=t[6], h3=t[7];
+    u64 r0,r1,r2,r3,r4;
 
-    u64 c[5] = {};
-    u128 s; u64 carry = 0;
-
-    for (int i = 0; i < 4; i++) {
-        s = (u128)hi[i] * 977ULL + c[i] + carry;
-        c[i] = (u64)s; carry = (u64)(s >> 64);
+    // ── Step 1: c = hi × 977  (PTX fused mad carry chain) ────────────────────
+    asm(
+        "mul.lo.u64     %0, %5, 977;\n\t"
+        "mul.hi.u64     %1, %5, 977;\n\t"
+        "mad.lo.cc.u64  %1, %6, 977, %1;\n\t"
+        "madc.hi.cc.u64 %2, %6, 977,  0;\n\t"
+        "mad.lo.cc.u64  %2, %7, 977, %2;\n\t"
+        "madc.hi.cc.u64 %3, %7, 977,  0;\n\t"
+        "mad.lo.cc.u64  %3, %8, 977, %3;\n\t"
+        "madc.hi.u64    %4, %8, 977,  0;\n\t"
+        : "=l"(r0),"=l"(r1),"=l"(r2),"=l"(r3),"=l"(r4)
+        : "l"(h0),"l"(h1),"l"(h2),"l"(h3)
+    );
+    // ── Step 2: add hi × 2^32 = (h[i]<<32)  ──────────────────────────────────
+    // h[i] << 32: contributes (h[i] & lo32) << 32 to position i (shift into top half)
+    //             and (h[i] >> 32) to position i+1 (top half into bottom half).
+    // Two-pass: first add h[i]>>32 (no shift, just carry chain), then h[i]<<32.
+    asm(
+        "add.cc.u64    %0, %0, %5;\n\t"   // r0 += h0<<32
+        "addc.cc.u64   %1, %1, %6;\n\t"   // r1 += h0>>32 + carry
+        "addc.cc.u64   %2, %2, %7;\n\t"   // r2 += h1>>32 + carry
+        "addc.cc.u64   %3, %3, %8;\n\t"   // r3 += h2>>32 + carry
+        "addc.u64      %4, %4, %9;\n\t"   // r4 += h3>>32 + carry
+        : "+l"(r0),"+l"(r1),"+l"(r2),"+l"(r3),"+l"(r4)
+        : "l"(h0 << 32), "l"(h0 >> 32), "l"(h1 >> 32), "l"(h2 >> 32), "l"(h3 >> 32)
+    );
+    asm(
+        "add.cc.u64    %0, %0, %4;\n\t"   // r1 += h1<<32
+        "addc.cc.u64   %1, %1, %5;\n\t"   // r2 += h2<<32 + carry
+        "addc.cc.u64   %2, %2, %6;\n\t"   // r3 += h3<<32 + carry
+        "addc.u64      %3, %3,  0;\n\t"   // r4 += carry
+        : "+l"(r1),"+l"(r2),"+l"(r3),"+l"(r4)
+        : "l"(h1 << 32), "l"(h2 << 32), "l"(h3 << 32)
+    );
+    // ── Step 3: add lo ────────────────────────────────────────────────────────
+    asm(
+        "add.cc.u64    %0, %0, %5;\n\t"
+        "addc.cc.u64   %1, %1, %6;\n\t"
+        "addc.cc.u64   %2, %2, %7;\n\t"
+        "addc.cc.u64   %3, %3, %8;\n\t"
+        "addc.u64      %4, %4,  0;\n\t"
+        : "+l"(r0),"+l"(r1),"+l"(r2),"+l"(r3),"+l"(r4)
+        : "l"(t[0]),"l"(t[1]),"l"(t[2]),"l"(t[3])
+    );
+    // ── Step 4: r4 is at most ~2; fold back via 2^256 ≡ 2^32+977 ─────────────
+    if (r4) {
+        u64 e = r4;
+        asm(
+            "mad.lo.cc.u64   %0, %4, 977, %0;\n\t"
+            "madc.hi.cc.u64  %1, %4, 977, %1;\n\t"
+            "addc.cc.u64     %2, %2, 0;\n\t"
+            "addc.u64        %3, %3, 0;\n\t"
+            : "+l"(r0),"+l"(r1),"+l"(r2),"+l"(r3)
+            : "l"(e)
+        );
+        // e * 2^32 = e<<32 → r0 upper half, e>>32 → r1 low bits
+        asm(
+            "add.cc.u64    %0, %0, %2;\n\t"
+            "addc.cc.u64   %1, %1, %3;\n\t"
+            : "+l"(r0),"+l"(r1)
+            : "l"(e << 32), "l"(e >> 32)
+        );
     }
-    c[4] = carry; carry = 0;
-
-    s = (u128)c[0] + (hi[0] << 32);
-    c[0] = (u64)s; carry = (u64)(s >> 64);
-    for (int i = 1; i < 4; i++) {
-        s = (u128)c[i] + (hi[i] << 32) + (hi[i-1] >> 32) + carry;
-        c[i] = (u64)s; carry = (u64)(s >> 64);
-    }
-    c[4] += (hi[3] >> 32) + carry;
-
-    u64 r5[5] = {}; carry = 0;
-    for (int i = 0; i < 4; i++) {
-        s = (u128)lo[i] + c[i] + carry;
-        r5[i] = (u64)s; carry = (u64)(s >> 64);
-    }
-    r5[4] = c[4] + carry;
-
-    if (r5[4] > 0) {
-        u64 e = r5[4];
-        u128 ex = (u128)e * (977ULL + ((u128)1ULL << 32));
-        s = (u128)r5[0] + (u64)ex;
-        r5[0] = (u64)s; carry = (u64)(s >> 64);
-        s = (u128)r5[1] + (u64)(ex >> 64) + carry;
-        r5[1] = (u64)s; carry = (u64)(s >> 64);
-        s = (u128)r5[2] + carry;
-        r5[2] = (u64)s; carry = (u64)(s >> 64);
-        r5[3] += carry; r5[4] = 0;
-    }
-
-    for (int i = 0; i < 4; i++) r[i] = r5[i];
+    r[0]=r0; r[1]=r1; r[2]=r2; r[3]=r3;
     const u64 p[4] = {P0, P1, P2, P3};
     if (!fe_lt(r, p)) fp_sub_p_inplace(r);
 }

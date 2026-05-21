@@ -20,6 +20,8 @@ mod coordinator;
 use clap::Parser;
 use secp::*;
 use glv::recover_k_6aut;
+#[allow(unused_imports)]
+use secp::{phi_point, sc_mul_lambda, glv_decompose};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::time::Instant;
@@ -41,12 +43,13 @@ struct Args {
     range_bits: u32,
 
     /// Animals per GPU (must be multiple of 256)
-    #[arg(long, default_value = "131072")]
+    #[arg(long, default_value = "262144")]
     num_animals: u32,
 
-    /// DP difficulty — 1 DP per 2^dp_bits steps
-    #[arg(long, default_value = "28")]
-    dp_bits: u32,
+    /// DP difficulty — 1 DP per 2^dp_bits steps.
+    /// Defaults to range_bits/2 − 10 (optimal table size vs DP rate tradeoff).
+    #[arg(long)]
+    dp_bits: Option<u32>,
 
     /// Affine steps per GPU launch — larger = less kernel-launch overhead
     #[arg(long, default_value = "65536")]
@@ -140,48 +143,53 @@ mod ffi {
 
 struct Jump { pt: Pt, scalar: Fe }
 
-/// Build NUM_JUMPS jump points with near-optimal torus coverage.
+/// Build NUM_JUMPS jump points with full GLV 2D torus coverage.
 ///
-/// Scalars are pseudo-random powers-of-2 drawn uniformly from the interval
-/// [2^(μ_bits-1), 2^(μ_bits+1)] where μ_bits = range_bits/2.  This gives:
-///   mean  ≈ 2^μ_bits   (≈ √range, optimal Kangaroo mean)
-///   E[s²] ≈ 4/3 * mean²  (uniform-distribution bound — minimum reachable)
-/// The 128 distinct scalars are powers of 2 so scalar_mul is fast (single
-/// double-and-add chain, no precomputation needed), yet they tile the orbit
-/// torus with minimal correlation between consecutive jumps.
+/// The secp256k1 group, viewed through the GLV endomorphism, is a hexagonal
+/// lattice (Z[ω] where ω = primitive cube root of 1).  A purely G-direction
+/// jump table covers only one axis of this lattice.  By mixing:
+///
+///   • First half  (i < N/2): G-direction jumps  δᵢ · G
+///     scalar contribution: δᵢ
+///
+///   • Second half (i ≥ N/2): φ(G)-direction jumps  φ(δᵢ · G) = δᵢ · φ(G)
+///     point:  (β·xᵢ, yᵢ)   [the GLV image of δᵢ·G]
+///     scalar contribution: λ·δᵢ mod n  [φ acts as λ in scalar space]
+///
+/// Both directions have the same magnitude (δᵢ ≈ √range), so the Kangaroo
+/// walk covers the full 2D hexagonal torus instead of a 1D slice.
+/// Jump selection (cx[0] % NUM_JUMPS) is still deterministic from canonical x,
+/// maintaining the "returning kangaroo" property.
 fn build_jumps(range_bits: u32, num_jumps: usize) -> Vec<Jump> {
-    let mu_bits = range_bits / 2;   // target mean exponent ≈ √range
+    let mu_bits = range_bits / 2;
+    let half    = num_jumps / 2;
     let mut jumps = Vec::with_capacity(num_jumps);
 
-    // Deterministic PRNG (xorshift64) seeded from range_bits for reproducibility.
-    // Each jump scalar = 2^k where k ∈ [mu_bits-1, mu_bits+1] (± 1 bit of μ).
-    // We spread k values uniformly across [mu_bits-1, mu_bits+1] so that the
-    // scalars are distinct and cover the interval with minimal repetition.
-    // For 128 jumps: 43 at 2^(μ-1), 42 at 2^μ, 43 at 2^(μ+1)  — trivially
-    // uniform, deterministic, and independent of a PRNG.
     for i in 0..num_jumps {
-        // Spread over 3 bands: lo / mid / hi  (i mod 3 → exponent offset)
-        let exp_offset: i32 = (i % 3) as i32 - 1;  // -1, 0, +1
-        let k = (mu_bits as i32 + exp_offset).max(1) as u32;
-
-        // Within the band, vary the low bits to break arithmetic correlation.
-        // Shift position within the band: add i/3 to the low word.
+        let exp_offset: i32 = (i % 3) as i32 - 1;
+        let k_exp = (mu_bits as i32 + exp_offset).max(1) as u32;
         let band_idx = (i / 3) as u64;
-        let word = (k / 64) as usize;
-        let bit  = k % 64;
+
+        let word = (k_exp / 64) as usize;
+        let bit  = k_exp % 64;
         let mut s = [0u64; 4];
-        if word < 4 {
-            s[word] = 1u64 << bit;
-        }
-        // Add band_idx scaled by 1 (so within a band scalars differ by 1 each)
-        // This keeps scalars as powers-of-2 PLUS a small low-bit offset,
-        // giving genuine 128 distinct values without hurting the mean/variance.
+        if word < 4 { s[word] = 1u64 << bit; }
         let (v, ov) = s[0].overflowing_add(band_idx);
         s[0] = v;
         if ov && 1 < 4 { s[1] += 1; }
 
-        let pt = scalar_mul(G, s);
-        jumps.push(Jump { pt, scalar: s });
+        if i < half {
+            // ── G-direction (k₁ axis of the GLV torus) ───────────────────────
+            let pt = scalar_mul(G, s);
+            jumps.push(Jump { pt, scalar: s });
+        } else {
+            // ── φ(G)-direction (k₂ axis of the GLV torus) ────────────────────
+            // φ maps (x,y) → (β·x, y) and acts as multiplication by λ on scalars.
+            let base_pt = scalar_mul(G, s);
+            let pt      = phi_point(base_pt);      // (β·x, y)
+            let scalar  = sc_mul_lambda(s);         // λ·δ mod n
+            jumps.push(Jump { pt, scalar });
+        }
     }
     jumps
 }
@@ -205,6 +213,38 @@ fn make_tame(total_idx: u32, range_bits: u32) -> (Pt, Fe) {
         }
     }
     (scalar_mul(G, k), k)
+}
+
+/// Wild animal: starts at target + offset·G where offset is a small random-looking
+/// scalar derived from the animal index.  This ensures that different wild
+/// kangaroos follow DIFFERENT trajectories (they are deterministic given their
+/// starting position, so without distinct starts they all collapse to 1 path).
+///
+/// offset = xorshift64(gpu_idx * 2^32 + animal_idx) capped to range_bits bits,
+/// which gives 2^range_bits distinct, reproducible, well-spread starting offsets.
+fn make_wild(animal_idx: u32, gpu_idx: usize, target: Pt, range_bits: u32) -> (Pt, [u64;4]) {
+    // Deterministic xorshift64 seeded per animal — fast, no RNG state needed.
+    let seed: u64 = ((gpu_idx as u64).wrapping_mul(0x9e3779b97f4a7c15))
+        ^ (animal_idx as u64).wrapping_mul(0x6c62272e07bb0142);
+    let mut x = seed ^ 0xdeadbeefcafe0000;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+
+    // Use lower range_bits bits as the offset scalar
+    let mask_word  = ((range_bits / 64) as usize).min(3);
+    let mask_bit   = range_bits % 64;
+    let mut offset = [0u64; 4];
+    offset[0] = x;
+    // Zero out bits above range_bits to keep offset inside the search range
+    if mask_word < 4 {
+        offset[mask_word] &= if mask_bit == 0 { 0 } else { (1u64 << mask_bit) - 1 };
+        for i in (mask_word + 1)..4 { offset[i] = 0; }
+    }
+    // wild position = target + offset·G; scalar starts at offset (distance from target)
+    let offset_pt = scalar_mul(G, offset);
+    let wild_pt   = pt_add(target, offset_pt);
+    (wild_pt, offset)
 }
 
 // ─── DP table ────────────────────────────────────────────────────────────────
@@ -293,11 +333,12 @@ fn cpu_solve(args: &Args, target: Pt, dp_table: DpTable, found: Arc<AtomicBool>)
     const NUM_JUMPS: usize = 128;
     let jumps = build_jumps(args.range_bits, NUM_JUMPS);
     let jump_idx = |x: Fe| (x[0] % NUM_JUMPS as u64) as usize;
-    let is_dp    = |x: Fe| x[3] < (1u64 << (64u32.saturating_sub(args.dp_bits)));
+    let dp_bits  = args.dp_bits.unwrap_or(28);
+    let is_dp    = |x: Fe| x[3] < (1u64 << (64u32.saturating_sub(dp_bits)));
 
     let n = (args.num_animals / 2).max(1) as usize;
     let mut tames: Vec<(Pt, Fe)> = (0..n as u32).map(|i| make_tame(i, args.range_bits)).collect();
-    let mut wilds: Vec<(Pt, Fe)> = (0..n).map(|_| (target, [0u64; 4])).collect();
+    let mut wilds: Vec<(Pt, Fe)> = (0..n as u32).map(|i| make_wild(i, 0, target, args.range_bits)).collect();
 
     let mut steps = 0u64;
     let mut dps   = 0u64;
@@ -390,11 +431,15 @@ fn run_gpu(
         global_tame_idx += n_gpus as u32;
         tame_count += 1;
     }
-    // Wild: all start at target
-    for _ in 0..n_wild {
+    // Wild: each starts at a DISTINCT point target + offset_i·G.
+    // Without distinct starts, all n_wild animals follow the identical path
+    // (deterministic jumps) → effectively 1 kangaroo wasting n_wild threads.
+    for i in 0..n_wild {
+        let global_wild_idx = (gpu_idx * n_wild + i) as u32;
+        let (wp, ws) = make_wild(global_wild_idx, gpu_idx, target, args.range_bits);
         host_animals.push(Animal {
-            ax: target.x, ay: target.y,
-            scalar: [0;4], is_wild: 1, _pad: [0;3],
+            ax: wp.x, ay: wp.y,
+            scalar: ws, is_wild: 1, _pad: [0;3],
         });
     }
 
@@ -402,7 +447,7 @@ fn run_gpu(
         kangaroo_init(
             host_animals.as_ptr(),
             args.num_animals,
-            args.dp_bits,
+            args.dp_bits.unwrap_or(28),
             args.steps_per_launch,
         )
     };
@@ -478,8 +523,8 @@ fn run_gpu(
         if total_steps % (args.num_animals as u64 * args.steps_per_launch as u64 * 10) == 0 {
             let rate = total_steps as f64 / elapsed / 1e6;
             let table_sz = dp_table.lock().unwrap().len();
-            // ETA estimate: birthday bound ≈ 2·√(range/6) / (n_gpus * num_animals)
-            let expected_ops = 2.0f64 * f64::powi(2.0, (args.range_bits as i32) / 2 - 1) / 6f64.sqrt();
+            // ETA estimate: 6-aut Kangaroo expected ops ≈ 2·√(range/6)
+            let expected_ops = 2.0f64 * f64::powi(2.0, args.range_bits as i32 / 2) / 6f64.sqrt();
             let eta_s = (expected_ops / 1e6 - total_steps as f64) / rate / 1e3;
             eprintln!(
                 "[GPU {}] {:.2}B steps | {} DPs | {:.0}M step/s | dp_table={} | ETA~{:.0}h",
@@ -509,18 +554,47 @@ fn run_gpu(
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
+// Resolve effective dp_bits: user override or auto-tune from range_bits.
+//
+// Optimal dp_bits so the expected DP table at collision time ≈ 2M entries:
+//   E[steps per animal] = E[total_steps] / (num_animals / 2)
+//   Optimal dp_bits ≈ log2(E[steps per animal])
+//              = range_bits/2 − log2(num_animals/2) + 1
+//
+// For 135-bit range, 262144 animals:
+//   = 67 − log2(131072) + 1 = 67 − 17 + 1 = 51
+//
+// This keeps the DP table at ~2M entries at collision time — small enough to
+// fit in RAM, large enough for fast birthday-paradox detection.
+fn effective_dp_bits(args: &Args) -> u32 {
+    args.dp_bits.unwrap_or_else(|| {
+        let half_range = (args.range_bits / 2) as i32;
+        let animals_per_side = (args.num_animals / 2).max(1);
+        let log_animals = (u32::BITS - animals_per_side.leading_zeros()) as i32 - 1;
+        let dp = half_range - log_animals + 1;
+        dp.max(16).min(56) as u32
+    })
+}
+
 fn main() {
-    let args = Arc::new(Args::parse());
+    let mut args = Args::parse();
+    // Resolve dp_bits once, store back so all code paths see the same value
+    let dp_bits = effective_dp_bits(&args);
+    args.dp_bits = Some(dp_bits);
+    let args = Arc::new(args);
 
     let tx = fe_from_hex(&args.target_x).expect("--target-x: need 64 hex chars");
     let ty = fe_from_hex(&args.target_y).expect("--target-y: need 64 hex chars");
     let target = Pt { x: tx, y: ty, inf: false };
 
-    eprintln!("sinGRAAL Kangaroo v4 — 6-automorphism secp256k1 ECDLP");
+    eprintln!("sinGRAAL Kangaroo v5 — 6-automorphism secp256k1 ECDLP");
     eprintln!("  target  = 0x{}:0x{}", fe_to_hex(tx), fe_to_hex(ty));
     eprintln!("  range   = [0, 2^{})", args.range_bits);
     eprintln!("  animals = {} per device", args.num_animals);
-    eprintln!("  dp_bits = {}", args.dp_bits);
+    eprintln!("  dp_bits = {}", dp_bits);
+    // Expected ops (informational):
+    let exp_ops = 2.0f64 * (2.0f64).powi(args.range_bits as i32 / 2) / 6f64.sqrt();
+    eprintln!("  E[ops]  = {:.2e}  (6-aut kangaroo, ~2√(range/6))", exp_ops);
     if let Some(ref c) = args.coordinator { eprintln!("  coord   = {c}"); }
 
     // ── Coordinator (server) mode ────────────────────────────────────────────

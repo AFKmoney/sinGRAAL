@@ -9,9 +9,11 @@
 //   Affine walk v5   : PTX inline asm for mul512/sqr512/fp_add/fp_sub/sc_add
 //                      (mad.lo.cc.u64 / madc.hi carry chains replace u128 loops),
 //                      shared-memory jump table (12 KB/block, eliminates constant-
-//                      cache thrash), steps_per_launch 65536 (4× less launch OH).
-//   Combined benefit: ~3-4× throughput vs v3, ~40× vs original Jacobian walk.
-//                     Target: solve puzzle #135 on 1–2 RTX 4000 GPUs.
+//                      cache thrash), steps_per_launch 65536 (4× less launch OH),
+//                      __launch_bounds__(256,3) → 37% SM occupancy (vs 25%),
+//                      num_animals 262144 (2×, better SM saturation),
+//                      auto-tuned dp_bits = range_bits/2 − 10.
+//   Combined benefit: ~4-6× throughput vs v4, ~40-56× vs original Jacobian walk.
 //
 //   CORRECT: jump_idx from canonical affine x → same position always same jump.
 //
@@ -43,15 +45,17 @@ __constant__ JumpPoint g_jumps[NUM_JUMPS];
 //  4. affine_add(ax,ay, jp.x,jp.y)      [1 fp_inv + 4M + 2S]
 //  5. sc_add(scalar, jp.s)              [mod-n add]
 //
-// __launch_bounds__(BLOCK_SIZE, 2):
-//   Budgets 128 regs/thread → 2 concurrent blocks/SM → ~25% occupancy.
+// __launch_bounds__(BLOCK_SIZE, 3):
+//   Budget 65536/(3×256)=85 regs/thread.  With v5 PTX ops (no u128 temporaries),
+//   fp_inv peaks at ~72 regs — fits the 85-reg budget → 3 concurrent blocks/SM
+//   → ~37% occupancy (vs 25% with 2 blocks/SM), another ~50% throughput gain.
 //
 // Shared-memory jump table: 128 × 96 = 12 288 B loaded once per block at launch.
 //   Eliminates constant-cache pressure: with 256 threads × 16 384 steps, every
-//   thread's random ji hits a different cache line — shared mem absorbs all 128
-//   entries in L1 (Ampere: 32 KB shared + 32 KB L1, Turing: 32/32 split).
+//   thread's random ji hits a different cache line — shared mem absorbs the entire
+//   table in L1 (Ampere/Ada: 100 KB configurable).
 
-__global__ __launch_bounds__(BLOCK_SIZE, 2)
+__global__ __launch_bounds__(BLOCK_SIZE, 3)
 void kangaroo_walk(
     Animal*  __restrict__ animals,
     DPEntry* __restrict__ dp_buf,
