@@ -40,6 +40,9 @@
 
 __constant__ JumpPoint g_jumps[NUM_JUMPS];
 
+// ─── Persistent-mode terminate flag ──────────────────────────────────────────
+__device__ volatile u32 g_terminate_flag;
+
 // ─── Affine Kangaroo kernel ───────────────────────────────────────────────────
 //
 // Every step:
@@ -113,6 +116,66 @@ void kangaroo_walk(
         for (int i = 0; i < 4; i++) { a.ax[i] = nx[i]; a.ay[i] = ny[i]; }
 
         // ── scalar accumulation ───────────────────────────────────────────────
+        u64 ns[4];
+        sc_add(a.scalar, jp.s, ns);
+        for (int i = 0; i < 4; i++) a.scalar[i] = ns[i];
+    }
+
+    animals[tid] = a;
+}
+
+// ─── Persistent Kangaroo kernel (runs until g_terminate_flag is set) ─────────
+//
+// Identical step logic to kangaroo_walk but loops indefinitely.
+// Host reads DP ring buffer live via kangaroo_read_dps_live() while kernel runs.
+// Eliminates all kernel-launch overhead (~5–10 μs per 65 K-step launch).
+__global__ __launch_bounds__(BLOCK_SIZE, 3)
+void kangaroo_walk_persistent(
+    Animal*  __restrict__ animals,
+    DPEntry* __restrict__ dp_buf,
+    u32*     __restrict__ dp_count,
+    u32  num_animals,
+    u64  dp_threshold,
+    u32  max_dps
+) {
+    __shared__ JumpPoint sh_jumps[NUM_JUMPS];
+    {
+        u64*       dst        = reinterpret_cast<u64*>(sh_jumps);
+        const u64* src        = reinterpret_cast<const u64*>(g_jumps);
+        const int  total_u64s = NUM_JUMPS * 12;
+        for (int k = (int)threadIdx.x; k < total_u64s; k += BLOCK_SIZE)
+            dst[k] = src[k];
+        __syncthreads();
+    }
+
+    u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_animals) return;
+
+    Animal a = animals[tid];
+
+    while (!g_terminate_flag) {
+        u64 cx[4];
+        canonical_x_affine(a.ax, cx);
+
+        if (cx[3] < dp_threshold) {
+            u32 slot = atomicAdd(dp_count, 1u) % max_dps;
+            DPEntry dp;
+            for (int i = 0; i < 4; i++) {
+                dp.canon_x[i] = cx[i];
+                dp.scalar[i]  = a.scalar[i];
+            }
+            dp.is_wild   = a.is_wild;
+            dp.pad[0] = dp.pad[1] = dp.pad[2] = 0;
+            dp_buf[slot] = dp;
+        }
+
+        u32 ji = (u32)(cx[0] % (u64)NUM_JUMPS);
+        const JumpPoint jp = sh_jumps[ji];
+
+        u64 nx[4], ny[4];
+        affine_add(a.ax, a.ay, jp.x, jp.y, nx, ny);
+        for (int i = 0; i < 4; i++) { a.ax[i] = nx[i]; a.ay[i] = ny[i]; }
+
         u64 ns[4];
         sc_add(a.scalar, jp.s, ns);
         for (int i = 0; i < 4; i++) a.scalar[i] = ns[i];
@@ -224,6 +287,44 @@ void cuda_device_name(int dev, char* buf, int len) {
 u64 cuda_device_memory(int dev) {
     cudaDeviceProp p; cudaGetDeviceProperties(&p, dev);
     return (u64)p.totalGlobalMem;
+}
+
+// ── Persistent kernel API ─────────────────────────────────────────────────────
+
+void kangaroo_launch_persistent(KangarooCtx* ctx) {
+    u32 zero = 0;
+    cudaMemcpyToSymbol(g_terminate_flag, &zero, sizeof(u32));
+    cudaMemset(ctx->d_dp_count, 0, sizeof(u32));
+    kangaroo_walk_persistent<<<ctx->grid, BLOCK_SIZE>>>(
+        ctx->d_animals, ctx->d_dp_buf, ctx->d_dp_count,
+        ctx->num_animals, ctx->dp_threshold, ctx->max_dps
+    );
+    // Returns immediately — kernel runs in background
+}
+
+void kangaroo_terminate(KangarooCtx* ctx) {
+    u32 flag = 1;
+    cudaMemcpyToSymbol(g_terminate_flag, &flag, sizeof(u32));
+    cudaDeviceSynchronize();
+}
+
+// Read DPs without stopping the persistent kernel.
+// The ring buffer may have races; corrupted entries hash to no match → safe to ignore.
+u32 kangaroo_read_dps_live(KangarooCtx* ctx, DPEntry* host_buf, u32 max) {
+    u32 count;
+    cudaMemcpy(&count, ctx->d_dp_count, sizeof(u32), cudaMemcpyDeviceToHost);
+    u32 to_read = count < max ? count : max;
+    to_read = to_read < MAX_DPS ? to_read : MAX_DPS;
+    if (to_read > 0) {
+        cudaMemcpy(host_buf, ctx->d_dp_buf,
+                   to_read * sizeof(DPEntry), cudaMemcpyDeviceToHost);
+        cudaMemset(ctx->d_dp_count, 0, sizeof(u32));
+    }
+    return to_read;
+}
+
+void kangaroo_update_dp_threshold(KangarooCtx* ctx, u32 dp_bits) {
+    ctx->dp_threshold = (dp_bits >= 64) ? 0ULL : (1ULL << (64 - dp_bits));
 }
 
 } // extern "C"

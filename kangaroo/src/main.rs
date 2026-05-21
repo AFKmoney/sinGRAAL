@@ -135,8 +135,16 @@ mod ffi {
         ) -> *mut KangarooCtx;
         pub fn kangaroo_step(ctx: *mut KangarooCtx) -> u32;
         pub fn kangaroo_read_dps(ctx: *mut KangarooCtx, host_buf: *mut DPEntry, max: u32) -> u32;
+        pub fn kangaroo_read_animals(ctx: *mut KangarooCtx, host_buf: *mut Animal);
+        pub fn kangaroo_write_animals(ctx: *mut KangarooCtx, host_buf: *const Animal);
         pub fn kangaroo_free(ctx: *mut KangarooCtx);
         pub fn kangaroo_num_jumps() -> u32;
+
+        // Persistent kernel API
+        pub fn kangaroo_launch_persistent(ctx: *mut KangarooCtx);
+        pub fn kangaroo_terminate(ctx: *mut KangarooCtx);
+        pub fn kangaroo_read_dps_live(ctx: *mut KangarooCtx, host_buf: *mut DPEntry, max: u32) -> u32;
+        pub fn kangaroo_update_dp_threshold(ctx: *mut KangarooCtx, dp_bits: u32);
     }
 }
 
@@ -476,12 +484,45 @@ fn run_gpu(
     let mut last_ckpt   = t0;
     const CKPT_INTERVAL_S: f64 = 60.0;
 
-    while !found.load(Ordering::Relaxed) {
-        let _cumulative = unsafe { kangaroo_step(ctx) };
-        total_steps += args.num_animals as u64 * args.steps_per_launch as u64;
+    // ── Dynamic dp_bits: start easy (8× more DPs), tighten as table fills ────────
+    let base_dp_bits = args.dp_bits.unwrap_or(28);
+    let mut cur_dp_bits = base_dp_bits.saturating_sub(3).max(16);
+    let dp_tighten_at = |bits_above_base: u32| 1usize << (19 + bits_above_base);
 
-        let n_dps = unsafe { kangaroo_read_dps(ctx, dp_buf.as_mut_ptr(), dp_cap) } as usize;
+    // ── DPs/s exponential moving average ─────────────────────────────────────────
+    let mut dp_rate_ema: f64 = 0.0;
+    let mut last_dp_count = 0u64;
+    let mut last_rate_time = t0;
+
+    // ── Dead-wild restart tracking ────────────────────────────────────────────────
+    let mut restarts_done = 0u32;
+    let mut last_restart = t0;
+    const RESTART_INTERVAL_S: f64 = 300.0;
+
+    // Launch persistent kernel once
+    unsafe { kangaroo_launch_persistent(ctx) };
+
+    while !found.load(Ordering::Relaxed) {
+        // Poll every 200ms — kernel runs continuously in background
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let n_dps = unsafe { kangaroo_read_dps_live(ctx, dp_buf.as_mut_ptr(), dp_cap) } as usize;
+        // Estimate steps from elapsed time and known GPU throughput
+        total_steps += args.num_animals as u64 * (args.steps_per_launch as u64 / 32).max(1);
         total_dps += n_dps as u64;
+
+        // ── DPs/s exponential moving average ─────────────────────────────────────
+        {
+            let now = Instant::now();
+            let dt = now.duration_since(last_rate_time).as_secs_f64();
+            if dt > 1.0 {
+                let new_dp_rate = (total_dps - last_dp_count) as f64 / dt;
+                dp_rate_ema = if dp_rate_ema == 0.0 { new_dp_rate }
+                              else { 0.1 * new_dp_rate + 0.9 * dp_rate_ema };
+                last_dp_count = total_dps;
+                last_rate_time = now;
+            }
+        }
 
         if let Some(ref mut conn) = coord {
             // ── Distributed mode: send DPs to coordinator ──────────────────────
@@ -522,11 +563,26 @@ fn run_gpu(
         }
 
         let elapsed = t0.elapsed().as_secs_f64();
+        let table_sz = dp_table.lock().unwrap().len();
 
-        // Progress every 10 launches
-        if total_steps % (args.num_animals as u64 * args.steps_per_launch as u64 * 10) == 0 {
+        // ── Tighten dp_bits as table fills (dynamic warm-up) ─────────────────────
+        if cur_dp_bits < base_dp_bits {
+            let gap = base_dp_bits - cur_dp_bits;
+            if table_sz >= dp_tighten_at(3 - gap.min(3)) {
+                cur_dp_bits += 1;
+                // Relaunch with new threshold: terminate current, update, relaunch
+                unsafe {
+                    kangaroo_terminate(ctx);
+                    kangaroo_update_dp_threshold(ctx, cur_dp_bits);
+                    kangaroo_launch_persistent(ctx);
+                }
+                eprintln!("[GPU {}] dp_bits tightened to {} (table={} DPs)", dev, cur_dp_bits, table_sz);
+            }
+        }
+
+        // Progress reporting (approximately every ~2 seconds given 200ms poll)
+        if total_steps % (args.num_animals as u64 * (args.steps_per_launch as u64 / 32).max(1) * 10) == 0 {
             let rate = total_steps as f64 / elapsed / 1e6;
-            let table_sz = dp_table.lock().unwrap().len();
             // ETA estimate: √12 = √6 (6-aut) × √2 (GLV 2D torus) combined speedup
             let expected_ops = 1.7f64 * f64::powi(2.0, args.range_bits as i32 / 2) / 12f64.sqrt();
             let eta_s = (expected_ops / 1e6 - total_steps as f64) / rate / 1e3;
@@ -538,12 +594,13 @@ fn run_gpu(
                 format!("{:.1}h", eta_h)
             };
             eprintln!(
-                "[GPU {}] {:.2}B steps ({:.1}%) | {} DPs | {:.0}M step/s | dp_table={} | ETA~{}",
+                "[GPU {}] {:.2}B steps ({:.1}%) | {} DPs | {:.0}M step/s | {:.1} DP/s | table={} | ETA~{}",
                 dev,
                 total_steps as f64 / 1e9,
                 pct,
                 total_dps,
                 rate,
+                dp_rate_ema,
                 table_sz,
                 eta_str,
             );
@@ -551,7 +608,7 @@ fn run_gpu(
 
         // Checkpoint every 60s (only GPU 0 saves to avoid races)
         if gpu_idx == 0 && !args.no_checkpoint {
-            let since_ckpt = t0.duration_since(last_ckpt).as_secs_f64();
+            let since_ckpt = Instant::now().duration_since(last_ckpt).as_secs_f64();
             if since_ckpt > CKPT_INTERVAL_S {
                 let table = dp_table.lock().unwrap().clone();
                 save_checkpoint(&table, &args.checkpoint);
@@ -559,8 +616,45 @@ fn run_gpu(
                 eprintln!("[GPU {}] checkpoint saved ({} DPs)", dev, table.len());
             }
         }
+
+        // ── Dead-wild restart: every 5 min, refresh 10% of wild animals ──────────
+        if !args.no_checkpoint {
+            let since_restart = Instant::now().duration_since(last_restart).as_secs_f64();
+            if since_restart > RESTART_INTERVAL_S {
+                let n_wild = (args.num_animals - args.num_animals / 2) as usize;
+                let refresh_count = (n_wild / 10).max(1);
+                let n_tame = (args.num_animals / 2) as usize;
+
+                // Read current animals
+                let mut host_animals: Vec<ffi::Animal> =
+                    (0..args.num_animals as usize).map(|_| unsafe { std::mem::zeroed() }).collect();
+                unsafe { ffi::kangaroo_read_animals(ctx, host_animals.as_mut_ptr()) };
+
+                // Refresh the last refresh_count wild animals with new starting positions
+                restarts_done += 1;
+                for i in 0..refresh_count {
+                    let wild_idx = n_tame + n_wild - 1 - i;
+                    if wild_idx >= host_animals.len() { break; }
+                    let global_wild_idx = (gpu_idx as u32)
+                        .wrapping_mul(0x9e3779b7)
+                        .wrapping_add(i as u32)
+                        .wrapping_add(restarts_done.wrapping_mul(0x517cc1b7));
+                    let (wp, ws) = make_wild(global_wild_idx ^ 0xcafe0000, gpu_idx + 1000 * restarts_done as usize, target, args.range_bits);
+                    host_animals[wild_idx] = ffi::Animal {
+                        ax: wp.x, ay: wp.y,
+                        scalar: ws, is_wild: 1, _pad: [0; 3],
+                    };
+                }
+
+                // Write back without stopping kernel
+                unsafe { ffi::kangaroo_write_animals(ctx, host_animals.as_ptr()) };
+                last_restart = Instant::now();
+                eprintln!("[GPU {}] refreshed {} wild animals (restart #{})", dev, refresh_count, restarts_done);
+            }
+        }
     }
 
+    unsafe { kangaroo_terminate(ctx) };
     unsafe { kangaroo_free(ctx) };
 }
 
