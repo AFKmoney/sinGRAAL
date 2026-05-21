@@ -41,12 +41,13 @@ struct Args {
     range_bits: u32,
 
     /// Animals per GPU (must be multiple of 256)
-    #[arg(long, default_value = "131072")]
+    #[arg(long, default_value = "262144")]
     num_animals: u32,
 
-    /// DP difficulty — 1 DP per 2^dp_bits steps
-    #[arg(long, default_value = "28")]
-    dp_bits: u32,
+    /// DP difficulty — 1 DP per 2^dp_bits steps.
+    /// Defaults to range_bits/2 − 10 (optimal table size vs DP rate tradeoff).
+    #[arg(long)]
+    dp_bits: Option<u32>,
 
     /// Affine steps per GPU launch — larger = less kernel-launch overhead
     #[arg(long, default_value = "65536")]
@@ -293,7 +294,8 @@ fn cpu_solve(args: &Args, target: Pt, dp_table: DpTable, found: Arc<AtomicBool>)
     const NUM_JUMPS: usize = 128;
     let jumps = build_jumps(args.range_bits, NUM_JUMPS);
     let jump_idx = |x: Fe| (x[0] % NUM_JUMPS as u64) as usize;
-    let is_dp    = |x: Fe| x[3] < (1u64 << (64u32.saturating_sub(args.dp_bits)));
+    let dp_bits  = args.dp_bits.unwrap_or(28);
+    let is_dp    = |x: Fe| x[3] < (1u64 << (64u32.saturating_sub(dp_bits)));
 
     let n = (args.num_animals / 2).max(1) as usize;
     let mut tames: Vec<(Pt, Fe)> = (0..n as u32).map(|i| make_tame(i, args.range_bits)).collect();
@@ -402,7 +404,7 @@ fn run_gpu(
         kangaroo_init(
             host_animals.as_ptr(),
             args.num_animals,
-            args.dp_bits,
+            args.dp_bits.unwrap_or(28),
             args.steps_per_launch,
         )
     };
@@ -478,8 +480,8 @@ fn run_gpu(
         if total_steps % (args.num_animals as u64 * args.steps_per_launch as u64 * 10) == 0 {
             let rate = total_steps as f64 / elapsed / 1e6;
             let table_sz = dp_table.lock().unwrap().len();
-            // ETA estimate: birthday bound ≈ 2·√(range/6) / (n_gpus * num_animals)
-            let expected_ops = 2.0f64 * f64::powi(2.0, (args.range_bits as i32) / 2 - 1) / 6f64.sqrt();
+            // ETA estimate: 6-aut Kangaroo expected ops ≈ 2·√(range/6)
+            let expected_ops = 2.0f64 * f64::powi(2.0, args.range_bits as i32 / 2) / 6f64.sqrt();
             let eta_s = (expected_ops / 1e6 - total_steps as f64) / rate / 1e3;
             eprintln!(
                 "[GPU {}] {:.2}B steps | {} DPs | {:.0}M step/s | dp_table={} | ETA~{:.0}h",
@@ -509,18 +511,34 @@ fn run_gpu(
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
+// Resolve effective dp_bits: user override or auto-tune from range_bits.
+// Optimal: dp_bits ≈ range_bits/2 − 10 keeps the DP table at ~1M entries
+// at collision time while ensuring DPs are dense enough for fast detection.
+fn effective_dp_bits(args: &Args) -> u32 {
+    args.dp_bits.unwrap_or_else(|| {
+        (args.range_bits / 2).saturating_sub(10).max(16).min(40)
+    })
+}
+
 fn main() {
-    let args = Arc::new(Args::parse());
+    let mut args = Args::parse();
+    // Resolve dp_bits once, store back so all code paths see the same value
+    let dp_bits = effective_dp_bits(&args);
+    args.dp_bits = Some(dp_bits);
+    let args = Arc::new(args);
 
     let tx = fe_from_hex(&args.target_x).expect("--target-x: need 64 hex chars");
     let ty = fe_from_hex(&args.target_y).expect("--target-y: need 64 hex chars");
     let target = Pt { x: tx, y: ty, inf: false };
 
-    eprintln!("sinGRAAL Kangaroo v4 — 6-automorphism secp256k1 ECDLP");
+    eprintln!("sinGRAAL Kangaroo v5 — 6-automorphism secp256k1 ECDLP");
     eprintln!("  target  = 0x{}:0x{}", fe_to_hex(tx), fe_to_hex(ty));
     eprintln!("  range   = [0, 2^{})", args.range_bits);
     eprintln!("  animals = {} per device", args.num_animals);
-    eprintln!("  dp_bits = {}", args.dp_bits);
+    eprintln!("  dp_bits = {}", dp_bits);
+    // Expected ops (informational):
+    let exp_ops = 2.0f64 * (2.0f64).powi(args.range_bits as i32 / 2) / 6f64.sqrt();
+    eprintln!("  E[ops]  = {:.2e}  (6-aut kangaroo, ~2√(range/6))", exp_ops);
     if let Some(ref c) = args.coordinator { eprintln!("  coord   = {c}"); }
 
     // ── Coordinator (server) mode ────────────────────────────────────────────
