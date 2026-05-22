@@ -96,6 +96,7 @@ pub fn run_4d_research(bits: u32) {
     section_improved_lll(bits);
     section_gls_proposal();
     section_verdict_4d(bits);
+    analyze_twist_order();
 }
 
 // ─── Section 1: Why 2D is the ceiling ─────────────────────────────────────────
@@ -480,11 +481,111 @@ pub fn analyze_torsion() {
     } else {
         println!("    3 | n  →  E(F_p)[3] has 3 or 9 elements");
     }
-    println!("  Since n' ≡ {} (mod 3):", (2 * p_mod3 + 2 + 3 - n_mod3) % 3);
-    if (2 * p_mod3 + 2 + 3 - n_mod3) % 3 == 0 {
+    let n_prime_mod3 = (2 * p_mod3 + 2 + 3 - n_mod3) % 3;
+    println!("  Since n' ≡ {} (mod 3):", n_prime_mod3);
+    if n_prime_mod3 == 0 {
         println!("    3 | n'  →  E'(F_p)[3] has 3 or 9 points ← POHLIG-HELLMAN APPLICABLE");
     } else {
         println!("    3 ∤ n'  →  E'(F_p)[3] = {{O}}");
+    }
+    println!();
+}
+
+// ─── Twist Order Computation ──────────────────────────────────────────────────
+
+/// Compute n' = 2p + 2 - n (the quadratic twist order) using raw 256-bit arithmetic.
+/// Returns [u64; 4] little-endian (may overflow 256 bits — high bit in carry is discarded
+/// since n' < 2p which is just over 256 bits; we care about n' mod small primes here).
+pub fn twist_order_low() -> Fe {
+    // n' = 2p + 2 - n
+    // Step 1: t = 2p
+    let mut t = [0u64; 4];
+    let mut carry = false;
+    for i in 0..4 {
+        let (s, c1) = FIELD_P[i].overflowing_add(FIELD_P[i]);
+        let (s, c2) = s.overflowing_add(carry as u64);
+        t[i] = s; carry = c1 || c2;
+    }
+    // Step 2: t += 2
+    let (s, c) = t[0].overflowing_add(2u64);
+    t[0] = s;
+    if c { t[1] = t[1].wrapping_add(1); }
+    // Step 3: t -= n  (t > n since 2p+2 > n)
+    let mut borrow = false;
+    for i in 0..4 {
+        let (s, b1) = t[i].overflowing_sub(FIELD_N[i]);
+        let (s, b2) = s.overflowing_sub(borrow as u64);
+        t[i] = s; borrow = b1 || b2;
+    }
+    // borrow here means 2p+2 < n which is impossible (p ≈ n so 2p+2 >> n)
+    t
+}
+
+/// Print a detailed analysis of the twist order and TPKH (Twist Pohlig-Hellman) potential.
+pub fn analyze_twist_order() {
+    println!("\n━━━ TWIST ORDER & TPKH ANALYSIS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+
+    let np = twist_order_low();
+    println!("  n' = 2p + 2 - n  (quadratic twist order, 256-bit)");
+    println!("  n' (low 256 bits) = 0x{}", fe_to_hex(np));
+    println!();
+
+    // Check divisibility by small primes
+    let small_primes = [2u64, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47];
+    println!("  n' mod small primes:");
+    for &p in &small_primes {
+        // Compute n' mod p using Horner's method on the limbs
+        let mut rem: u64 = 0;
+        for i in (0..4).rev() {
+            // rem = (rem * 2^64 + np[i]) mod p
+            // 2^64 mod p:
+            let hi = ((rem as u128).wrapping_mul((u64::MAX as u128 % p as u128 + 1) % p as u128)
+                      + np[i] as u128 % p as u128) % p as u128;
+            rem = hi as u64;
+        }
+        let divides = if rem == 0 { " ← divides!" } else { "" };
+        println!("    n' mod {:>3} = {}{}", p, rem, divides);
+    }
+    println!();
+
+    // v11 improvement summary
+    println!("  TPKH potential (if small factors confirmed in full n'):");
+    println!("  ─────────────────────────────────────────────────────────────");
+    println!("    Suppose 3² × 13² | n'  (= 9 × 169 = 1521)");
+    println!("    → Extract k mod 1521 via Pohlig-Hellman on E'[3] and E'[13]");
+    println!("    → Kangaroo range reduced by 1521×");
+    println!("    → Ops: 2^67.5 → 2^67.5 / √1521 ≈ 2^61.5  (64× fewer)");
+    println!();
+    println!("  CAVEAT: The target P is on E(F_p), not E'(F_p).");
+    println!("  Direct TPKH requires a bridge between E and E' DLPs.");
+    println!("  Known bridge: if the puzzle key k satisfies k² ≡ δ (mod p)");
+    println!("  for the twist parameter δ, points lift to E'. Otherwise,");
+    println!("  the torsion information on E' doesn't directly constrain k.");
+    println!();
+    println!("  Status: the low 256 bits of n' are shown above.");
+    println!("  Full verification requires 257-bit arithmetic (n' > 2^256).");
+    println!("  Computing exact small-prime factorization of n'...");
+
+    // More precise: compute n' mod 9, mod 169
+    let mut np9: u64 = 0;
+    for i in (0..4).rev() {
+        np9 = ((np9 as u128 * ((u64::MAX as u128 % 9 + 1)) + np[i] as u128) % 9) as u64;
+    }
+    let mut np169: u64 = 0;
+    for i in (0..4).rev() {
+        np169 = ((np169 as u128 * ((u64::MAX as u128 % 169 + 1)) + np[i] as u128) % 169) as u64;
+    }
+    println!("    n' mod 9   = {}", np9);
+    println!("    n' mod 169 = {}", np169);
+    if np9 == 0 {
+        println!("    → 9 | n'  ✓  E'[3](F_p) has ≥ 9 points");
+    } else {
+        println!("    → 9 ∤ n'  (3-torsion smaller than expected)");
+    }
+    if np169 == 0 {
+        println!("    → 169 | n'  ✓  E'[13](F_p) has ≥ 169 points");
+    } else {
+        println!("    → 169 ∤ n'  (13-torsion smaller than expected)");
     }
     println!();
 }

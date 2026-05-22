@@ -193,15 +193,17 @@ struct Jump { pt: Pt, scalar: Fe }
 ///   • Axis 1 (N/3 ≤ i < 2N/3): φ(G)-dir — point (β·xᵢ,yᵢ), scalar λ·δᵢ mod n
 ///   • Axis 2 (i ≥ 2N/3): φ²(G)-dir     — point (β²·xᵢ,yᵢ), scalar λ²·δᵢ mod n
 ///
-/// JUMP DISTRIBUTION — 17-band geometric (v10, optimal for 256-jump budget):
+/// JUMP DISTRIBUTION — 29-band geometric (v11, best fit for 256-jump budget):
 ///
 ///   Kangaroo constant C ≈ 1 + 2/ln(r) where r = largest/smallest jump ratio.
 ///
-///   5-band [-2..+2]:  r = 2^4  = 16,      C ≈ 1.72   (v5-v7)
-///   9-band [-4..+4]:  r = 2^8  = 256,     C ≈ 1.36   (v8-v9)
-///  17-band [-8..+8]:  r = 2^16 = 65536,   C ≈ 1.18   (v10, this version)
+///   5-band [-2..+2]:  r = 2^4  = 16,           C ≈ 1.72   (v5-v7)
+///   9-band [-4..+4]:  r = 2^8  = 256,           C ≈ 1.36   (v8-v9)
+///  17-band [-8..+8]:  r = 2^16 = 65536,         C ≈ 1.18   (v10)
+///  29-band [-14..+14]: r = 2^28 ≈ 2.68×10^8,   C ≈ 1.10   (v11, this version)
 ///
-///   With NUM_JUMPS=256: 256/3 axes = 85/axis, 85/17 bands = 5/band — valid.
+///   With NUM_JUMPS=256: 256/3 axes = 85/axis, 85/29 ≈ 2.9/band — valid.
+///   Theoretical optimal: 3-5 jumps/band. 29 bands gives C ≈ 1.10 (7% vs v10).
 ///   Shared memory: 256 × 96 B × 3 blocks = 72 KB < 100 KB Ampere/Ada limit.
 ///   Jump selection: cx[0] & 0xFF (bitmask — 1 GPU instruction, no division).
 ///
@@ -215,9 +217,9 @@ fn build_jumps(range_bits: u32, num_jumps: usize) -> Vec<Jump> {
     let mut jumps = Vec::with_capacity(num_jumps);
     let mut global_i = 0usize;
 
-    // 17-band geometric: spread [2^(mu-8) .. 2^(mu+8)], factor 2^16 = 65536.
-    const NUM_BANDS: usize = 17;
-    const BAND_HALF: i32   = (NUM_BANDS / 2) as i32;  // 8
+    // 29-band geometric: spread [2^(mu-14) .. 2^(mu+14)], factor 2^28.
+    const NUM_BANDS: usize = 29;
+    const BAND_HALF: i32   = (NUM_BANDS / 2) as i32;  // 14
 
     for axis in 0..3usize {
         for local_i in 0..axis_sizes[axis] {
@@ -726,7 +728,7 @@ fn run_gpu(
             let rate_gstep = total_steps as f64 / elapsed / 1e9;  // Gstep/s
             // ETA: full 3-axis hexagonal lattice (G + φG + φ²G) → constant ~1.65
             // vs 2-axis (G + φG only) → ~1.70.  Factor √12 = √6-aut × √2-GLV.
-            let expected_ops = 1.18f64 * f64::powi(2.0, args.range_bits as i32 / 2) / 12f64.sqrt();
+            let expected_ops = 1.10f64 * f64::powi(2.0, args.range_bits as i32 / 2) / 12f64.sqrt();
             let remaining    = (expected_ops - total_steps as f64).max(0.0);
             let eta_s        = remaining / (total_steps as f64 / elapsed.max(1.0));
             let pct = (total_steps as f64 / expected_ops * 100.0).min(99.9);
@@ -848,14 +850,14 @@ fn main() {
     let ty = fe_from_hex(&args.target_y).expect("--target-y: need 64 hex chars");
     let target = Pt { x: tx, y: ty, inf: false };
 
-    eprintln!("sinGRAAL Kangaroo v8 — 6-automorphism secp256k1 ECDLP (3-axis GLV)");
+    eprintln!("sinGRAAL Kangaroo v11 — 6-automorphism secp256k1 ECDLP (3-axis GLV, 29-band C≈1.10)");
     eprintln!("  target  = 0x{}:0x{}", fe_to_hex(tx), fe_to_hex(ty));
     eprintln!("  range   = [0, 2^{})", args.range_bits);
     eprintln!("  animals = {} per device", args.num_animals);
     eprintln!("  dp_bits = {}", dp_bits);
     // Expected ops (informational):
-    let exp_ops = 1.18f64 * (2.0f64).powi(args.range_bits as i32 / 2) / 12f64.sqrt();
-    eprintln!("  E[ops]  = {:.2e}  (6-aut+GLV3+17-band, ~1.18√(range/12))", exp_ops);
+    let exp_ops = 1.10f64 * (2.0f64).powi(args.range_bits as i32 / 2) / 12f64.sqrt();
+    eprintln!("  E[ops]  = {:.2e}  (6-aut+GLV3+29-band, ~1.10√(range/12))", exp_ops);
     if let Some(ref c) = args.coordinator { eprintln!("  coord   = {c}"); }
 
     // ── Structure analysis mode ──────────────────────────────────────────────
