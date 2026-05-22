@@ -19,6 +19,7 @@
 mod secp;
 mod glv;
 mod coordinator;
+mod research;
 
 use clap::Parser;
 use secp::*;
@@ -36,10 +37,12 @@ use std::fs::File;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "kangaroo", about = "sinGRAAL 6-aut Kangaroo ECDLP solver for secp256k1")]
 struct Args {
-    #[arg(long)]
+    /// Target point x-coordinate (64 hex chars). Optional when --research is used.
+    #[arg(long, default_value = "")]
     target_x: String,
 
-    #[arg(long)]
+    /// Target point y-coordinate (64 hex chars). Optional when --research is used.
+    #[arg(long, default_value = "")]
     target_y: String,
 
     #[arg(long, default_value = "135")]
@@ -98,6 +101,13 @@ struct Args {
     /// (fractal hierarchy, Frobenius, twist order, GLV optimality check)
     #[arg(long)]
     analyze: bool,
+
+    /// Run sub-exponential ECDLP research mode: mathematical landscape analysis,
+    /// GLV statistics experiment, Semaev complexity curve, novel directions.
+    /// Can run standalone (no --target-x/y required).
+    /// Example: kangaroo --research --range-bits 64
+    #[arg(long)]
+    research: bool,
 }
 
 // ─── CUDA FFI ────────────────────────────────────────────────────────────────
@@ -812,6 +822,13 @@ fn main() {
     // Resolve dp_bits once, store back so all code paths see the same value
     let dp_bits = effective_dp_bits(&args);
     args.dp_bits = Some(dp_bits);
+
+    // Research mode can run standalone (no --target-x/y required)
+    if args.research {
+        research::run_research(args.range_bits);
+        return;
+    }
+
     let args = Arc::new(args);
 
     let tx = fe_from_hex(&args.target_x).expect("--target-x: need 64 hex chars");
