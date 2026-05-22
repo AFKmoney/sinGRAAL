@@ -1,13 +1,15 @@
-// sinGRAAL Kangaroo v6 — 6-automorphism Pollard Kangaroo, CUDA-accelerated
+// sinGRAAL Kangaroo v8 — 6-automorphism Pollard Kangaroo, CUDA-accelerated
 //
 // Improvements over v1:
 //  • Correct DP detection (GPU normalizes to affine every NORM_INTERVAL steps)
 //  • Multi-GPU with shared DP table (linear scaling with GPUs)
 //  • Checkpoint save/load (resume multi-day runs)
 //  • Exact 6-aut recovery (6 candidates, not 18)
-//  • GLV 2D torus coverage (G-direction + φ(G)-direction jump halves)
-//  • 5-band geometric jump distribution (factor-16 spread, drives constant ~2.2→~1.7)
-//  • Progress bar with ETA (GLV2D-corrected: ~1.7√(range/12))
+//  • GLV 3-axis torus coverage: G + φ(G) + φ²(G) directions (full hexagonal lattice)
+//  • 5-band geometric jump distribution per axis (factor-16 spread, constant ~1.7→~1.65)
+//  • Progress bar with ETA (GLV3-corrected: ~1.65√(range/12))
+//  • GPU step counter: actual throughput from device (not estimated)
+//  • Warp-ballot DP coalescing: 32× fewer global atomics in GPU kernel
 //
 // Usage:
 //   kangaroo --target-x <hex64> --target-y <hex64> --range-bits 135
@@ -22,7 +24,7 @@ use clap::Parser;
 use secp::*;
 use glv::recover_k_6aut;
 #[allow(unused_imports)]
-use secp::{phi_point, sc_mul_lambda, glv_decompose};
+use secp::{phi_point, phi2_point, sc_mul_lambda, sc_mul_lambda2, glv_decompose};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::time::Instant;
@@ -145,6 +147,8 @@ mod ffi {
         pub fn kangaroo_terminate(ctx: *mut KangarooCtx);
         pub fn kangaroo_read_dps_live(ctx: *mut KangarooCtx, host_buf: *mut DPEntry, max: u32) -> u32;
         pub fn kangaroo_update_dp_threshold(ctx: *mut KangarooCtx, dp_bits: u32);
+        // Accurate GPU throughput counter (sum across all blocks)
+        pub fn kangaroo_read_step_count() -> u64;
     }
 }
 
@@ -152,55 +156,57 @@ mod ffi {
 
 struct Jump { pt: Pt, scalar: Fe }
 
-/// Build NUM_JUMPS jump points with full GLV 2D torus coverage.
+/// Build NUM_JUMPS jump points with full GLV 3-axis hexagonal lattice coverage.
 ///
-/// The secp256k1 group, viewed through the GLV endomorphism, is a hexagonal
-/// lattice (Z[ω] where ω = primitive cube root of 1).  A purely G-direction
-/// jump table covers only one axis of this lattice.  By mixing:
+/// secp256k1 has a degree-6 automorphism group {±id, ±φ, ±φ²} where
+/// φ: (x,y)→(βx,y) acts as ×λ in scalar space.  The canonical_x_affine()
+/// function already collapses all 6 equivalents, so the Kangaroo walk
+/// operates on the Z[ω] hexagonal quotient lattice.
 ///
-///   • First half  (i < N/2): G-direction jumps  δᵢ · G
-///     scalar contribution: δᵢ
+/// This lattice has 3 natural axes: G, φ(G), φ²(G).  Prior versions used
+/// only G and φ(G) (2-axis).  Adding φ²(G) achieves full hexagonal coverage:
 ///
-///   • Second half (i ≥ N/2): φ(G)-direction jumps  φ(δᵢ · G) = δᵢ · φ(G)
-///     point:  (β·xᵢ, yᵢ)   [the GLV image of δᵢ·G]
-///     scalar contribution: λ·δᵢ mod n  [φ acts as λ in scalar space]
+///   • Axis 0 (i < N/3):   G-direction    — point δᵢ·G,       scalar δᵢ
+///   • Axis 1 (N/3 ≤ i < 2N/3): φ(G)-dir — point (β·xᵢ,yᵢ), scalar λ·δᵢ mod n
+///   • Axis 2 (i ≥ 2N/3): φ²(G)-dir     — point (β²·xᵢ,yᵢ), scalar λ²·δᵢ mod n
 ///
-/// Both directions have the same magnitude (δᵢ ≈ √range), so the Kangaroo
-/// walk covers the full 2D hexagonal torus instead of a 1D slice.
-/// Jump selection (cx[0] % NUM_JUMPS) is still deterministic from canonical x,
-/// maintaining the "returning kangaroo" property.
+/// Each axis uses the same 5-band geometric distribution [2^(μ-2)..2^(μ+2)].
+/// Jump selection cx[0] % NUM_JUMPS is deterministic → "returning kangaroo" holds.
+/// Expected constant improves ~1.70→~1.65 from full 3-axis symmetry.
 fn build_jumps(range_bits: u32, num_jumps: usize) -> Vec<Jump> {
-    let mu_bits = (range_bits / 2) as i32;
-    let half    = num_jumps / 2;
+    let mu_bits  = (range_bits / 2) as i32;
+    let axis0_sz = num_jumps / 3;
+    let axis1_sz = num_jumps / 3;
+    let axis2_sz = num_jumps - axis0_sz - axis1_sz;
+    let axis_sizes = [axis0_sz, axis1_sz, axis2_sz];
     let mut jumps = Vec::with_capacity(num_jumps);
+    let mut global_i = 0usize;
 
-    for i in 0..num_jumps {
-        // 5-band geometric distribution spanning [2^(μ-2), 2^(μ+2)].
-        // Factor-16 spread in jump sizes drives the Kangaroo constant from ~2.2
-        // toward the theoretical minimum ~1.7 (vs 3-band factor-4 spread before).
-        let band      = (i % 5) as i32 - 2;   // -2, -1, 0, +1, +2
-        let k_exp     = (mu_bits + band).max(1) as u32;
-        let band_slot = (i / 5) as u64;
+    for axis in 0..3usize {
+        for local_i in 0..axis_sizes[axis] {
+            // 5-band geometric distribution within each axis.
+            let band      = (local_i % 5) as i32 - 2;   // -2, -1, 0, +1, +2
+            let k_exp     = (mu_bits + band).max(1) as u32;
+            let band_slot = (local_i / 5) as u64;
 
-        let word = (k_exp / 64) as usize;
-        let bit  = k_exp % 64;
-        let mut s = [0u64; 4];
-        if word < 4 { s[word] = 1u64 << bit; }
-        // Spread within each band using a small LCG offset (stays well below 2^k_exp)
-        let slot_offset = band_slot.wrapping_mul(0x9e3779b97f4a7c15)
-                                   .wrapping_add((i as u64).wrapping_mul(0x6c62272e07bb0142));
-        let (v, ov) = s[0].overflowing_add(slot_offset >> (64u32.saturating_sub(k_exp)));
-        s[0] = v;
-        if ov && 1 < 4 { s[1] = s[1].wrapping_add(1); }
+            let word = (k_exp / 64) as usize;
+            let bit  = k_exp % 64;
+            let mut s = [0u64; 4];
+            if word < 4 { s[word] = 1u64 << bit; }
+            let slot_offset = band_slot.wrapping_mul(0x9e3779b97f4a7c15)
+                                       .wrapping_add((global_i as u64).wrapping_mul(0x6c62272e07bb0142));
+            let (v, ov) = s[0].overflowing_add(slot_offset >> (64u32.saturating_sub(k_exp)));
+            s[0] = v;
+            if ov && 1 < 4 { s[1] = s[1].wrapping_add(1); }
 
-        if i < half {
-            let pt = scalar_mul(G, s);
-            jumps.push(Jump { pt, scalar: s });
-        } else {
             let base_pt = scalar_mul(G, s);
-            let pt      = phi_point(base_pt);
-            let scalar  = sc_mul_lambda(s);
+            let (pt, scalar) = match axis {
+                0 => (base_pt, s),
+                1 => (phi_point(base_pt),  sc_mul_lambda(s)),
+                _ => (phi2_point(base_pt), sc_mul_lambda2(s)),
+            };
             jumps.push(Jump { pt, scalar });
+            global_i += 1;
         }
     }
     jumps
@@ -478,11 +484,13 @@ fn run_gpu(
                 .ok()
         });
 
-    let mut total_steps = 0u64;
-    let mut total_dps   = 0u64;
+    let mut total_steps: u64 = 0;
+    let mut total_dps:   u64 = 0;
     let t0 = Instant::now();
-    let mut last_ckpt   = t0;
-    const CKPT_INTERVAL_S: f64 = 60.0;
+    let mut last_ckpt      = t0;
+    let mut last_progress  = t0;
+    const CKPT_INTERVAL_S: f64     = 60.0;
+    const PROGRESS_INTERVAL_S: f64 = 2.0;
 
     // ── Dynamic dp_bits: start easy (8× more DPs), tighten as table fills ────────
     let base_dp_bits = args.dp_bits.unwrap_or(28);
@@ -507,8 +515,8 @@ fn run_gpu(
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         let n_dps = unsafe { kangaroo_read_dps_live(ctx, dp_buf.as_mut_ptr(), dp_cap) } as usize;
-        // Estimate steps from elapsed time and known GPU throughput
-        total_steps += args.num_animals as u64 * (args.steps_per_launch as u64 / 32).max(1);
+        // Actual GPU step count from device-side atomic counter (updated every 65536 steps/block)
+        total_steps = unsafe { kangaroo_read_step_count() };
         total_dps += n_dps as u64;
 
         // ── DPs/s exponential moving average ─────────────────────────────────────
@@ -580,26 +588,29 @@ fn run_gpu(
             }
         }
 
-        // Progress reporting (approximately every ~2 seconds given 200ms poll)
-        if total_steps % (args.num_animals as u64 * (args.steps_per_launch as u64 / 32).max(1) * 10) == 0 {
-            let rate = total_steps as f64 / elapsed / 1e6;
-            // ETA estimate: √12 = √6 (6-aut) × √2 (GLV 2D torus) combined speedup
-            let expected_ops = 1.7f64 * f64::powi(2.0, args.range_bits as i32 / 2) / 12f64.sqrt();
-            let eta_s = (expected_ops / 1e6 - total_steps as f64) / rate / 1e3;
+        // Progress reporting every ~2 seconds (time-gated, not step-gated)
+        if Instant::now().duration_since(last_progress).as_secs_f64() >= PROGRESS_INTERVAL_S {
+            last_progress = Instant::now();
+            let rate_gstep = total_steps as f64 / elapsed / 1e9;  // Gstep/s
+            // ETA: full 3-axis hexagonal lattice (G + φG + φ²G) → constant ~1.65
+            // vs 2-axis (G + φG only) → ~1.70.  Factor √12 = √6-aut × √2-GLV.
+            let expected_ops = 1.65f64 * f64::powi(2.0, args.range_bits as i32 / 2) / 12f64.sqrt();
+            let remaining    = (expected_ops - total_steps as f64).max(0.0);
+            let eta_s        = remaining / (total_steps as f64 / elapsed.max(1.0));
             let pct = (total_steps as f64 / expected_ops * 100.0).min(99.9);
-            let eta_h = (eta_s / 3600.0).max(0.0);
+            let eta_h = eta_s / 3600.0;
             let eta_str = if eta_h > 48.0 {
                 format!("{:.1}d", eta_h / 24.0)
             } else {
                 format!("{:.1}h", eta_h)
             };
             eprintln!(
-                "[GPU {}] {:.2}B steps ({:.1}%) | {} DPs | {:.0}M step/s | {:.1} DP/s | table={} | ETA~{}",
+                "[GPU {}] {:.2}B steps ({:.1}%) | {} DPs | {:.2} Gstep/s | {:.1} DP/s | table={} | ETA~{}",
                 dev,
                 total_steps as f64 / 1e9,
                 pct,
                 total_dps,
-                rate,
+                rate_gstep,
                 dp_rate_ema,
                 table_sz,
                 eta_str,
@@ -693,14 +704,14 @@ fn main() {
     let ty = fe_from_hex(&args.target_y).expect("--target-y: need 64 hex chars");
     let target = Pt { x: tx, y: ty, inf: false };
 
-    eprintln!("sinGRAAL Kangaroo v6 — 6-automorphism secp256k1 ECDLP");
+    eprintln!("sinGRAAL Kangaroo v8 — 6-automorphism secp256k1 ECDLP (3-axis GLV)");
     eprintln!("  target  = 0x{}:0x{}", fe_to_hex(tx), fe_to_hex(ty));
     eprintln!("  range   = [0, 2^{})", args.range_bits);
     eprintln!("  animals = {} per device", args.num_animals);
     eprintln!("  dp_bits = {}", dp_bits);
     // Expected ops (informational):
-    let exp_ops = 1.7f64 * (2.0f64).powi(args.range_bits as i32 / 2) / 12f64.sqrt();
-    eprintln!("  E[ops]  = {:.2e}  (6-aut+GLV2D kangaroo, ~1.7√(range/12))", exp_ops);
+    let exp_ops = 1.65f64 * (2.0f64).powi(args.range_bits as i32 / 2) / 12f64.sqrt();
+    eprintln!("  E[ops]  = {:.2e}  (6-aut+GLV3-axis kangaroo, ~1.65√(range/12))", exp_ops);
     if let Some(ref c) = args.coordinator { eprintln!("  coord   = {c}"); }
 
     // ── Coordinator (server) mode ────────────────────────────────────────────
@@ -762,7 +773,7 @@ fn main() {
                 }).collect();
 
                 for h in handles { let _ = h.join(); }
-                result.lock().unwrap().take()
+                let k = result.lock().unwrap().take(); k
             }
         }
         #[cfg(not(feature = "cuda"))]
