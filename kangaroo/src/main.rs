@@ -20,6 +20,7 @@ mod secp;
 mod glv;
 mod coordinator;
 mod research;
+mod glv4d;
 
 use clap::Parser;
 use secp::*;
@@ -108,6 +109,13 @@ struct Args {
     /// Example: kangaroo --research --range-bits 64
     #[arg(long)]
     research: bool,
+
+    /// Run 4D GLV research mode: why 2D is the ceiling for secp256k1,
+    /// what genuine 4D would require, performance projections, GLS path,
+    /// Twist Pohlig-Hellman proposal (64× speedup, implementable today).
+    /// Example: kangaroo --research4d --range-bits 135
+    #[arg(long)]
+    research4d: bool,
 }
 
 // ─── CUDA FFI ────────────────────────────────────────────────────────────────
@@ -826,6 +834,11 @@ fn main() {
     // Research mode can run standalone (no --target-x/y required)
     if args.research {
         research::run_research(args.range_bits);
+        return;
+    }
+    if args.research4d {
+        glv4d::run_4d_research(args.range_bits);
+        glv4d::analyze_torsion();
         return;
     }
 
