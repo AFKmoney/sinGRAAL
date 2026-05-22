@@ -13,7 +13,9 @@ pub const GX: Fe     = [0x59F2815B16F81798, 0x029BFCDB2DCE28D9, 0x55A06295CE870B
 pub const GY: Fe     = [0x9C47D08FFB10D4B8, 0xFD17B448A6855419, 0x5DA4FBFC0E1108A8, 0x483ADA7726A3C465];
 pub const BETA: Fe   = [0xC1396C28719501EE, 0x9CF0497512F58995, 0x6E64479EAC3434E9, 0x7AE96A2B657C0710];
 pub const BETA2: Fe  = [0x3EC693D68E6AFA40, 0x630FB68AED0A766A, 0x919BB86153CBCB16, 0x851695D49A83F8EF];
-pub const LAMBDA: Fe = [0xDF02967C1B23BD72, 0x122E22EA20816678, 0xA5261C028812645A, 0x5363AD4CC05C30E0];
+pub const LAMBDA: Fe  = [0xDF02967C1B23BD72, 0x122E22EA20816678, 0xA5261C028812645A, 0x5363AD4CC05C30E0];
+// λ² ≡ -1 - λ (mod n)  since 1 + λ + λ² ≡ 0 (mod n)
+pub const LAMBDA2: Fe = [0xDCCFC810B51283CE, 0xA880B9FC8EC739C2, 0x5AD9E3FD77ED9BA4, 0xAC9C52B33FA3CF1F];
 
 // ─── Comparison ───────────────────────────────────────────────────────────────
 
@@ -275,10 +277,17 @@ pub fn phi_point(p: Pt) -> Pt {
     Pt { x: fp_mul(BETA, p.x), y: p.y, inf: false }
 }
 
+/// Apply φ²: (x, y) → (β²·x, y).  φ²(P) = λ²·P in scalar space.
+pub fn phi2_point(p: Pt) -> Pt {
+    if p.inf { return p; }
+    Pt { x: fp_mul(BETA2, p.x), y: p.y, inf: false }
+}
+
 /// Multiply scalar s by λ (the GLV eigenvalue) mod n.
-/// Used to track the accumulated scalar when a φ-direction jump is taken:
-///   φ(k·G) = (λ·k)·G, so adding jump φ(δ·G) increments scalar by λ·δ.
 pub fn sc_mul_lambda(s: Fe) -> Fe { sc_mul(LAMBDA, s) }
+
+/// Multiply scalar s by λ² mod n.
+pub fn sc_mul_lambda2(s: Fe) -> Fe { sc_mul(LAMBDA2, s) }
 
 /// GLV scalar decomposition: k = k1 + k2·λ  with |k1|, |k2| ≈ √k.
 ///
