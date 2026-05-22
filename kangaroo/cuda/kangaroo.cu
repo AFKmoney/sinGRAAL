@@ -36,7 +36,7 @@
 
 // ─── Tuning constants ─────────────────────────────────────────────────────────
 
-#define NUM_JUMPS  128
+#define NUM_JUMPS  256          // 256 × 96 B = 24 KB/block × 3 blocks = 72 KB < 100 KB limit
 #define MAX_DPS    (1u << 23)   // 8M ring buffer — prevents overflow on fast GPUs
 #define BLOCK_SIZE 256
 
@@ -65,10 +65,11 @@ __device__ unsigned long long g_step_count;
 //   fp_inv peaks at ~72 regs — fits the 85-reg budget → 3 concurrent blocks/SM
 //   → ~37% occupancy (vs 25% with 2 blocks/SM), another ~50% throughput gain.
 //
-// Shared-memory jump table: 128 × 96 = 12 288 B loaded once per block at launch.
+// Shared-memory jump table: 256 × 96 = 24 576 B loaded once per block at launch.
 //   Eliminates constant-cache pressure: with 256 threads × 16 384 steps, every
 //   thread's random ji hits a different cache line — shared mem absorbs the entire
-//   table in L1 (Ampere/Ada: 100 KB configurable).
+//   table in L1 (Ampere/Ada: 100 KB configurable; 3 blocks × 24 KB = 72 KB fits).
+//   Jump selection: cx[0] & 0xFF  (bitmask, one instruction, no division).
 
 __global__ __launch_bounds__(BLOCK_SIZE, 3)
 void kangaroo_walk(
@@ -85,7 +86,7 @@ void kangaroo_walk(
     {
         u64*       dst        = reinterpret_cast<u64*>(sh_jumps);
         const u64* src        = reinterpret_cast<const u64*>(g_jumps);
-        const int  total_u64s = NUM_JUMPS * 12;   // 128 × 12 u64s = 1536
+        const int  total_u64s = NUM_JUMPS * 12;   // 256 × 12 u64s = 3072
         for (int k = (int)threadIdx.x; k < total_u64s; k += BLOCK_SIZE)
             dst[k] = src[k];
         __syncthreads();
@@ -115,7 +116,7 @@ void kangaroo_walk(
         }
 
         // ── jump from shared mem (no constant-cache miss) ─────────────────────
-        u32 ji = (u32)(cx[0] % (u64)NUM_JUMPS);
+        u32 ji = (u32)(cx[0] & (NUM_JUMPS - 1u));   // NUM_JUMPS=256 → & 0xFF, 1 cycle
         const JumpPoint jp = sh_jumps[ji];
 
         // ── affine step (1 fp_inv + 4M + 2S, all PTX-accelerated) ────────────
@@ -201,7 +202,7 @@ void kangaroo_walk_persistent(
         }
 
         // ── Jump from shared mem ──────────────────────────────────────────────
-        u32 ji = (u32)(cx[0] % (u64)NUM_JUMPS);
+        u32 ji = (u32)(cx[0] & (NUM_JUMPS - 1u));   // NUM_JUMPS=256 → & 0xFF, 1 cycle
         const JumpPoint jp = sh_jumps[ji];
 
         u64 nx[4], ny[4];

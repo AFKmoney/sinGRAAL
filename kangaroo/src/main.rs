@@ -175,17 +175,19 @@ struct Jump { pt: Pt, scalar: Fe }
 ///   • Axis 1 (N/3 ≤ i < 2N/3): φ(G)-dir — point (β·xᵢ,yᵢ), scalar λ·δᵢ mod n
 ///   • Axis 2 (i ≥ 2N/3): φ²(G)-dir     — point (β²·xᵢ,yᵢ), scalar λ²·δᵢ mod n
 ///
-/// JUMP DISTRIBUTION — 9-band geometric (the key missing optimization):
+/// JUMP DISTRIBUTION — 17-band geometric (v10, optimal for 256-jump budget):
 ///
 ///   Kangaroo constant C ≈ 1 + 2/ln(r) where r = largest/smallest jump ratio.
 ///
-///   5-band [-2..+2]:  r = 2^4 = 16,   ln(16) = 2.77  →  C ≈ 1.72   (old)
-///   9-band [-4..+4]:  r = 2^8 = 256,  ln(256) = 5.55  →  C ≈ 1.36   (new)
+///   5-band [-2..+2]:  r = 2^4  = 16,      C ≈ 1.72   (v5-v7)
+///   9-band [-4..+4]:  r = 2^8  = 256,     C ≈ 1.36   (v8-v9)
+///  17-band [-8..+8]:  r = 2^16 = 65536,   C ≈ 1.18   (v10, this version)
 ///
-///   Result: ~21% fewer expected operations. Zero kernel/hardware change.
-///   Same 128 jumps, same 12 KB shared memory, only this function changes.
+///   With NUM_JUMPS=256: 256/3 axes = 85/axis, 85/17 bands = 5/band — valid.
+///   Shared memory: 256 × 96 B × 3 blocks = 72 KB < 100 KB Ampere/Ada limit.
+///   Jump selection: cx[0] & 0xFF (bitmask — 1 GPU instruction, no division).
 ///
-/// Jump selection cx[0] % NUM_JUMPS is deterministic → "returning kangaroo" holds.
+/// Jump selection is deterministic → "returning kangaroo" property holds.
 fn build_jumps(range_bits: u32, num_jumps: usize) -> Vec<Jump> {
     let mu_bits  = (range_bits / 2) as i32;
     let axis0_sz = num_jumps / 3;
@@ -195,13 +197,13 @@ fn build_jumps(range_bits: u32, num_jumps: usize) -> Vec<Jump> {
     let mut jumps = Vec::with_capacity(num_jumps);
     let mut global_i = 0usize;
 
-    // 9-band geometric: spread [2^(mu-4) .. 2^(mu+4)], factor 2^8 = 256.
-    const NUM_BANDS: usize = 9;
-    const BAND_HALF: i32   = (NUM_BANDS / 2) as i32;  // 4
+    // 17-band geometric: spread [2^(mu-8) .. 2^(mu+8)], factor 2^16 = 65536.
+    const NUM_BANDS: usize = 17;
+    const BAND_HALF: i32   = (NUM_BANDS / 2) as i32;  // 8
 
     for axis in 0..3usize {
         for local_i in 0..axis_sizes[axis] {
-            let band      = (local_i % NUM_BANDS) as i32 - BAND_HALF;  // -4..+4
+            let band      = (local_i % NUM_BANDS) as i32 - BAND_HALF;  // -8..+8
             let k_exp     = (mu_bits + band).max(1) as u32;
             let band_slot = (local_i / NUM_BANDS) as u64;
 
@@ -706,7 +708,7 @@ fn run_gpu(
             let rate_gstep = total_steps as f64 / elapsed / 1e9;  // Gstep/s
             // ETA: full 3-axis hexagonal lattice (G + φG + φ²G) → constant ~1.65
             // vs 2-axis (G + φG only) → ~1.70.  Factor √12 = √6-aut × √2-GLV.
-            let expected_ops = 1.36f64 * f64::powi(2.0, args.range_bits as i32 / 2) / 12f64.sqrt();
+            let expected_ops = 1.18f64 * f64::powi(2.0, args.range_bits as i32 / 2) / 12f64.sqrt();
             let remaining    = (expected_ops - total_steps as f64).max(0.0);
             let eta_s        = remaining / (total_steps as f64 / elapsed.max(1.0));
             let pct = (total_steps as f64 / expected_ops * 100.0).min(99.9);
@@ -822,8 +824,8 @@ fn main() {
     eprintln!("  animals = {} per device", args.num_animals);
     eprintln!("  dp_bits = {}", dp_bits);
     // Expected ops (informational):
-    let exp_ops = 1.36f64 * (2.0f64).powi(args.range_bits as i32 / 2) / 12f64.sqrt();
-    eprintln!("  E[ops]  = {:.2e}  (6-aut+GLV3-axis+9-band, ~1.36√(range/12))", exp_ops);
+    let exp_ops = 1.18f64 * (2.0f64).powi(args.range_bits as i32 / 2) / 12f64.sqrt();
+    eprintln!("  E[ops]  = {:.2e}  (6-aut+GLV3+17-band, ~1.18√(range/12))", exp_ops);
     if let Some(ref c) = args.coordinator { eprintln!("  coord   = {c}"); }
 
     // ── Structure analysis mode ──────────────────────────────────────────────
