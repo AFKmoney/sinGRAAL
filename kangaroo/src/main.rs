@@ -126,6 +126,18 @@ struct Args {
     #[arg(long)]
     research_semaev: bool,
 
+    /// Empirically test the Frobenius endomorphism π:(x,y)→(x^p,y^p) on secp256k1 points.
+    /// Proves whether GLS 4D is applicable to puzzle #135.
+    /// Example: kangaroo --research-gls
+    #[arg(long)]
+    research_gls: bool,
+
+    /// Benchmark canonical_Y branchless (AVX-512 concept) vs canonical_X (6×).
+    /// Measures compression ratio, fruitless cycle risk, GPU impact.
+    /// Example: kangaroo --research-canonical
+    #[arg(long)]
+    research_canonical: bool,
+
     /// Measure empirical Kangaroo constant C on random small-scale DLP instances.
     /// Compares measured C against theoretical 1.10 and published literature.
     /// Example: kangaroo --benchmark-c --range-bits 48 --trials 500
@@ -862,6 +874,14 @@ fn main() {
     }
     if args.research_semaev {
         semaev::run_semaev_research(args.range_bits);
+        return;
+    }
+    if args.research_gls {
+        glv4d::run_frobenius_experiment();
+        return;
+    }
+    if args.research_canonical {
+        glv4d::run_canonical_benchmark();
         return;
     }
     if args.benchmark_c {

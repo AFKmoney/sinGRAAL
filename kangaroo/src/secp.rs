@@ -348,6 +348,41 @@ pub fn canonical_x(x: Fe) -> Fe {
     m
 }
 
+// ─── Branchless canonical Y (2× compression) ─────────────────────────────────
+//
+// Choose between P=(x,y) and -P=(x,p-y) based on Y parity.
+// Canonical = Y with LSB=0 (even Y).
+// Branchless: compute p-y unconditionally, select via arithmetic mask.
+// This is the CPU equivalent of the AVX-512 _mm512_mask_blend_epi64 approach.
+//
+// Returns (canonical_y, negated: bool)
+pub fn canonical_y_branchless(y: Fe) -> (Fe, bool) {
+    let y_neg = fp_neg(y);
+    // mask = 0xFFFF...F if y[0] is odd, 0x0000...0 if even
+    let odd  = y[0] & 1;
+    let mask = odd.wrapping_neg(); // arithmetic: 1→all-ones, 0→all-zeros
+    let mut out = [0u64; 4];
+    for i in 0..4 {
+        out[i] = (y_neg[i] & mask) | (y[i] & !mask);
+    }
+    (out, odd == 1)
+}
+
+// Canonical point: choose (x, canonical_y) — 2× reduction only (vs 6× for canonical_x)
+pub fn canonical_pt_y(p: Pt) -> (Pt, bool) {
+    let (cy, neg) = canonical_y_branchless(p.y);
+    (Pt { x: p.x, y: cy, inf: p.inf }, neg)
+}
+
+// Full 6× canonical: canonical_x + note that ±P share x → catches both via x alone
+// canonical_x already subsumes canonical_y: min(x,βx,β²x) detects P AND -P collisions
+// This function benchmarks both for comparison
+pub fn canonical_compare(p: Pt) -> (Fe, Fe) {
+    let cx = canonical_x(p.x);          // 6× effective (catches ±P via same x)
+    let (cy, _) = canonical_y_branchless(p.y); // 2× (half the orbit)
+    (cx, cy)
+}
+
 // ─── Hex helpers ──────────────────────────────────────────────────────────────
 
 pub fn fe_to_hex(a: Fe) -> String {
