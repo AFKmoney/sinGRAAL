@@ -23,6 +23,7 @@ mod research;
 mod glv4d;
 mod fp2;
 mod gls;
+mod lll4d;
 
 use clap::Parser;
 use secp::*;
