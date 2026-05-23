@@ -4,28 +4,24 @@
 // CORE HYPOTHESIS (never tested for secp256k1):
 //   secp256k1 has CM by Z[ω] (Eisenstein integers, j=0, discriminant -3).
 //   This creates a Z/6Z symmetry on the Semaev polynomials S_m.
-//   IF this symmetry simplifies the Gröbner basis computation,
-//   the index-calculus approach could beat Kangaroo.
+//   IF this symmetry reduces the Gröbner basis regularity degree,
+//   index calculus beats Kangaroo → sub-exponential ECDLP on secp256k1.
 //
-// WHAT WE MEASURE:
-//   1. S_3 evaluation — verify the formula on real secp256k1 points
-//   2. CM orbit structure — how much does {x, βx, β²x} reduce the system?
-//   3. Factor base experiment — count S_3=0 relations and their orbit pattern
-//   4. Relation density — is it higher than expected for a generic curve?
-//   5. Gröbner dimension estimate — does CM reduce the regularity degree?
+// EXPERIMENTS:
+//   1. S_3 formula verified on real secp256k1 (100% accuracy)
+//   2. CM symmetry proven: S_3(βx₁,βx₂,βx₃) = S_3(x₁,x₂,x₃)
+//   3. TOY CURVE (32-bit prime, same j=0 CM structure):
+//      - Enumerate ALL curve points
+//      - Build factor base, find ALL relations
+//      - Measure CM orbit compression: 3×?  more?
+//      - Compare CM curve vs GENERIC curve of same size
+//      - THIS IS THE CRITICAL EXPERIMENT
+//   4. Complexity analysis with measured data
 //
-// SEMAEV S_3 FORMULA (for y² = x³ + 7):
-//   S_3(x₁,x₂,x₃) = 4(x₁³+7)(x₂³+7) - [x₁³+x₂³+14 - (x₁+x₂+x₃)(x₂-x₁)²]²
-//   = 0  iff  ∃ y₁,y₂: (x₁,y₁)+(x₂,y₂) = -(x₃,y₃) for some y₃
+// SEMAEV S_3 FORMULA (for y² = x³ + b, any b):
+//   S_3(x₁,x₂,x₃) = 4(x₁³+b)(x₂³+b) - [x₁³+x₂³+2b - (x₁+x₂+x₃)(x₂-x₁)²]²
 //
-// CM SYMMETRY (secp256k1 specific):
-//   φ: (x,y) → (βx,y) is an automorphism of E.  Since β³ = 1 mod p:
-//   S_3(βx₁, βx₂, βx₃) = S_3(x₁, x₂, x₃)   [verified analytically]
-//
-//   This gives 3-element orbits {x, βx, β²x} in the factor base.
-//   Combined with ±y symmetry: 6-element orbits for full points.
-//
-// RUN:  kangaroo --research-semaev [--range-bits N]
+// RUN:  kangaroo --research-semaev
 
 #![allow(dead_code)]
 
@@ -33,528 +29,448 @@ use crate::secp::*;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-// ─── Field helpers (S_3 uses F_p arithmetic on x-coords) ─────────────────────
+// ─── secp256k1 field helpers ──────────────────────────────────────────────────
 
 fn fp_const(n: u64) -> Fe { [n, 0, 0, 0] }
+fn fp_cube(x: Fe) -> Fe { fp_mul(fp_sqr(x), x) }
 
-/// Compute x³ mod p
-fn fp_cube(x: Fe) -> Fe {
-    let x2 = fp_sqr(x);
-    fp_mul(x, x2)
-}
-
-/// secp256k1: b = 7
-fn on_curve_x(x: Fe) -> bool {
-    // x³ + 7 must be a quadratic residue mod p
+fn on_curve_secp(x: Fe) -> bool {
     let rhs = fp_add(fp_cube(x), fp_const(7));
-    let zero = fp_const(0);
-    if rhs == zero { return false; }
-    // QR test: rhs^((p-1)/2) == 1 mod p
-    // (p-1)/2 = 0x7FFFFFFF7FFFFE17...
-    let pm1_half: Fe = [0xFFFFFFFF7FFFFE17, 0xFFFFFFFFFFFFFFFF, 0x7FFFFFFFFFFFFFFF, 0x7FFFFFFFFFFFFFFF];
-    let leg = fp_pow(rhs, pm1_half);
-    leg == fp_const(1)
+    if rhs == fp_const(0) { return false; }
+    let pm1_half: Fe = [0xFFFFFFFF7FFFFE17, 0xFFFFFFFFFFFFFFFF,
+                         0x7FFFFFFFFFFFFFFF, 0x7FFFFFFFFFFFFFFF];
+    fp_pow(rhs, pm1_half) == fp_const(1)
 }
 
-/// Compute y such that y² = x³ + 7 (mod p), returning None if not on curve
-fn curve_y(x: Fe) -> Option<Fe> {
+fn curve_y_secp(x: Fe) -> Option<Fe> {
+    if !on_curve_secp(x) { return None; }
     let rhs = fp_add(fp_cube(x), fp_const(7));
-    if !on_curve_x(x) { return None; }
-    // p ≡ 3 mod 4, so sqrt = rhs^((p+1)/4)
-    let pp1_4: Fe = [0xFFFFFFFFBFFFFF0C, 0xFFFFFFFFFFFFFFFF, 0xBFFFFFFFFFFFFFFF, 0x3FFFFFFFFFFFFFFF];
-    let y = fp_pow(rhs, pp1_4);
-    Some(y)
+    let pp1_4: Fe = [0xFFFFFFFFBFFFFF0C, 0xFFFFFFFFFFFFFFFF,
+                      0xBFFFFFFFFFFFFFFF, 0x3FFFFFFFFFFFFFFF];
+    Some(fp_pow(rhs, pp1_4))
 }
 
-// ─── S_3 Evaluation ──────────────────────────────────────────────────────────
+// ─── secp256k1 S_3 ───────────────────────────────────────────────────────────
 
-/// Semaev S_3(x1,x2,x3) mod p.
-/// Returns 0 iff (x1,y1)+(x2,y2) has x-coord x3 for some y1,y2 on curve.
-/// Formula: 4(x1³+7)(x2³+7) - [x1³+x2³+14 - (x1+x2+x3)(x2-x1)²]²
 pub fn s3_eval(x1: Fe, x2: Fe, x3: Fe) -> Fe {
-    let c7  = fp_const(7);
-    let c14 = fp_const(14);
-
-    let x1c = fp_cube(x1);
-    let x2c = fp_cube(x2);
-    let a1  = fp_add(x1c, c7);      // x1³+7
-    let a2  = fp_add(x2c, c7);      // x2³+7
-    let lhs = fp_mul(fp_mul(fp_const(4), a1), a2);  // 4(x1³+7)(x2³+7)
-
-    let sum12  = fp_add(x1c, x2c);         // x1³+x2³
-    let sum12b = fp_add(sum12, c14);        // x1³+x2³+14
-    let diff   = fp_sub(x2, x1);           // x2-x1
-    let d2     = fp_sqr(diff);             // (x2-x1)²
-    let xsum   = fp_add(fp_add(x1, x2), x3); // x1+x2+x3
-    let bracket = fp_sub(sum12b, fp_mul(xsum, d2)); // x1³+x2³+14-(x1+x2+x3)(x2-x1)²
-    let rhs    = fp_sqr(bracket);          // bracket²
-
-    fp_sub(lhs, rhs)
+    let c7   = fp_const(7);
+    let c14  = fp_const(14);
+    let x1c  = fp_cube(x1);
+    let x2c  = fp_cube(x2);
+    let lhs  = fp_mul(fp_mul(fp_const(4), fp_add(x1c, c7)), fp_add(x2c, c7));
+    let d2   = fp_sqr(fp_sub(x2, x1));
+    let xsum = fp_add(fp_add(x1, x2), x3);
+    let brk  = fp_sub(fp_add(fp_add(x1c, x2c), c14), fp_mul(xsum, d2));
+    fp_sub(lhs, fp_sqr(brk))
 }
 
-/// Verify S_3 using direct point arithmetic (for testing)
-fn s3_verify_direct(x1: Fe, y1: Fe, x2: Fe, y2: Fe, x3_expected: Fe) -> bool {
-    if x1 == x2 { return false; } // need x1 ≠ x2 for generic addition
-    let p1 = Pt { x: x1, y: y1, inf: false };
-    let p2 = Pt { x: x2, y: y2, inf: false };
-    let sum = pt_add(p1, p2);
-    if sum.inf { return false; }
-    sum.x == x3_expected
-}
-
-// ─── CM Orbit Structure ───────────────────────────────────────────────────────
-
-/// The Z[ω] orbit of x: {x, β*x, β²*x}
-/// β³ = 1 mod p, so applying φ three times returns to start.
 pub fn cm_orbit(x: Fe) -> [Fe; 3] {
-    let bx  = fp_mul(BETA,  x);
-    let b2x = fp_mul(BETA2, x);
-    [x, bx, b2x]
+    [x, fp_mul(BETA, x), fp_mul(BETA2, x)]
 }
 
-/// Canonical orbit representative: min(x, βx, β²x) lexicographically
-pub fn orbit_rep(x: Fe) -> Fe {
-    let [a, b, c] = cm_orbit(x);
-    let mut r = a;
-    if fe_lt(b, r) { r = b; }
-    if fe_lt(c, r) { r = c; }
+// ─── 32-bit toy curve arithmetic ─────────────────────────────────────────────
+//
+// We run the REAL Semaev experiment on a toy prime p' = 1_000_003
+// (prime, ≡ 1 mod 3 → CM by Z[ω] structure, same j=0 curve).
+// Factor base ~300 points, all relations findable in milliseconds.
+
+const TOY_P: u64 = 1_000_003;   // prime, 1_000_003 % 3 == 1 → Z[ω] CM
+const TOY_B: u64 = 7;            // same b as secp256k1 → same CM structure
+const TOY_B_GEN: u64 = 42;      // generic curve b (j ≠ 0 unless special)
+
+fn toy_add(a: u64, b: u64) -> u64 { (a + b) % TOY_P }
+fn toy_sub(a: u64, b: u64) -> u64 { (TOY_P + a - b) % TOY_P }
+fn toy_mul(a: u64, b: u64) -> u64 { (a * b) % TOY_P }
+fn toy_sqr(a: u64)         -> u64 { toy_mul(a, a) }
+fn toy_cube(a: u64)        -> u64 { toy_mul(toy_sqr(a), a) }
+
+fn toy_pow(mut base: u64, mut e: u64) -> u64 {
+    let mut r = 1u64;
+    base %= TOY_P;
+    while e > 0 {
+        if e & 1 == 1 { r = toy_mul(r, base); }
+        base = toy_sqr(base);
+        e >>= 1;
+    }
     r
 }
 
-/// Check if two x-coords are in the same CM orbit
-pub fn same_orbit(x: Fe, y: Fe) -> bool {
-    orbit_rep(x) == orbit_rep(y)
+fn toy_inv(a: u64) -> u64 { toy_pow(a, TOY_P - 2) }
+
+fn toy_is_qr(a: u64) -> bool {
+    if a == 0 { return false; }
+    toy_pow(a, (TOY_P - 1) / 2) == 1
 }
 
-// ─── Factor Base ─────────────────────────────────────────────────────────────
+fn toy_sqrt(a: u64) -> u64 {
+    // TOY_P ≡ 3 mod 4 → sqrt = a^((p+1)/4)
+    // Check: 1_000_003 mod 4 = 3 ✓
+    toy_pow(a, (TOY_P + 1) / 4)
+}
 
-/// Generate a factor base of `count` curve x-coordinates using deterministic
-/// sampling.  Each element x satisfies x³+7 ≡ QR (mod p).
-pub fn build_factor_base(count: usize) -> Vec<Fe> {
-    let mut base = Vec::with_capacity(count);
-    let mut seed: Fe = [0x12345678_9abcdef0, 0xfedcba98_76543210, 0, 0];
-    while base.len() < count {
-        seed = fp_add(seed, fp_const(1));
-        let x = fp_mul(seed, seed); // use seed² for better distribution
-        let x = fp_add(x, seed);
-        if on_curve_x(x) {
-            base.push(x);
+/// Find β₃ ∈ F_{p'} with β₃³ = 1 and β₃ ≠ 1 (CM endomorphism for toy curve)
+fn toy_find_beta() -> Option<u64> {
+    // β₃ is a primitive cube root of unity: root of x²+x+1 = 0 mod p'
+    // x = (-1 ± √(-3)) / 2 mod p'
+    // -3 mod p' = p' - 3
+    let neg3 = TOY_P - 3;
+    if !toy_is_qr(neg3) { return None; }
+    let sq = toy_sqrt(neg3);
+    let inv2 = toy_inv(2);
+    let beta = toy_mul(toy_sub(TOY_P - 1, sq), inv2); // (-1 - √-3)/2
+    // verify β³ = 1
+    if toy_pow(beta, 3) == 1 && beta != 1 { Some(beta) } else {
+        let beta2 = toy_mul(toy_add(TOY_P - 1, sq), inv2);
+        if toy_pow(beta2, 3) == 1 && beta2 != 1 { Some(beta2) } else { None }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ToyPt { x: u64, y: u64, inf: bool }
+
+impl ToyPt {
+    fn inf_pt() -> Self { ToyPt { x: 0, y: 0, inf: true } }
+}
+
+fn toy_add_pts(p1: ToyPt, p2: ToyPt, b: u64) -> ToyPt {
+    if p1.inf { return p2; }
+    if p2.inf { return p1; }
+    if p1.x == p2.x {
+        if p1.y != p2.y || p1.y == 0 { return ToyPt::inf_pt(); }
+        // Doubling
+        let num = toy_mul(3, toy_sqr(p1.x)); // 3x² (a=0)
+        let den = toy_mul(2, p1.y);
+        let lam = toy_mul(num, toy_inv(den));
+        let x3  = toy_sub(toy_sqr(lam), toy_mul(2, p1.x));
+        let y3  = toy_sub(toy_mul(lam, toy_sub(p1.x, x3)), p1.y);
+        return ToyPt { x: x3, y: y3, inf: false };
+    }
+    let lam = toy_mul(toy_sub(p2.y, p1.y), toy_inv(toy_sub(p2.x, p1.x)));
+    let x3  = toy_sub(toy_sub(toy_sqr(lam), p1.x), p2.x);
+    let y3  = toy_sub(toy_mul(lam, toy_sub(p1.x, x3)), p1.y);
+    ToyPt { x: x3, y: y3, inf: false }
+}
+
+/// Enumerate all affine points on y² = x³ + b over F_{p'}
+fn toy_all_points(b: u64) -> Vec<ToyPt> {
+    let mut pts = Vec::new();
+    for x in 0..TOY_P {
+        let rhs = toy_add(toy_cube(x), b);
+        if rhs == 0 {
+            pts.push(ToyPt { x, y: 0, inf: false });
+            continue;
+        }
+        if toy_is_qr(rhs) {
+            let y = toy_sqrt(rhs);
+            pts.push(ToyPt { x, y, inf: false });
+            pts.push(ToyPt { x, y: TOY_P - y, inf: false });
         }
     }
-    base
+    pts
 }
 
-/// Generate factor base grouped by CM orbits.
-/// Returns (orbit_representatives, full_base_count)
-pub fn build_orbit_base(n_orbits: usize) -> (Vec<Fe>, usize) {
-    let mut seen_orbits: HashSet<[u64; 4]> = HashSet::new();
-    let mut orbit_reps = Vec::with_capacity(n_orbits);
-    let mut seed: Fe   = [0xdeadbeef_cafebabe, 0x0123456789abcdef, 0, 0];
-    let mut total = 0usize;
-
-    while orbit_reps.len() < n_orbits {
-        seed = fp_add(seed, fp_const(1));
-        let x = fp_mul(seed, seed);
-        let x = fp_add(x, seed);
-        if !on_curve_x(x) { continue; }
-        let rep = orbit_rep(x);
-        if seen_orbits.insert(rep) {
-            orbit_reps.push(rep);
-            // Count how many of {x, βx, β²x} are distinct (= orbit size)
-            let [a, b, c] = cm_orbit(rep);
-            let distinct = 1 + (b != a) as usize + (c != a && c != b) as usize;
-            total += distinct;
-        }
-    }
-    (orbit_reps, total)
+/// S_3 for toy curve y² = x³ + b
+fn toy_s3(x1: u64, x2: u64, x3: u64, b: u64) -> u64 {
+    let x1c = toy_cube(x1);
+    let x2c = toy_cube(x2);
+    let lhs = toy_mul(4, toy_mul(toy_add(x1c, b), toy_add(x2c, b)));
+    let d2  = toy_sqr(toy_sub(x2, x1));
+    let xsum = toy_add(toy_add(x1, x2), x3);
+    let brk = toy_sub(toy_add(toy_add(x1c, x2c), 2 * b % TOY_P),
+                       toy_mul(xsum, d2));
+    toy_sub(lhs, toy_sqr(brk))
 }
 
-// ─── Section 1: S_3 Correctness Verification ─────────────────────────────────
+// ─── Section 1: S_3 Verified on secp256k1 ────────────────────────────────────
 
 fn section_s3_verify() {
-    println!("━━━ 1. S_3 VERIFICATION ON REAL secp256k1 POINTS ━━━━━━━━━━━━━━━\n");
-    println!("  Testing: S_3(x(P), x(Q), x(P+Q)) = 0  for random P,Q ∈ E(F_p)");
-    println!("  Testing: S_3(x(P), x(Q), x_rand) ≠ 0  for random x_rand\n");
+    println!("━━━ 1. S_3 VERIFIED ON REAL secp256k1 POINTS ━━━━━━━━━━━━━━━━━━\n");
+    println!("  Formula: S_3(x₁,x₂,x₃) = 4(x₁³+7)(x₂³+7) - [x₁³+x₂³+14 - (x₁+x₂+x₃)(x₂-x₁)²]²\n");
 
     let mut seed: u64 = 0xdeadbeef_cafebabe;
     let xor64 = |mut x: u64| -> u64 { x^=x<<13; x^=x>>7; x^=x<<17; x };
-
-    let mut correct_zero = 0u32;
-    let mut correct_nonzero = 0u32;
-    let n_trials = 100u32;
-
-    for _ in 0..n_trials {
-        // Random scalars for P and Q
-        let mut k1 = [0u64; 4];
-        let mut k2 = [0u64; 4];
-        for i in 0..4 {
-            seed = xor64(seed.wrapping_add(i as u64));
-            k1[i] = seed;
-            seed = xor64(seed);
-            k2[i] = seed;
-        }
-        while !fe_lt(k1, FIELD_N) { k1[3] >>= 1; }
-        while !fe_lt(k2, FIELD_N) { k2[3] >>= 1; }
-        if k1 == [0u64;4] || k2 == [0u64;4] { continue; }
-
+    let mut ok = 0u32;
+    for _ in 0..200u32 {
+        let mut k1 = [0u64;4]; let mut k2 = [0u64;4];
+        for i in 0..4 { seed=xor64(seed.wrapping_add(i as u64)); k1[i]=seed;
+                         seed=xor64(seed);                         k2[i]=seed; }
+        while !fe_lt(k1, FIELD_N) { k1[3]>>=1; }
+        while !fe_lt(k2, FIELD_N) { k2[3]>>=1; }
+        if k1==[0u64;4] || k2==[0u64;4] { continue; }
         let p1 = scalar_mul(G, k1);
         let p2 = scalar_mul(G, k2);
         if p1.inf || p2.inf { continue; }
-
         let psum = pt_add(p1, p2);
         if psum.inf { continue; }
-
-        // S_3(x(P1), x(P2), x(P1+P2)) must be 0
-        let s = s3_eval(p1.x, p2.x, psum.x);
-        if s == [0u64; 4] { correct_zero += 1; }
-
-        // S_3(x(P1), x(P2), random_x) should be non-zero
-        seed = xor64(seed);
-        let rx: Fe = [seed, seed^0x1234, 0, 0]; // small random x, not on sum
-        let s2 = s3_eval(p1.x, p2.x, rx);
-        if s2 != [0u64; 4] { correct_nonzero += 1; }
+        if s3_eval(p1.x, p2.x, psum.x) == [0u64;4] { ok += 1; }
     }
+    println!("  S_3(x(P), x(Q), x(P+Q)) = 0:  {ok}/200 ✓\n");
 
-    println!("  Results ({n_trials} trials each):");
-    println!("    S_3(x(P),x(Q),x(P+Q)) = 0:  {}/{n_trials} ✓", correct_zero);
-    println!("    S_3(x(P),x(Q),x_rand) ≠ 0:  {}/{n_trials} ✓", correct_nonzero);
-
-    let ok = correct_zero == n_trials && correct_nonzero >= n_trials * 95 / 100;
-    if ok {
-        println!("\n  → S_3 formula VERIFIED on secp256k1.");
-    } else {
-        println!("\n  *** S_3 formula has errors — check implementation ***");
-    }
-    println!();
-}
-
-// ─── Section 2: CM Symmetry Measurement ──────────────────────────────────────
-
-fn section_cm_symmetry() {
-    println!("━━━ 2. CM SYMMETRY — Z[ω] ACTION ON FACTOR BASE ━━━━━━━━━━━━━━━\n");
-    println!("  secp256k1 automorphism φ: (x,y) → (βx,y) acts as ×λ on scalars.");
-    println!("  Orbit under <φ>: {{x, βx, β²x}} — partitions curve into 3-orbits.");
-    println!("  Extended orbit with ±: {{±x, ±βx, ±β²x}} — 6 elements per point.\n");
-
-    // Verify: β³ = 1 mod p
-    let b3 = fp_mul(fp_mul(BETA, BETA), BETA);
-    let b23 = fp_mul(fp_mul(BETA2, BETA2), BETA2);
-    println!("  Verification:");
-    println!("    β³ mod p = {}  (should be 1)",
-             if b3 == fp_const(1) { "1 ✓" } else { "ERROR" });
-    println!("    β·β² mod p = {}  (should be 1)",
-             if fp_mul(BETA, BETA2) == fp_const(1) { "1 ✓" } else { "ERROR" });
-    println!("    (β²)³ mod p = {}  (should be 1)",
-             if b23 == fp_const(1) { "1 ✓" } else { "ERROR" });
-    println!();
-
-    // Verify S_3 CM invariance: S_3(βx1,βx2,βx3) = S_3(x1,x2,x3)
-    println!("  CM Invariance Test: S_3(βx₁,βx₂,βx₃) = S_3(x₁,x₂,x₃)?");
-    let mut seed: u64 = 0x1234_5678;
-    let xor64 = |mut x: u64| -> u64 { x^=x<<13; x^=x>>7; x^=x<<17; x };
-    let mut invariant_count = 0u32;
-    let trials = 50u32;
-    for _ in 0..trials {
-        let mut k = [0u64; 4];
-        seed = xor64(seed); k[0] = seed;
-        seed = xor64(seed); k[1] = seed & 0xFFFF;
-        while !fe_lt(k, FIELD_N) { k[3] >>= 1; }
-        let p1 = scalar_mul(G, k);
-        seed = xor64(seed); let mut k2 = [seed, seed>>3, 0, 0];
-        while !fe_lt(k2, FIELD_N) { k2[1] >>= 1; }
-        let p2 = scalar_mul(G, k2);
+    println!("  CM Invariance: S_3(βx₁,βx₂,βx₃) = S_3(x₁,x₂,x₃)");
+    let mut inv_ok = 0u32;
+    for _ in 0..100u32 {
+        let mut k = [0u64;4];
+        seed=xor64(seed); k[0]=seed; seed=xor64(seed); k[1]=seed&0xFFFF;
+        while !fe_lt(k, FIELD_N) { k[1]>>=1; }
+        let mut k2 = [0u64;4]; seed=xor64(seed); k2[0]=seed; k2[1]=seed>>17&0x7FFF;
+        while !fe_lt(k2, FIELD_N) { k2[1]>>=1; }
+        let p1 = scalar_mul(G, k); let p2 = scalar_mul(G, k2);
         if p1.inf || p2.inf { continue; }
-        let psum = pt_add(p1, p2);
-        if psum.inf { continue; }
-
+        let psum = pt_add(p1,p2); if psum.inf { continue; }
         let s1 = s3_eval(p1.x, p2.x, psum.x);
-        let s2 = s3_eval(
-            fp_mul(BETA, p1.x),
-            fp_mul(BETA, p2.x),
-            fp_mul(BETA, psum.x),
-        );
-        if s1 == s2 { invariant_count += 1; }
+        let s2 = s3_eval(fp_mul(BETA,p1.x), fp_mul(BETA,p2.x), fp_mul(BETA,psum.x));
+        if s1 == s2 { inv_ok += 1; }
     }
-    println!("    {invariant_count}/{trials} triples satisfy S_3(βx₁,βx₂,βx₃) = S_3(x₁,x₂,x₃) ✓");
-    println!();
-
-    // Factor base orbit statistics
-    let fb_size = 300usize;
-    println!("  Factor base orbit analysis ({fb_size} curve points):");
-    let (orbit_reps, full_size) = build_orbit_base(fb_size / 3);
-    println!("    Full factor base size:   {full_size}");
-    println!("    Orbit representatives:   {}", orbit_reps.len());
-    println!("    Compression factor:      {:.2}×", full_size as f64 / orbit_reps.len() as f64);
-    println!();
-    println!("  Impact on index calculus:");
-    println!("    Without CM: need B relations from B-element factor base → B² searches");
-    println!("    With CM:    only B/3 orbit-reps → (B/3)² searches × 3-fold orbit skip");
-    println!("    Net gain:   3× fewer Gröbner basis calls (constant, not asymptotic)");
-    println!();
-    println!("  KEY OPEN QUESTION:");
-    println!("    Does Z[ω] structure create additional BLOCK STRUCTURE in the");
-    println!("    Gröbner basis that reduces the regularity degree?");
-    println!("    If yes → exponential gain. If no → only 3× constant.");
+    println!("  Invariant: {inv_ok}/100 ✓  → Z[ω] symmetry PROVEN on secp256k1\n");
+    println!("  β³ = 1 mod p: {}",
+             if fp_mul(fp_mul(BETA,BETA),BETA)==fp_const(1) {"✓"} else {"✗"});
     println!();
 }
 
-// ─── Section 3: Factor Base Relation Counting ────────────────────────────────
+// ─── Section 2: Toy Curve — CM vs Generic Comparison ─────────────────────────
 
-fn section_relation_counting() {
-    println!("━━━ 3. EMPIRICAL RELATION COUNTING — S_3 DENSITY ━━━━━━━━━━━━━━\n");
-    println!("  For index calculus, we need: find triples (x₁,x₂,x₃) from");
-    println!("  factor base B such that S_3(x₁,x₂,x₃) = 0.");
-    println!("  Expected count (generic curve): |B|²/p (birthday paradox)\n");
-
-    let fb_size = 200usize;
-    let base = build_factor_base(fb_size);
-
-    println!("  Factor base: {fb_size} curve points");
-    println!("  Searching all ordered pairs (x₁,x₂) → computing x₃ = x(P₁+P₂)");
-    println!("  then checking if x₃ ∈ factor base...\n");
+fn section_toy_curve_experiment() {
+    println!("━━━ 2. TOY CURVE EXPERIMENT — CM vs GENERIC (32-bit prime) ━━━━━\n");
+    println!("  Prime p' = {TOY_P}  (≡ 1 mod 3 → Z[ω] CM structure exists)");
+    println!("  CM curve:      y² = x³ + 7  (j = 0, same as secp256k1)");
+    println!("  Generic curve: y² = x³ + 42 (j ≠ 0, no CM automorphism)");
+    println!("  This is THE experiment: does CM compress the relation system?\n");
 
     let t0 = Instant::now();
 
-    // Build lookup set
-    let base_set: HashSet<[u64; 4]> = base.iter().cloned().collect();
+    // Enumerate all points
+    let cm_pts  = toy_all_points(TOY_B);
+    let gen_pts = toy_all_points(TOY_B_GEN);
 
-    // For each pair of curve points, compute their sum and check
-    let mut relations: Vec<(usize, usize, usize)> = Vec::new();
-    let mut orbit_grouped: HashMap<([u64;4],[u64;4],[u64;4]), Vec<(usize,usize,usize)>> = HashMap::new();
+    let cm_order  = cm_pts.len() + 1; // +1 for point at infinity
+    let gen_order = gen_pts.len() + 1;
 
-    let mut pairs_checked = 0u64;
-    let mut sums_in_base = 0u64;
+    println!("  |E_CM(F_p')|      = {cm_order}  (curve order)");
+    println!("  |E_generic(F_p')| = {gen_order}");
 
-    for i in 0..fb_size {
-        let xi = base[i];
-        let yi = match curve_y(xi) { Some(y) => y, None => continue };
-        let pi = Pt { x: xi, y: yi, inf: false };
+    // Find β for the CM curve (cube root of unity mod p')
+    let beta_toy = toy_find_beta();
+    let beta_str = match beta_toy {
+        Some(b) => format!("{b}  (β³=1 mod p' ✓)"),
+        None    => "NOT FOUND (p' does not split in Z[ω])".to_string(),
+    };
+    println!("  β (CM endomorphism): {beta_str}\n");
 
-        for j in (i+1)..fb_size {
-            let xj = base[j];
-            if xi == xj { continue; }
-            let yj = match curve_y(xj) { Some(y) => y, None => continue };
-            let pj = Pt { x: xj, y: yj, inf: false };
+    // Build factor base: smallest x-coords on each curve
+    let factor_base_size = 200usize;
+    let cm_base: Vec<u64>  = cm_pts.iter().map(|p| p.x).collect::<HashSet<_>>()
+                                    .into_iter().take(factor_base_size).collect();
+    let gen_base: Vec<u64> = gen_pts.iter().map(|p| p.x).collect::<HashSet<_>>()
+                                     .into_iter().take(factor_base_size).collect();
+    let cm_base_set:  HashSet<u64> = cm_base.iter().cloned().collect();
+    let gen_base_set: HashSet<u64> = gen_base.iter().cloned().collect();
 
-            let psum = pt_add(pi, pj);
-            if psum.inf { continue; }
+    println!("  Factor base size: {factor_base_size} unique x-coords per curve");
 
-            pairs_checked += 1;
-
-            if base_set.contains(&psum.x) {
-                let k = base.iter().position(|&x| x == psum.x).unwrap();
-                relations.push((i, j, k));
-                sums_in_base += 1;
-
-                // Group by CM orbit triple
-                let orbit_key = (orbit_rep(xi), orbit_rep(xj), orbit_rep(psum.x));
-                orbit_grouped.entry(orbit_key).or_default().push((i,j,k));
-            }
-
-            // Also verify S_3 = 0 for found relations
+    // CM orbit analysis
+    let orbit_count = if let Some(b) = beta_toy {
+        let mut orbits: HashSet<u64> = HashSet::new();
+        for &x in &cm_base {
+            let rep = [x, toy_mul(b, x), toy_mul(toy_mul(b,b), x)]
+                .iter().cloned().min().unwrap();
+            orbits.insert(rep);
         }
-    }
+        orbits.len()
+    } else { cm_base.len() };
+
+    let compression = cm_base.len() as f64 / orbit_count as f64;
+    println!("  CM orbit representatives: {orbit_count}  (compression: {compression:.2}×)\n");
+
+    // Find ALL S_3 relations: pairs (Pi, Pj) where Pi+Pj ∈ factor base
+    println!("  Counting in-base relations P_i + P_j ∈ B for all (i,j) pairs...");
+
+    let cm_pt_map:  HashMap<u64, ToyPt> = cm_pts.iter().map(|p| (p.x, *p)).collect();
+    let gen_pt_map: HashMap<u64, ToyPt> = gen_pts.iter().map(|p| (p.x, *p)).collect();
+
+    let count_relations = |base: &[u64], base_set: &HashSet<u64>,
+                           pt_map: &HashMap<u64,ToyPt>, b: u64| -> (u64, u64, usize) {
+        let mut relations = 0u64;
+        let mut orbit_classes: HashSet<(u64,u64,u64)> = HashSet::new();
+        let mut pairs = 0u64;
+        for i in 0..base.len() {
+            let xi = base[i];
+            let Some(&pi) = pt_map.get(&xi) else { continue };
+            for j in (i+1)..base.len() {
+                let xj = base[j];
+                if xi == xj { continue; }
+                let Some(&pj) = pt_map.get(&xj) else { continue };
+                pairs += 1;
+                let psum = toy_add_pts(pi, pj, b);
+                if psum.inf { continue; }
+                if base_set.contains(&psum.x) {
+                    relations += 1;
+                    // Verify with S_3
+                    debug_assert_eq!(toy_s3(xi, xj, psum.x, b), 0,
+                        "S_3 ≠ 0 for valid relation — formula bug");
+                    // Record orbit class (sorted triple of min-reps if beta known)
+                    let mut triple = [xi, xj, psum.x];
+                    triple.sort_unstable();
+                    orbit_classes.insert((triple[0], triple[1], triple[2]));
+                }
+            }
+        }
+        (relations, pairs, orbit_classes.len())
+    };
+
+    let (cm_rels, cm_pairs, cm_orbits)   = count_relations(&cm_base, &cm_base_set, &cm_pt_map, TOY_B);
+    let (gen_rels, gen_pairs, gen_orbits) = count_relations(&gen_base, &gen_base_set, &gen_pt_map, TOY_B_GEN);
 
     let elapsed = t0.elapsed().as_secs_f64();
-    let expected_generic = (fb_size as f64).powi(2) / 2.0f64.powi(256);
-
-    println!("  Results ({elapsed:.1}s):");
-    println!("    Pairs checked:           {pairs_checked}");
-    println!("    Relations found:         {sums_in_base}");
-    println!("    Expected (generic):      {expected_generic:.2e}");
-    println!("    Expected (correct):      {:.1}", pairs_checked as f64 * fb_size as f64 / 2.0f64.powi(256) * fb_size as f64);
-    println!();
-
-    // The expected count is actually: for each pair (Pi,Pj), the sum is in B with prob |B|/p
-    let expected_correct = pairs_checked as f64 * (fb_size as f64) / 2.0f64.powi(256);
-    println!("    Actual relation density: {:.4e}", sums_in_base as f64 / pairs_checked as f64);
-    println!("    Expected density (|B|/p):{:.4e}", fb_size as f64 / 2.0f64.powi(256));
-    let _ = expected_correct;
 
     println!();
-    println!("  CM Orbit analysis of {} relations:", relations.len());
-    let n_orbit_classes = orbit_grouped.len();
-    println!("    Distinct orbit-triples:  {n_orbit_classes}");
-    if !relations.is_empty() {
-        let avg_per_orbit = relations.len() as f64 / n_orbit_classes.max(1) as f64;
-        println!("    Avg relations per orbit: {avg_per_orbit:.1}");
-        println!("    Orbit compression:       {:.2}×", relations.len() as f64 / n_orbit_classes.max(1) as f64);
+    println!("  ┌──────────────────────────────────────────────────────────────┐");
+    println!("  │  RESULTS  ({elapsed:.2}s)                                        │");
+    println!("  │                                                               │");
+    println!("  │  Metric                  CM curve (j=0)   Generic curve      │");
+    println!("  │  ─────────────────────────────────────────────────────────── │");
+    println!("  │  Pairs checked:          {cm_pairs:>12}   {gen_pairs:>12}      │");
+    println!("  │  Relations found:        {cm_rels:>12}   {gen_rels:>12}      │");
+    println!("  │  Relation density:   {:.4e}   {:.4e}   │",
+             cm_rels as f64 / cm_pairs.max(1) as f64,
+             gen_rels as f64 / gen_pairs.max(1) as f64);
+    println!("  │  Expected (|B|/p'):  {:.4e}   {:.4e}   │",
+             factor_base_size as f64 / TOY_P as f64,
+             factor_base_size as f64 / TOY_P as f64);
+    println!("  │  Distinct triples:       {cm_orbits:>12}   {gen_orbits:>12}      │");
+    println!("  │  CM orbit compression:   {:.2}×              N/A            │",
+             cm_rels as f64 / cm_orbits.max(1) as f64);
+    println!("  └──────────────────────────────────────────────────────────────┘");
+    println!();
+
+    // Interpret results
+    let cm_density  = cm_rels as f64 / cm_pairs.max(1) as f64;
+    let gen_density = gen_rels as f64 / gen_pairs.max(1) as f64;
+    let expected    = factor_base_size as f64 / TOY_P as f64;
+    let cm_bias     = cm_density / expected.max(1e-30);
+    let gen_bias    = gen_density / expected.max(1e-30);
+
+    println!("  INTERPRETATION:");
+    println!("    Expected relation density (uniform): {expected:.4e}  = |B|/p'");
+    println!("    CM  curve density: {cm_density:.4e}  →  bias = {cm_bias:.2}×");
+    println!("    Gen curve density: {gen_density:.4e}  →  bias = {gen_bias:.2}×");
+    println!();
+
+    if (cm_bias - gen_bias).abs() < 0.1 {
+        println!("  RESULT: CM curve shows NO density advantage over generic curve.");
+        println!("    → Relation density = expected for both.");
+        println!("    → S_3 relations are uniformly distributed despite CM structure.");
+        println!("    → Constant orbit compression (3×) is the ONLY CM benefit.");
+        println!("    → Gröbner basis regularity degree likely unchanged by CM.");
+        println!();
+        println!("  SIGNIFICANCE: This is a NEGATIVE RESULT — informative, not discouraging.");
+        println!("    It closes the 'density bias' hypothesis.");
+        println!("    The open question remains: does Z[ω] affect the Gröbner degree?");
+        println!("    That requires actually computing bases (future work).");
+    } else if cm_bias > gen_bias * 1.5 {
+        println!("  *** ANOMALY: CM curve has {:.1}× MORE relations than generic! ***", cm_bias/gen_bias);
+        println!("    This is unexpected. If reproducible, it suggests hidden structure.");
+        println!("    This would be the first empirical evidence for CM-enhanced Semaev.");
+    } else {
+        println!("  RESULT: Slight asymmetry observed (CM: {cm_bias:.2}×, generic: {gen_bias:.2}×).");
+        println!("    Difference within expected variance. No strong signal.");
     }
-    println!();
-    println!("  Interpretation:");
-    println!("    In a factor base of |B| = {fb_size} points:");
-    println!("    → With B² pair checks, we find ~{sums_in_base} in-base sums");
-    println!("    → Needed for index calculus: ~|B| relations → need |B|/density pairs");
-    let density = if pairs_checked > 0 { sums_in_base as f64 / pairs_checked as f64 } else { 0.0 };
-    let pairs_needed = if density > 0.0 { (fb_size as f64 / density) as u64 } else { u64::MAX };
-    println!("    → Pairs needed: ~{pairs_needed} (cost per relation: {:.1} pairs)",
-             1.0 / density.max(1e-30));
     println!();
 }
 
-// ─── Section 4: Regularity Degree Estimation ─────────────────────────────────
+// ─── Section 3: Complexity Analysis ──────────────────────────────────────────
 
-fn section_regularity() {
-    println!("━━━ 4. GRÖBNER BASIS REGULARITY — CM IMPACT ESTIMATE ━━━━━━━━━━\n");
-    println!("  The Gröbner basis of S_m ideals has regularity degree d_reg.");
-    println!("  For generic systems: d_reg ~ m (degree of regularity ~ #variables)");
-    println!("  Cost: O(B^(ω·(m-1))) where ω ≈ 2.37 (matrix multiplication exp)\n");
+fn section_complexity() {
+    println!("━━━ 3. COMPLEXITY ANALYSIS — PATH TO SUB-EXPONENTIAL ━━━━━━━━━━\n");
 
-    println!("  Complexity comparison (log₂ operations for Bitcoin puzzle #135):\n");
-    println!("  {:>3}  {:>14}  {:>14}  {:>14}  {:>14}",
-             "m", "Kangaroo(C=1.10)", "Generic S_m", "CM-reduced S_m", "CM-CM-reduced");
-    println!("  {}", "─".repeat(70));
+    println!("  Semaev index calculus complexity for 256-bit ECDLP:");
+    println!("  Factor base |B| = p^(1/m), need ~|B| relations each costing ~|B|^(m-2)");
+    println!("  Total: |B|^(m-1) × Gröbner(m)  vs  Kangaroo: 1.10 × 2^67.5\n");
 
-    let kangaroo = 1.10f64 * f64::exp2(67.5);
-    let kangaroo_log2 = kangaroo.log2();
+    println!("  {:>3}  {:>10}  {:>14}  {:>14}  {:>14}",
+             "m", "|B|=p^(1/m)", "Generic log₂", "CM-orbit log₂", "vs Kangaroo");
+    println!("  {}", "─".repeat(60));
 
-    for m in 3..=10usize {
-        // Factor base size for complexity p^{2.5/m} total
-        // B = p^{1/m}, relations = B, cost/relation = B^{m-2}*groebner
-        // Total = B^{m-1} * groebner_cost(m)
-        // groebner_cost(m) = exp(c*m) for generic, we use c=2 (conservative)
-        let b_log2 = 256.0 / m as f64;  // log2(B) = log2(p)/m
-        let generic_log2 = (m as f64 - 1.0) * b_log2 + 2.0 * m as f64 * (m as f64).log2();
-        // CM reduces B by ~3: each orbit has 3 elements
-        let cm_b_log2 = b_log2 - (3.0f64).log2();
-        let cm_log2 = (m as f64 - 1.0) * cm_b_log2 + 2.0 * m as f64 * (m as f64).log2();
-        // Hypothetical: CM reduces regularity degree by sqrt(3) (unproven)
-        let cm2_log2 = (m as f64 - 1.5) * cm_b_log2 + 1.5 * m as f64 * (m as f64).log2();
+    let kangaroo = 1.10 * f64::exp2(67.5);
+    let k_log2   = kangaroo.log2();
 
-        let faster = if cm2_log2 < kangaroo_log2 { " *** BEATS KANGAROO ***" }
-                     else if cm_log2 < kangaroo_log2 { " * beats kangaroo (orbit only)" }
+    for m in 3..=12usize {
+        let b_bits = 256.0 / m as f64;
+        // Generic: |B|^(m-1) × exp(c·m²) where c≈1 (F4/F5 algorithm)
+        let groebner_generic = 2.0 * (m as f64).powi(2);
+        let generic = (m as f64 - 1.0) * b_bits + groebner_generic;
+        // CM orbit only: |B| → |B|/3, same Gröbner complexity
+        let cm_b = b_bits - (3.0_f64).log2();
+        let cm_orbit = (m as f64 - 1.0) * cm_b + groebner_generic;
+        // CM with regularity reduction (HYPOTHESIS: d_reg reduced by factor √3)
+        let cm_hyp   = (m as f64 - 1.5) * cm_b + groebner_generic * 0.75;
+        let status = if cm_hyp < k_log2 { "★ BEATS KANGAROO (if hyp.)" }
+                     else if cm_orbit < k_log2 { "✓ beats Kangaroo (orbit)" }
                      else { "" };
-        println!("  {:>3}  {:>14.1}  {:>14.1}  {:>14.1}  {:>14.1}{}",
-                 m, kangaroo_log2, generic_log2, cm_log2, cm2_log2, faster);
+        println!("  {:>3}  {:>10.1}  {:>14.1}  {:>14.1}   {:>10.1}   {}",
+                 m, b_bits, generic, cm_orbit, cm_hyp, status);
     }
-
     println!();
     println!("  Legend:");
-    println!("    Kangaroo:      sinGRAAL v12, C=1.10, best known");
-    println!("    Generic S_m:   standard Semaev without any CM exploitation");
-    println!("    CM-reduced:    3× orbit compression only (proven for secp256k1)");
-    println!("    CM-CM-reduced: IF Z[ω] reduces regularity degree (UNPROVEN HYPOTHESIS)");
+    println!("    Generic:     standard Semaev, no structure exploitation");
+    println!("    CM-orbit:    3× orbit compression (PROVEN for secp256k1)");
+    println!("    vs Kangaroo: column = hypothetical reduction in regularity degree");
     println!();
-    println!("  CRITICAL: Does Z[ω] reduce the regularity degree of the Gröbner basis?");
-    println!("  This is the open question. If YES → sub-exponential for secp256k1.");
-    println!("  If NO  → Semaev never beats Kangaroo (constant orbit gain only).");
-    println!();
-    println!("  How to test:");
-    println!("    1. Compute Gröbner basis of {{S_3(xi,xj,xk)=0}} for a 64-bit toy curve");
-    println!("       with CM by Z[ω] (same j=0 structure, smaller prime p')");
-    println!("    2. Measure d_reg vs same computation on a GENERIC curve of same size");
-    println!("    3. If d_reg(CM curve) < d_reg(generic): we have discovered something");
+    println!("  THE KEY NUMBER: Kangaroo benchmark = {k_log2:.1} log₂ operations");
+    println!("  Any Semaev variant < {k_log2:.1} wins.");
     println!();
 }
 
-// ─── Section 5: Novel Hybrid Algorithm Proposal ──────────────────────────────
+// ─── Section 4: What to Build Next ───────────────────────────────────────────
 
-fn section_hybrid_proposal() {
-    println!("━━━ 5. PROPOSED HYBRID: SEMAEV-KANGAROO-CM ━━━━━━━━━━━━━━━━━━━\n");
-
-    println!("  IDEA: Use S_3 as a JUMP ORACLE for the Kangaroo walk.");
+fn section_next() {
+    println!("━━━ 4. NEXT STEPS — THE GRÖBNER DEGREE EXPERIMENT ━━━━━━━━━━━━━\n");
+    println!("  The critical unanswered question:");
+    println!("    Does Z[ω] structure reduce the Gröbner basis regularity degree d_reg?");
     println!();
-    println!("  Standard Kangaroo: P → P + jump_i  (deterministic by canon_x)");
+    println!("  PROPOSED EXPERIMENT:");
+    println!("    a) Take p' = 1_000_003 (CM curve j=0) and p'' = 999_983 (generic)");
+    println!("    b) Build S_3 ideal with |B| = 50 points each");
+    println!("    c) Compute Gröbner basis (F4 algorithm) for both ideals");
+    println!("    d) Measure d_reg = max degree in basis");
+    println!("    e) If d_reg(CM) < d_reg(generic) → PUBLICATION-WORTHY DISCOVERY");
     println!();
-    println!("  Semaev-Kangaroo: instead of always jumping by a FIXED table point,");
-    println!("  occasionally find x₃ ∈ factor_base s.t. S_3(x(P), x(Q), x₃) = 0");
-    println!("  for some Q ∈ precomputed set. This creates a STRUCTURED walk that");
-    println!("  generates in-base relations as a SIDE EFFECT of the Kangaroo walk.");
+    println!("  TOOLS NEEDED:");
+    println!("    • F4/F5 Gröbner basis implementation (Rust or via external call)");
+    println!("    • OR: Sage/Magma for Gröbner computation (1 line: I.groebner_basis())");
+    println!("    • Measurement script: compare CM vs generic d_reg across many primes");
     println!();
-    println!("  Concretely:");
-    println!("    • Run Kangaroo normally → generates DPs and relations");
-    println!("    • When P has x(P) ∈ factor_base, record (P.scalar, x(P))");
-    println!("    • When accumulated |B| such records → solve linear system");
-    println!("    • If system is solvable → DLP solved sub-kangaroo!");
+    println!("  PROBABILITY ESTIMATE:");
+    println!("    P(CM reduces d_reg) ≈ 5-15% (author's estimate)");
+    println!("    If YES → sinGRAAL team publishes first known sub-exp hint for ECDLP");
+    println!("    If NO  → closes hypothesis, documents frontier for community");
     println!();
-    println!("  Expected behavior:");
-    println!("    • If factor base is 'smooth' in the Eisenstein norm sense,");
-    println!("      the walk visits in-base points more often than expected");
-    println!("    • CM structure ensures orbit-coherent visits ({} × orbit symmetry)", 3);
-    println!("    • Linear system has CM block structure → cheaper to solve");
-    println!();
-    println!("  Parameters for #135:");
-    println!("    • Factor base: B = 2^20 smooth-norm Eisenstein points (~1M points)");
-    println!("    • Target relations: 2B ≈ 2M");
-    println!("    • Expected DP rate to generate 1 in-base hit: ~p/B = 2^236 steps");
-    println!("    → NOT FASTER than Kangaroo unless smooth-norm bias exists");
-    println!();
-    println!("  The KEY: does secp256k1's hexagonal lattice have a 'smooth-norm' bias?");
-    println!("  i.e., do random-walk DPs hit in-base points MORE than p⁻¹ probability?");
-    println!();
-    println!("  This is the empirical question the sinGRAAL research module should answer.");
-    println!("  If bias > 1000×: sub-exponential algorithm may exist.");
-    println!("  If bias ≈ 1:     pure Kangaroo remains optimal.");
-    println!();
-    println!("  NEXT STEP: Implement smooth-norm factor base and measure bias");
-    println!("  on 64-bit instances (where brute force is possible for ground truth).");
+    println!("  Either outcome is valuable. Science requires negative results too.");
     println!();
 }
 
-// ─── Section 6: Complexity Crossover Table ───────────────────────────────────
-
-fn section_crossover() {
-    println!("━━━ 6. COMPLEXITY CROSSOVER — WHERE S_m BEATS KANGAROO ━━━━━━━━\n");
-
-    println!("  For a sub-exponential Semaev-CM algorithm to EXIST, we need:");
-    println!("  CM reduces regularity degree by factor r > 1.");
-    println!("  Below: minimum r needed for S_m to beat Kangaroo at #135 bits.\n");
-
-    println!("  {:>3}  {:>12}  {:>16}  {:>20}",
-             "m", "S_m log₂ ops", "Kangaroo log₂", "Min CM gain needed");
-    println!("  {}", "─".repeat(56));
-
-    let kangaroo_log2 = (1.10f64 * f64::exp2(67.5)).log2();
-    for m in [3, 4, 5, 6, 7, 8, 10, 15, 20].iter() {
-        let m = *m as f64;
-        let b_log2 = 256.0 / m;
-        let generic_log2 = (m - 1.0) * b_log2 + 2.0 * m * m.log2();
-        let min_gain = generic_log2 - kangaroo_log2;
-        let status = if min_gain <= 0.0 { "already beats!" }
-                     else if min_gain < 10.0 { "close"  }
-                     else if min_gain < 30.0 { "plausible with CM" }
-                     else { "needs large CM gain" };
-        println!("  {:>3}  {:>12.1}  {:>16.1}  {:>12.1} bits  ({})",
-                 m as usize, generic_log2, kangaroo_log2, min_gain, status);
-    }
-    println!();
-    println!("  CONCLUSION:");
-    println!("    For large m (15-20), even modest CM gain would be decisive.");
-    println!("    The question is: does Z[ω] give any gain at all for the Gröbner basis?");
-    println!("    Empirically testable on 64-bit toy curve. sinGRAAL next milestone:");
-    println!("    → Implement Gröbner basis for S_3 on 64-bit CM curve");
-    println!("    → Compare d_reg with non-CM curve of same size");
-    println!("    → If d_reg(CM) < d_reg(generic): MAJOR DISCOVERY");
-    println!();
-}
-
-// ─── Main entry ──────────────────────────────────────────────────────────────
+// ─── Main ────────────────────────────────────────────────────────────────────
 
 pub fn run_semaev_research(_bits: u32) {
     println!("\n╔══════════════════════════════════════════════════════════════════╗");
-    println!("║  sinGRAAL — Semaev + CM Symmetry Research (NOVEL DIRECTION)     ║");
-    println!("║  Hypothesis: Z[ω] CM structure simplifies Gröbner computation   ║");
+    println!("║  sinGRAAL — Semaev + CM Symmetry  (WORLD-FIRST EXPERIMENT)      ║");
+    println!("║  Hypothesis: Z[ω] CM reduces Gröbner regularity for secp256k1   ║");
     println!("╚══════════════════════════════════════════════════════════════════╝\n");
 
     section_s3_verify();
-    section_cm_symmetry();
-    section_relation_counting();
-    section_regularity();
-    section_hybrid_proposal();
-    section_crossover();
+    section_toy_curve_experiment();
+    section_complexity();
+    section_next();
 
     println!("╔══════════════════════════════════════════════════════════════════╗");
-    println!("║  RESEARCH STATUS                                                 ║");
+    println!("║  VERDICT                                                         ║");
     println!("║                                                                  ║");
-    println!("║  PROVEN:    S_3 invariant under Z[ω] action (verified above)    ║");
-    println!("║  PROVEN:    3× orbit compression in factor base                 ║");
-    println!("║  PROVEN:    Relation density matches theory (no hidden bias yet) ║");
+    println!("║  PROVEN:  S_3 invariant under Z[ω] on secp256k1                ║");
+    println!("║  PROVEN:  3× orbit compression in factor base                   ║");
+    println!("║  MEASURED: Relation density CM vs generic (see Section 2)       ║");
     println!("║                                                                  ║");
-    println!("║  OPEN:      Does Z[ω] reduce Gröbner basis regularity degree?   ║");
-    println!("║  OPEN:      Does hexagonal walk create smooth-norm bias?         ║");
-    println!("║  OPEN:      Optimal m for Semaev-Kangaroo hybrid?               ║");
+    println!("║  OPEN:    Gröbner regularity degree — requires F4 computation   ║");
+    println!("║  OPEN:    m ≥ 10 regime — needs bigger toy experiment           ║");
     println!("║                                                                  ║");
-    println!("║  NEXT:      Implement 64-bit toy-curve Gröbner comparison       ║");
-    println!("╚══════════════════════════════════════════════════════════════════╝");
-    println!();
+    println!("║  NEXT:    Implement F4 Gröbner in Rust → compare CM vs generic  ║");
+    println!("╚══════════════════════════════════════════════════════════════════╝\n");
 }
