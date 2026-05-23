@@ -99,7 +99,7 @@ fn cpu_kangaroo_step(
 
 /// Solve ECDLP for target = k·G where k ∈ [2^(bits-1), 2^bits).
 /// Returns (steps, found) using CPU Kangaroo with `n_animals/2` tame + wild.
-fn cpu_solve(target: Pt, k_real: Fe, bits: u32, n_animals: usize) -> (u64, bool) {
+fn cpu_solve(target: Pt, _k_real: Fe, bits: u32, n_animals: usize) -> (u64, bool) {
     // Build small jump table (power-of-2 size for bitmask)
     let n_jumps = 32usize;
     let mu = (bits / 2) as i32;
