@@ -20,6 +20,7 @@ mod secp;
 mod glv;
 mod coordinator;
 mod research;
+mod glv4d;
 
 use clap::Parser;
 use secp::*;
@@ -108,6 +109,23 @@ struct Args {
     /// Example: kangaroo --research --range-bits 64
     #[arg(long)]
     research: bool,
+
+    /// Run 4D GLV research mode: why 2D is the ceiling for secp256k1,
+    /// what genuine 4D would require, performance projections, GLS path,
+    /// Twist Pohlig-Hellman proposal.
+    /// Example: kangaroo --research4d --range-bits 135
+    #[arg(long)]
+    research4d: bool,
+
+    /// Measure empirical Kangaroo constant C on random small-scale DLP instances.
+    /// Compares measured C against theoretical 1.10 and published literature.
+    /// Example: kangaroo --benchmark-c --range-bits 48 --trials 500
+    #[arg(long)]
+    benchmark_c: bool,
+
+    /// Number of random DLP trials for --benchmark-c (default 200)
+    #[arg(long, default_value = "200")]
+    trials: u64,
 }
 
 // ─── CUDA FFI ────────────────────────────────────────────────────────────────
@@ -826,6 +844,15 @@ fn main() {
     // Research mode can run standalone (no --target-x/y required)
     if args.research {
         research::run_research(args.range_bits);
+        return;
+    }
+    if args.research4d {
+        glv4d::run_4d_research(args.range_bits);
+        glv4d::analyze_torsion();
+        return;
+    }
+    if args.benchmark_c {
+        research::run_benchmark_c(args.range_bits.min(52), args.trials);
         return;
     }
 
