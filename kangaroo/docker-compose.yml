@@ -1,0 +1,76 @@
+version: '3.8'
+
+# sinGRAAL v13 — Docker Compose for Cloud GPU Cluster
+#
+# Single machine (all GPUs):
+#   docker compose up singraal
+#
+# Distributed (coordinator on machine A, workers on B, C, ...):
+#   Machine A: docker compose up coordinator
+#   Machine B: COORDINATOR=A.ip:5135 docker compose up worker
+
+x-gpu-common: &gpu-common
+  image: singraal:v13
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      CUDA_ARCH: sm_80  # override: sm_86 (3090), sm_89 (4090), sm_90 (H100)
+  restart: unless-stopped
+  volumes:
+    - singraal-data:/data
+
+services:
+  singraal:
+    <<: *gpu-common
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - TARGET_X=${TARGET_X}
+      - TARGET_Y=${TARGET_Y}
+      - RANGE_BITS=${RANGE_BITS:-135}
+    command: >
+      --target-x ${TARGET_X}
+      --target-y ${TARGET_Y}
+      --range-bits ${RANGE_BITS:-135}
+      --all-gpus
+      --checkpoint /data/checkpoint.bin
+
+  coordinator:
+    <<: *gpu-common
+    ports:
+      - "5135:5135"
+    environment:
+      - TARGET_X=${TARGET_X}
+      - TARGET_Y=${TARGET_Y}
+    command: >
+      --serve
+      --bind 0.0.0.0:5135
+      --target-x ${TARGET_X}
+      --target-y ${TARGET_Y}
+      --range-bits ${RANGE_BITS:-135}
+
+  worker:
+    <<: *gpu-common
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - COORDINATOR=${COORDINATOR:-coordinator:5135}
+    command: >
+      --coordinator ${COORDINATOR:-coordinator:5135}
+      --all-gpus
+      --range-bits ${RANGE_BITS:-135}
+      --checkpoint /data/checkpoint.bin
+
+volumes:
+  singraal-data:

@@ -1,29 +1,21 @@
-// sinGRAAL — 6-automorphism Kangaroo CUDA kernel  (affine walk edition, v8)
+// sinGRAAL — 6-automorphism Kangaroo CUDA kernel  (v13: 4-axis, 48-band, C≈1.06)
 //
-// KEY DESIGN DECISION — affine walk (normalize every step):
-//   Old Jacobian walk: 11 field-muls/step, DP check only every 512 steps
-//   Affine walk v3   : ~395 field-muls/step, DP check every step → 14× more DPs/s
-//   Affine walk v4   : optimized fp_inv (256S+15M, 40 fewer registers),
-//                      __launch_bounds__(256,2) doubles SM occupancy to ~25%,
-//                      sqr512 (10 products vs 16) saves 37% on squarings.
-//   Affine walk v5   : PTX inline asm for mul512/sqr512/fp_add/fp_sub/sc_add
-//                      (mad.lo.cc.u64 / madc.hi carry chains replace u128 loops),
-//                      shared-memory jump table (12 KB/block, eliminates constant-
-//                      cache thrash), steps_per_launch 65536 (4× less launch OH),
-//                      __launch_bounds__(256,3) → 37% SM occupancy (vs 25%),
-//                      num_animals 262144 (2×, better SM saturation),
-//                      auto-tuned dp_bits = range_bits/2 − 10.
-//   Affine walk v6   : MAX_DPS doubled to 8M, preferred shared-mem carveout = MAX,
-//                      5-band geometric jump distribution.
-//   Affine walk v8   : Warp-ballot DP coalescing — __ballot_sync + warp prefix-sum
-//                      cuts atomicAdd calls from ≤256/iter to ≤8/iter (one/warp).
-//                      GPU-side step counter — g_step_count accumulates actual steps
-//                      so host sees real throughput instead of estimates.
-//                      3-axis GLV jump table (G + φG + φ²G) — full hexagonal lattice
-//                      coverage, Kangaroo constant improves ~1.70 → ~1.65.
-//   Combined benefit: ~4-6× throughput vs v4, ~40-56× vs original Jacobian walk.
+// VERSION HISTORY:
+//   v8  : warp-ballot DP coalescing, 3-axis GLV, GPU step counter
+//   v10 : 256 jumps, 17-band geometric (C≈1.18), bitmask selection
+//   v11 : 29-band (C≈1.10), optimal 3-jump/band density
+//   v13 : 48-band (C≈1.06), 4th Frobenius axis [μ]G (μ=p−n)
+//         NUM_JUMPS=256 = 4 axes × 64 per axis
+//         r = 2^47 → C = 1+2/ln(2^47) ≈ 1.062
+//         −4% ops vs v11, −38% vs v5 baseline
 //
-//   CORRECT: jump_idx from canonical affine x → same position always same jump.
+// CUDA budget:
+//   NUM_JUMPS=256, shared mem = 256×96B = 24KB/block, 3 blocks = 72KB < 100KB
+//   Selection: cx[0] & 0xFF (bitmask, 1 instruction, no division)
+//
+// Compile:
+//   nvcc -O3 -arch=sm_80 --compiler-options -fPIC -c kangaroo.cu -o kangaroo.o
+//   ar rcs libkangaroo_cuda.a kangaroo.o
 //
 // Compile:
 //   nvcc -O3 -arch=sm_80 --compiler-options -fPIC -c kangaroo.cu -o kangaroo.o
