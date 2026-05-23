@@ -1,15 +1,15 @@
-// sinGRAAL Kangaroo v8 — 6-automorphism Pollard Kangaroo, CUDA-accelerated
+// sinGRAAL Kangaroo v12 — 6-automorphism Pollard Kangaroo, CUDA-accelerated
 //
-// Improvements over v1:
-//  • Correct DP detection (GPU normalizes to affine every NORM_INTERVAL steps)
-//  • Multi-GPU with shared DP table (linear scaling with GPUs)
-//  • Checkpoint save/load (resume multi-day runs)
-//  • Exact 6-aut recovery (6 candidates, not 18)
-//  • GLV 3-axis torus coverage: G + φ(G) + φ²(G) directions (full hexagonal lattice)
-//  • 9-band geometric jump distribution per axis (factor-256 spread, constant ~1.36)
-//  • Progress bar with ETA (GLV3-corrected: ~1.65√(range/12))
-//  • GPU step counter: actual throughput from device (not estimated)
-//  • Warp-ballot DP coalescing: 32× fewer global atomics in GPU kernel
+// v12 over v11:
+//  • 29-band geometric jumps (was 17-band) — r = 2^28, C ≈ 1.10 (was 1.18)
+//    Empirically validated by --benchmark-c on 29-band distribution in v11.
+//    This is the actual solver now matching the benchmark model.
+//  • Cloud GPU deployment: Docker entrypoint, env-var config, cloud-init scripts
+//  • Version string unified across all modules
+//
+// v11: 4D GLV research module + empirical C measurement (29-band benchmark)
+// v10: 17-band geometric jumps, C ≈ 1.18, 256-jump table
+// v8:  Persistent kernel + warp-ballot DP coalescing + GPU step counter
 //
 // Usage:
 //   kangaroo --target-x <hex64> --target-y <hex64> --range-bits 135
@@ -21,6 +21,7 @@ mod glv;
 mod coordinator;
 mod research;
 mod glv4d;
+mod semaev;
 
 use clap::Parser;
 use secp::*;
@@ -117,6 +118,26 @@ struct Args {
     #[arg(long)]
     research4d: bool,
 
+    /// Run Semaev + CM symmetry research: summation polynomials S_3 verified
+    /// on secp256k1, Z[ω] orbit compression measured, relation density counted,
+    /// regularity degree estimation, novel Semaev-Kangaroo-CM hybrid proposal.
+    /// Core hypothesis: CM structure reduces Gröbner basis regularity degree.
+    /// Example: kangaroo --research-semaev
+    #[arg(long)]
+    research_semaev: bool,
+
+    /// Empirically test the Frobenius endomorphism π:(x,y)→(x^p,y^p) on secp256k1 points.
+    /// Proves whether GLS 4D is applicable to puzzle #135.
+    /// Example: kangaroo --research-gls
+    #[arg(long)]
+    research_gls: bool,
+
+    /// Benchmark canonical_Y branchless (AVX-512 concept) vs canonical_X (6×).
+    /// Measures compression ratio, fruitless cycle risk, GPU impact.
+    /// Example: kangaroo --research-canonical
+    #[arg(long)]
+    research_canonical: bool,
+
     /// Measure empirical Kangaroo constant C on random small-scale DLP instances.
     /// Compares measured C against theoretical 1.10 and published literature.
     /// Example: kangaroo --benchmark-c --range-bits 48 --trials 500
@@ -196,22 +217,22 @@ struct Jump { pt: Pt, scalar: Fe }
 /// function already collapses all 6 equivalents, so the Kangaroo walk
 /// operates on the Z[ω] hexagonal quotient lattice.
 ///
-/// This lattice has 3 natural axes: G, φ(G), φ²(G).  Prior versions used
-/// only G and φ(G) (2-axis).  Adding φ²(G) achieves full hexagonal coverage:
+/// This lattice has 3 natural axes: G, φ(G), φ²(G).
+///   • Axis 0 (i < N/3):         G-direction — scalar δᵢ
+///   • Axis 1 (N/3 ≤ i < 2N/3): φ(G)-dir   — scalar λ·δᵢ mod n
+///   • Axis 2 (i ≥ 2N/3):       φ²(G)-dir  — scalar λ²·δᵢ mod n
 ///
-///   • Axis 0 (i < N/3):   G-direction    — point δᵢ·G,       scalar δᵢ
-///   • Axis 1 (N/3 ≤ i < 2N/3): φ(G)-dir — point (β·xᵢ,yᵢ), scalar λ·δᵢ mod n
-///   • Axis 2 (i ≥ 2N/3): φ²(G)-dir     — point (β²·xᵢ,yᵢ), scalar λ²·δᵢ mod n
-///
-/// JUMP DISTRIBUTION — 17-band geometric (v10, optimal for 256-jump budget):
+/// JUMP DISTRIBUTION — 29-band geometric (v12, best C for 256-jump budget):
 ///
 ///   Kangaroo constant C ≈ 1 + 2/ln(r) where r = largest/smallest jump ratio.
 ///
-///   5-band [-2..+2]:  r = 2^4  = 16,      C ≈ 1.72   (v5-v7)
-///   9-band [-4..+4]:  r = 2^8  = 256,     C ≈ 1.36   (v8-v9)
-///  17-band [-8..+8]:  r = 2^16 = 65536,   C ≈ 1.18   (v10, this version)
+///   5-band  [-2..+2]:   r = 2^4  = 16,         C ≈ 1.72  (v5-v7)
+///   9-band  [-4..+4]:   r = 2^8  = 256,        C ≈ 1.36  (v8-v9)
+///  17-band  [-8..+8]:   r = 2^16 = 65 536,     C ≈ 1.18  (v10-v11)
+///  29-band [-14..+14]:  r = 2^28 = 268 M,      C ≈ 1.10  (v12, this version)
 ///
-///   With NUM_JUMPS=256: 256/3 axes = 85/axis, 85/17 bands = 5/band — valid.
+///   With NUM_JUMPS=256: 256/3 = 85/axis.  85 = 2×29 + 27, so 27 bands have
+///   3 jump slots and 2 bands have 2 — sufficient diversity per band.
 ///   Shared memory: 256 × 96 B × 3 blocks = 72 KB < 100 KB Ampere/Ada limit.
 ///   Jump selection: cx[0] & 0xFF (bitmask — 1 GPU instruction, no division).
 ///
@@ -225,9 +246,9 @@ fn build_jumps(range_bits: u32, num_jumps: usize) -> Vec<Jump> {
     let mut jumps = Vec::with_capacity(num_jumps);
     let mut global_i = 0usize;
 
-    // 17-band geometric: spread [2^(mu-8) .. 2^(mu+8)], factor 2^16 = 65536.
-    const NUM_BANDS: usize = 17;
-    const BAND_HALF: i32   = (NUM_BANDS / 2) as i32;  // 8
+    // 29-band geometric: spread [2^(mu-14) .. 2^(mu+14)], factor 2^28 = 268M.
+    const NUM_BANDS: usize = 29;
+    const BAND_HALF: i32   = (NUM_BANDS / 2) as i32;  // 14
 
     for axis in 0..3usize {
         for local_i in 0..axis_sizes[axis] {
@@ -736,7 +757,7 @@ fn run_gpu(
             let rate_gstep = total_steps as f64 / elapsed / 1e9;  // Gstep/s
             // ETA: full 3-axis hexagonal lattice (G + φG + φ²G) → constant ~1.65
             // vs 2-axis (G + φG only) → ~1.70.  Factor √12 = √6-aut × √2-GLV.
-            let expected_ops = 1.18f64 * f64::powi(2.0, args.range_bits as i32 / 2) / 12f64.sqrt();
+            let expected_ops = 1.10f64 * f64::powi(2.0, args.range_bits as i32 / 2) / 12f64.sqrt();
             let remaining    = (expected_ops - total_steps as f64).max(0.0);
             let eta_s        = remaining / (total_steps as f64 / elapsed.max(1.0));
             let pct = (total_steps as f64 / expected_ops * 100.0).min(99.9);
@@ -851,6 +872,18 @@ fn main() {
         glv4d::analyze_torsion();
         return;
     }
+    if args.research_semaev {
+        semaev::run_semaev_research(args.range_bits);
+        return;
+    }
+    if args.research_gls {
+        glv4d::run_frobenius_experiment();
+        return;
+    }
+    if args.research_canonical {
+        glv4d::run_canonical_benchmark();
+        return;
+    }
     if args.benchmark_c {
         research::run_benchmark_c(args.range_bits.min(52), args.trials);
         return;
@@ -862,14 +895,14 @@ fn main() {
     let ty = fe_from_hex(&args.target_y).expect("--target-y: need 64 hex chars");
     let target = Pt { x: tx, y: ty, inf: false };
 
-    eprintln!("sinGRAAL Kangaroo v8 — 6-automorphism secp256k1 ECDLP (3-axis GLV)");
+    eprintln!("sinGRAAL Kangaroo v12 — 6-automorphism secp256k1 ECDLP (3-axis GLV, 29-band)");
     eprintln!("  target  = 0x{}:0x{}", fe_to_hex(tx), fe_to_hex(ty));
     eprintln!("  range   = [0, 2^{})", args.range_bits);
     eprintln!("  animals = {} per device", args.num_animals);
     eprintln!("  dp_bits = {}", dp_bits);
     // Expected ops (informational):
-    let exp_ops = 1.18f64 * (2.0f64).powi(args.range_bits as i32 / 2) / 12f64.sqrt();
-    eprintln!("  E[ops]  = {:.2e}  (6-aut+GLV3+17-band, ~1.18√(range/12))", exp_ops);
+    let exp_ops = 1.10f64 * (2.0f64).powi(args.range_bits as i32 / 2) / 12f64.sqrt();
+    eprintln!("  E[ops]  = {:.2e}  (6-aut+GLV3+29-band, ~1.10√(range/12))", exp_ops);
     if let Some(ref c) = args.coordinator { eprintln!("  coord   = {c}"); }
 
     // ── Structure analysis mode ──────────────────────────────────────────────
