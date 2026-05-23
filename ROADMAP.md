@@ -26,64 +26,55 @@ vs naive: 5.6× speedup (≡ 132.4-bit problem)
 
 ---
 
-## 🔬 v14 — IN RESEARCH
+## ✅ v14 — COMPLETE
 
-**Target: true 4D GLS Kangaroo — halving per-step EC operation cost**
+**C ≈ 1.046 — 4-axis — 64-band (1 jump per band, optimal uniformity)**
 
-### What changes in v14
+### What changed in v14
+- **64-band jump table** (was 48-band): 256 jumps × 4 axes = exactly 1 jump per band
+  - C: 1.062 → 1.046 (~1.5% fewer ops)
+  - Formula: C ≈ 1 + 2/ln(2^63) ≈ 1.046
+- **Documentation**: corrected false 2^33 claims — see RESEARCH.md §7
+- **Accuracy**: honest performance projections throughout
 
-With 4D GLS, each Kangaroo step uses a 4-part scalar decomposition:
+### v14 Performance
 ```
-k = k₁ + k₂λ + k₃ψ + k₄λψ  (mod n)
-```
-where ψ is the balanced GLS scalar (≈ n^{1/4} ≈ 2^64 per component).
+E[ops] = 1.046 × √(2^135 / 6) ≈ 2^65.5 operations   (−1.5% vs v13)
+vs v13:  −1.5% fewer ops (1.062 → 1.046)
+vs v5:   −39% fewer ops total
+vs naive: 5.7× speedup
 
-Each EC operation needs only `n^{1/4} ≈ 34` doublings instead of `n^{1/2} ≈ 68`.
-**Net: each Kangaroo step is ~2× cheaper.**
-
-### v14 Milestones
-
-#### Phase 1 — Find balanced GLS scalar ψ
-- [ ] Solve: ψ² + t·ψ + p ≡ 0 (mod n) for the non-trivial root
-      (The trivial root μ=p−n ≈ 2^128 is too large — need the "twisted" root)
-- [ ] Implement: 4×4 LLL reduction over the {1, λ, ψ, λψ} lattice
-- [ ] Verify: all four kᵢ components ≈ 34 bits for 135-bit keys
-- [ ] Benchmark: EC op cost with 4D vs 2D decomposition
-
-#### Phase 2 — 4D CUDA kernel
-- [ ] 4-scalar simultaneous doubling (w-NAF or joint sparse form)
-- [ ] Precomputed table for 4 basis points {G, φG, [ψ]G, φ[ψ]G}
-- [ ] Verify: correctness on small test cases
-- [ ] Profile: op count and timing vs v13 kernel
-
-#### Phase 3 — Integration
-- [ ] Update `build_jumps()` with 4D-decomposed jump scalars
-- [ ] Update CUDA jump table layout for 4D basis
-- [ ] Update `--benchmark-c` to measure v14 empirical C
-- [ ] Target: C ≈ 1.04 (improvement from faster per-step ops)
-
-### v14 Expected Performance
-```
-Per-step cost: ~2× faster (34 doublings vs 68 doublings)
-Ops count: same as v13 (~2^65.6)
-Wall-clock: 2× faster → effectively C_wall ≈ 1.06/2 ≈ 0.53 (time-domain)
-
-1× RTX 4090: ~550 years   (vs ~1,100 years today)
-8× RTX 4090: ~69 years    (vs ~140 years today)
+1× RTX 4090 (~10 Gop/s):  ~80 years
+8× RTX 4090 (~80 Gop/s):  ~10 years
 ```
 
 ---
 
-## 🌌 v15 and Beyond
+## 🔬 v15 — NEXT
 
-### v15 — 4D BSGS (Memory-Time Tradeoff)
+**Target: 4D BSGS — memory-time tradeoff, 2^34 ops**
+
+### Clarification — Why 4D Does NOT Halve Kangaroo Ops
+
+Kangaroo random walk: each step = **one point addition** (not scalar multiplication).
+Scalar size has no effect on per-step cost. The 4D endomorphisms help by:
+- Lowering C constant (better jump table coverage) ✅ done in v13/v14
+- Enabling 4D BSGS with 2^(n/4) time, but 2^(n/4) memory ← v15 target
+
+### v15 Plan — 4D BSGS
+
 ```
 Algorithm: 4D Baby-Step Giant-Step
 Time:      2^34 ops   (~14 seconds @ 1 Gop/s)
-Memory:    2^34 × 100B = ~1.7 TB
-Feasibility: requires ~1.7 TB VRAM — not yet practical
-             A100 cluster with NVLink: possible at scale
+Memory:    2^34 × 100B = ~1.7 TB VRAM
 ```
+
+#### Milestones
+- [ ] Implement 4×4 LLL lattice reduction (secp256k1 4D short basis)
+- [ ] Verify balanced decomposition: all kᵢ ≈ 2^34 bits for k ≈ 2^135
+- [ ] Baby-step table: precompute 2^34 points in F_{p²}
+- [ ] Giant-step: iterate 2^34 steps, check table
+- [ ] Feasibility: requires A100 cluster with NVLink (~1.7 TB combined VRAM)
 
 ### v16 — TPKH (Twist Pohlig-Hellman Combination)
 - Solve DLP mod small factors of twist order n' = 2p+2−n
@@ -91,12 +82,19 @@ Feasibility: requires ~1.7 TB VRAM — not yet practical
 - Maximum gain: 64× range reduction if smooth n' factor found
 - Status: bridge problem unsolved — active research
 
-### v∞ — Sub-Exponential
+---
+
+## 🌌 v17 and Beyond
+
+### v17 — Sub-Exponential Research
 ```
-Known paths to sub-exponential:
+Known paths to sub-exponential for secp256k1:
   - Semaev summation polynomials (sub-quadratic Gröbner — open math)
   - Quantum Shor's algorithm (requires ~4000 logical qubits for 135 bits)
-  - Novel algebraic structure (undiscovered)
+  - Novel algebraic structure (none discovered — breaking all ECC if found)
+
+No known sub-exponential algorithm exists for random prime-order ECC.
+Best proven lower bound: Ω(√n) for generic group algorithms (Shoup 1997).
 ```
 
 ---

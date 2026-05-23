@@ -197,7 +197,7 @@ mod ffi {
 
 struct Jump { pt: Pt, scalar: Fe }
 
-/// Build NUM_JUMPS jump points — sinGRAAL v13: 4-axis, 48-band, C ≈ 1.06.
+/// Build NUM_JUMPS jump points — sinGRAAL v14: 4-axis, 64-band, C ≈ 1.046.
 ///
 /// AXES (4 total):
 ///   0: G-direction       scalar δᵢ
@@ -208,7 +208,7 @@ struct Jump { pt: Pt, scalar: Fe }
 ///   Axes 0-2 tile the 2D hexagonal lattice (optimal, Gauss 1831).
 ///   Axis 3 adds the Frobenius-scalar direction for 4D coverage.
 ///
-/// BAND DISTRIBUTION — 48-band geometric (v13):
+/// BAND DISTRIBUTION — 64-band geometric (v14):
 ///
 ///   C ≈ 1 + 2/ln(r) where r = largest/smallest jump ratio.
 ///
@@ -216,18 +216,20 @@ struct Jump { pt: Pt, scalar: Fe }
 ///    9-band:  r = 2^8,   C ≈ 1.36  (v8-v9)
 ///   17-band:  r = 2^16,  C ≈ 1.18  (v10)
 ///   29-band:  r = 2^28,  C ≈ 1.10  (v11)
-///   48-band:  r = 2^47,  C ≈ 1.06  (v13 — this version)
+///   48-band:  r = 2^47,  C ≈ 1.06  (v13)
+///   64-band:  r = 2^63,  C ≈ 1.046 (v14 — this version)
 ///
 /// CUDA budget: NUM_JUMPS=256 = 4×64 per axis.
+///   With 64-band: exactly 1 jump per band — perfectly uniform coverage.
 ///   Shared mem: 256 × 96 B = 24 KB per block, 3 blocks = 72 KB < 100 KB limit.
 ///   Selection:  cx[0] & 0xFF  (bitmask, 1 GPU instruction).
 fn build_jumps(range_bits: u32, num_jumps: usize) -> Vec<Jump> {
     let mu_bits = (range_bits / 2) as i32;
 
-    // v13: 4 axes, 64 jumps each = 256 total.
+    // v14: 4 axes, 64 jumps each = 256 total. 64-band = 1 jump per band (optimal uniformity).
     const NUM_AXES:  usize = 4;
-    const NUM_BANDS: usize = 48;
-    const BAND_HALF: i32   = (NUM_BANDS / 2) as i32;  // 24
+    const NUM_BANDS: usize = 64;
+    const BAND_HALF: i32   = (NUM_BANDS / 2) as i32;  // 32
 
     let per_axis = num_jumps / NUM_AXES;
     let axis_sizes = [per_axis, per_axis, per_axis, num_jumps - 3 * per_axis];
@@ -750,7 +752,7 @@ fn run_gpu(
             let rate_gstep = total_steps as f64 / elapsed / 1e9;  // Gstep/s
             // ETA: full 3-axis hexagonal lattice (G + φG + φ²G) → constant ~1.65
             // vs 2-axis (G + φG only) → ~1.70.  Factor √12 = √6-aut × √2-GLV.
-            let expected_ops = 1.06f64 * f64::powi(2.0, args.range_bits as i32 / 2) / 6f64.sqrt();
+            let expected_ops = 1.046f64 * f64::powi(2.0, args.range_bits as i32 / 2) / 6f64.sqrt();
             let remaining    = (expected_ops - total_steps as f64).max(0.0);
             let eta_s        = remaining / (total_steps as f64 / elapsed.max(1.0));
             let pct = (total_steps as f64 / expected_ops * 100.0).min(99.9);
@@ -880,12 +882,12 @@ fn main() {
     let ty = fe_from_hex(&args.target_y).expect("--target-y: need 64 hex chars");
     let target = Pt { x: tx, y: ty, inf: false };
 
-    eprintln!("sinGRAAL Kangaroo v13 — 6-aut secp256k1 ECDLP (4-axis GLV+Frobenius, 48-band C≈1.06)");
+    eprintln!("sinGRAAL Kangaroo v14 — 6-aut secp256k1 ECDLP (4-axis GLV+Frobenius, 64-band C≈1.046)");
     eprintln!("  target  = 0x{}:0x{}", fe_to_hex(tx), fe_to_hex(ty));
     eprintln!("  range   = [0, 2^{})", args.range_bits);
     eprintln!("  animals = {} per device", args.num_animals);
     eprintln!("  dp_bits = {}", dp_bits);
-    let exp_ops = 1.06f64 * (2.0f64).powi(args.range_bits as i32 / 2) / 6f64.sqrt();
+    let exp_ops = 1.046f64 * (2.0f64).powi(args.range_bits as i32 / 2) / 6f64.sqrt();
     eprintln!("  E[ops]  = {:.2e}  (6-aut+GLV4+48-band, ~1.06√(range/6))", exp_ops);
     if let Some(ref c) = args.coordinator { eprintln!("  coord   = {c}"); }
 

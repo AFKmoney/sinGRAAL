@@ -252,7 +252,7 @@ uint idx = cx[0] & (NUM_JUMPS - 1);   // & 0xFF
 
 ---
 
-## 7. The GLS Breakthrough — Path to 4D
+## 7. The GLS Construction — What It Actually Provides
 
 ### Construction
 
@@ -260,48 +260,46 @@ The **GLS (Galbraith-Lin-Scott, 2009)** construction works as follows:
 
 1. **Extend the field:** Work over F_{p²} instead of F_p
 2. **Frobenius endomorphism:** π: (x,y) → (x^p, y^p) is well-defined and non-trivial over F_{p²}
-3. **4D lattice:** k decomposes as `k = k₁ + k₂λ + k₃·(something) + k₄·(something·λ) (mod n)`
-4. **Scalar bits:** Each kᵢ ≈ bits/4 instead of bits/2
+3. **4D lattice:** k decomposes as `k = k₁ + k₂λ + k₃μ + k₄λμ (mod n)`, where μ = p−n
+4. **Balanced decomposition:** With a 4×4 LLL-reduced basis, each kᵢ ≈ n^{1/4} ≈ 2^34 bits
 
-### For Puzzle #135
+### What 4D GLS Helps in Kangaroo — and What It Doesn't
+
+**Important distinction:** The Kangaroo random walk makes one EC *point addition* per step, not a scalar multiplication. Scalar size does NOT affect step count.
 
 ```
-2D current:   scalar length ≈ 67.5 bits  →  ops ≈ C × 2^67.5
-4D GLS target: scalar length ≈ 33.75 bits →  ops ≈ C × 2^33.75
+Kangaroo step: P_next = P + J[i]   (one point addition from the jump table)
 ```
 
-At 1 Gop/s: 2^33.75 ≈ 1.4 × 10^10 ops → **~14 seconds**.
+This means:
 
-### Why F_{p²} Arithmetic Doesn't Cancel the Gain
+| Algorithm        | How 4D helps                            | Ops count     |
+|------------------|-----------------------------------------|---------------|
+| **BSGS**         | 4D decomposition → 2^(n/4) table size  | 2^34 ops ✅    |
+| **Kangaroo**     | More jump axes → lower C constant      | 2^65.6 ops    |
+| Kangaroo per-step| 4D multi-scalar → 2× fewer doublings   | Same ops, 2× faster wall-clock |
 
-F_{p²} arithmetic costs ~4× per operation vs F_p:
+### For Puzzle #135 — Honest Numbers
+
+```
+Kangaroo (current, v14): E[ops] ≈ 1.046 × 2^67.5 / √6 ≈ 2^65.5
+  At 10 Gop/s (8× RTX 4090): ~110 years
+
+4D BSGS (theoretical):   ops ≈ 2^34,  memory ≈ 1.7 TB VRAM
+  At 1 Tflop/s + 1.7 TB:  ~14 seconds — but no current GPU has 1.7 TB VRAM
+```
+
+### F_{p²} Arithmetic Cost
+
+F_{p²} arithmetic costs ~3-4× per operation vs F_p:
 - 1 F_{p²} addition = 2 F_p additions
-- 1 F_{p²} multiplication = 4 F_p multiplications (Karatsuba: 3)
-- Net: ~3-4× overhead
+- 1 F_{p²} multiplication ≈ 3 F_p multiplications (Karatsuba)
 
-But the ops reduction is 2^33.75 ≈ 10^10×.
+For Kangaroo, working over F_{p²} would cost ~3× per step while giving only ~√2 speedup from the larger automorphism group — net loss. The GLS construction benefits BSGS, not Kangaroo.
 
-Net speedup: `10^10 / 4 ≈ 2.5 × 10^9×` — **nine orders of magnitude**.
+### Current Implementation (v13–v14)
 
-### Implementation Plan (v12)
-
-```rust
-// F_{p²} element: a + b·i where i² = non-residue mod p
-struct Fp2 { a: Fe, b: Fe }
-
-// Curve over F_{p²}: same equation y² = x³ + 7, but x,y ∈ F_{p²}
-// Frobenius: π(x,y) = (x^p, y^p) = (conj(x), conj(y)) for p≡3 mod 4
-
-// 4D decomposition of k ∈ [0, 2^135):
-// k = k1 + k2*λ + k3*p + k4*λ*p  (mod n)
-// Each ki ≈ 33 bits
-
-// Kangaroo walk axes (4D):
-// J1 = G           (baseline)
-// J2 = φ(G)        (CM endomorphism)
-// J3 = π(G)        (Frobenius on F_{p²} lift)
-// J4 = φ(π(G))     (composed)
-```
+The 4D structure is used in v13–v14 for the **jump table axes** (4 directions: G, φG, φ²G, [μ]G), which reduces the C constant. The F_{p²} and Frobenius arithmetic is implemented in `fp2.rs` and `gls.rs` for research purposes and as infrastructure for a future 4D BSGS solver.
 
 ---
 
@@ -375,35 +373,36 @@ If measured C < 1.15, sinGRAAL is in **world-record territory** for published Ka
 
 ### Near-term (implementable)
 
-| Problem | Difficulty | Potential gain |
-|---------|-----------|----------------|
-| 4D GLS Kangaroo on CUDA | High (F_{p²} arithmetic) | 2^33.75 ops → seconds |
-| 4D LLL decomposition | Medium | required for GLS |
-| Twist TPKH bridge | Research | 64× if solved |
-| Semaev Gröbner basis | Open math | sub-exponential if solved |
-| C → 1.05 (more bands) | Medium | 5% more ops saved |
+| Problem | Difficulty | Actual gain |
+|---------|-----------|-------------|
+| 4D BSGS solver | Very High (1.7 TB memory) | 2^34 ops — but needs 1.7 TB VRAM |
+| 4×4 LLL decomposition | Medium | Needed for 4D BSGS; no Kangaroo benefit |
+| Twist TPKH bridge | Research (unsolved) | Up to 64× range narrowing if bridge found |
+| Semaev Gröbner basis | Open mathematics | Sub-exponential if solvable (unknown) |
+| C → 1.04 (more bands / LLL) | Medium | ~2% fewer ops |
+| More GPU parallelism | Engineering | Linear scaling with GPUs |
 
-### v11 → v12 Checklist
+### v14 Progress
 
-- [ ] F_{p²} field arithmetic in Rust (CPU setup)
-- [ ] F_{p²} field arithmetic in CUDA (GPU kernel)
-- [ ] Frobenius endomorphism π on F_{p²} points
-- [ ] 4D LLL scalar decomposition
-- [ ] 4D Kangaroo jump table (4 axes × 29 bands)
-- [ ] 4D DP detection (canonical form in 4D)
-- [ ] 4D collision recovery → scalar k
-- [ ] Benchmark: measure actual C for 4D walk
-- [ ] Target: puzzle #135 in < 60 seconds on single RTX 4090
+- [x] F_{p²} field arithmetic in Rust (`fp2.rs`)
+- [x] Frobenius endomorphism π on F_{p²} points
+- [x] 4D decomposition framework in `gls.rs` (μ eigenvalue verified)
+- [x] 4-axis Kangaroo jump table (G, φG, φ²G, [μ]G) — 64-band in v14
+- [x] 6-automorphism canonical form → √6 speedup
+- [x] Empirical C measurement (`--benchmark-c`)
+- [ ] 4×4 LLL for balanced 4D decomposition (needed for 4D BSGS path)
+- [ ] 4D BSGS prototype (memory-time tradeoff, 2^34 ops / 1.7 TB)
+- [ ] TPKH bridge (active research — bridge problem unsolved)
 
 ### Mathematical Frontiers
 
 | Direction | Status | If solved |
 |-----------|--------|-----------|
-| GLS 4D on F_{p²} | **v12 target** | **seconds per GPU** |
-| TPKH bridge | Research | 64× narrowing |
-| Semaev sub-quadratic | Open math | potentially polynomial |
-| Supersingular lift | Theoretical | 4D via quaternion End(E) |
-| ML structure search | Experimental | unknown |
+| 4D BSGS on GPU cluster | Engineering | 2^34 ops — needs 1.7 TB VRAM |
+| TPKH bridge | Research | Potential 64× range narrowing |
+| Semaev sub-quadratic | Open math | Potentially polynomial |
+| Quantum Shor | Engineering | Needs ~4000 logical qubits |
+| Novel algebraic attack | Unknown | Would break all ECC if found |
 
 ---
 
