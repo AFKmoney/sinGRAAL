@@ -21,6 +21,7 @@ mod glv;
 mod coordinator;
 mod research;
 mod glv4d;
+mod semaev;
 
 use clap::Parser;
 use secp::*;
@@ -116,6 +117,14 @@ struct Args {
     /// Example: kangaroo --research4d --range-bits 135
     #[arg(long)]
     research4d: bool,
+
+    /// Run Semaev + CM symmetry research: summation polynomials S_3 verified
+    /// on secp256k1, Z[ω] orbit compression measured, relation density counted,
+    /// regularity degree estimation, novel Semaev-Kangaroo-CM hybrid proposal.
+    /// Core hypothesis: CM structure reduces Gröbner basis regularity degree.
+    /// Example: kangaroo --research-semaev
+    #[arg(long)]
+    research_semaev: bool,
 
     /// Measure empirical Kangaroo constant C on random small-scale DLP instances.
     /// Compares measured C against theoretical 1.10 and published literature.
@@ -849,6 +858,10 @@ fn main() {
     if args.research4d {
         glv4d::run_4d_research(args.range_bits);
         glv4d::analyze_torsion();
+        return;
+    }
+    if args.research_semaev {
+        semaev::run_semaev_research(args.range_bits);
         return;
     }
     if args.benchmark_c {
