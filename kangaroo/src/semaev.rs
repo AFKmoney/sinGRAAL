@@ -1637,15 +1637,22 @@ fn section_frobenius() {
 
     println!();
     println!("  ┌─ FROBENIUS CONCLUSION ──────────────────────────────────────────┐");
-    println!("  │  Frobenius π acts as IDENTITY on E(F_p)-points.                │");
-    println!("  │  It does NOT give new scalar orbits for Kangaroo or Semaev.    │");
-    println!("  │  The 6-orbit from {{±1, ±φ, ±φ²}} is provably complete.         │");
+    println!("  │  Frobenius π_p acts as IDENTITY on E(F_p)-points.              │");
+    println!("  │  ∀P=(x,y)∈E(F_p): (x^p,y^p)=(x,y). No new orbit for Kangaroo.│");
+    println!("  │  The 6-orbit {{±P,±φP,±φ²P}} is COMPLETE (Deuring, rank 2).    │");
     println!("  │                                                                 │");
-    println!("  │  Frobenius IS useful for:                                       │");
-    println!("  │    • GLS construction over F_{{p²}}: Frobenius over F_{{p²}}       │");
-    println!("  │      is NOT the identity → gives 2nd endomorphism → 4D GLV.   │");
-    println!("  │    This requires LIFTING secp256k1 to a GLS curve over F_{{p²}}. │");
-    println!("  │    GLS-4D would give 2^33.75 ops for puzzle #135 (feasible!).  │");
+    println!("  │  GLS-4D COMPLEXITY AUDIT (puzzle #135):                        │");
+    println!("  │    Puzzle: k ∈ [2^134,2^135), group order n ≈ 2^256            │");
+    println!("  │    Kangaroo range-bounded:  √(2^135)        = 2^67.5 ✓         │");
+    println!("  │    + 6-orbit GLV (constant): √(2^135/6)     = 2^66.2 ✓         │");
+    println!("  │    GLS on E(F_{{p²}}): order≈2^512 → (2^512)^(1/4) = 2^128 ✗   │");
+    println!("  │    '2^33.75' = (2^135)^(1/4): confuses range with group order! │");
+    println!("  │                                                                 │");
+    println!("  │  CORRECT FORMULA: GLS-4D full DLP → n^(1/4) = (2^256)^(1/4)   │");
+    println!("  │    = 2^64. But requires End(E/F_p) rank 4 — IMPOSSIBLE here.   │");
+    println!("  │    Deuring: End(secp256k1/F_p) ≅ Z[ω], rank 2. QED.           │");
+    println!("  │                                                                 │");
+    println!("  │  BEST KNOWN for puzzle #135: Kangaroo+6-orbit ≈ 2^66.2 ops.   │");
     println!("  └─────────────────────────────────────────────────────────────────┘\n");
 
     println!("━━━ COMPLEXITY CHAIN: CM d_reg REDUCTION × INDEX CALCULUS ━━━━━━━━\n");
