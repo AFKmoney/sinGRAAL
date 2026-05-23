@@ -1,12 +1,14 @@
-// sinGRAAL Kangaroo v12 — 6-automorphism Pollard Kangaroo, CUDA-accelerated
+// sinGRAAL Kangaroo v13 — 6-automorphism Pollard Kangaroo, CUDA-accelerated
 //
-// v12 over v11:
-//  • 29-band geometric jumps (was 17-band) — r = 2^28, C ≈ 1.10 (was 1.18)
-//    Empirically validated by --benchmark-c on 29-band distribution in v11.
-//    This is the actual solver now matching the benchmark model.
-//  • Cloud GPU deployment: Docker entrypoint, env-var config, cloud-init scripts
-//  • Version string unified across all modules
+// v13 over v12:
+//  • Range-filtered 6-aut recovery — skips 5/6 scalar_mul calls per collision
+//    (the correct k ∈ [0, 2^range_bits) uniquely; wrong candidates ≈ 2^256)
+//  • Z[ω] LLL research (--research-semaev Section 11) — proves 3-axis jump
+//    table is already LLL-optimal in the Eisenstein scalar lattice
+//  • Fixed analyze_structure C values (was stale v9 values: C=1.36, 9-band)
+//  • Dead-wild restart is now independent of --no-checkpoint flag
 //
+// v12: 29-band geometric jumps (was 17-band) — r = 2^28, C ≈ 1.10
 // v11: 4D GLV research module + empirical C measurement (29-band benchmark)
 // v10: 17-band geometric jumps, C ≈ 1.18, 256-jump table
 // v8:  Persistent kernel + warp-ballot DP coalescing + GPU step counter
@@ -461,15 +463,15 @@ fn analyze_structure(target: Pt, range_bits: u32) {
     eprintln!();
 
     // ── 5. Summary ────────────────────────────────────────────────────────────
-    let e_ops = 1.65f64 * f64::powi(2.0, range_bits as i32 / 2) / 12f64.sqrt();
+    let e_ops = 1.10f64 * f64::powi(2.0, range_bits as i32 / 2) / 12f64.sqrt();
     eprintln!("[5] Summary — what the fractal gives us:");
-    eprintln!("    Level 0 (6-aut)    : factor-6 collapse       FULLY EXPLOITED");
-    eprintln!("    Level 0 (GLV 3ax)  : factor-√3 mixing        FULLY EXPLOITED");
-    eprintln!("    Jump distribution  : 9-band factor-256 spread FULLY EXPLOITED");
-    eprintln!("    Combined speedup   : C=1.36 vs naive C=2.0");
+    eprintln!("    Level 0 (6-aut)    : factor-6 collapse            FULLY EXPLOITED");
+    eprintln!("    Level 0 (GLV 3ax)  : Z[ω] hexagonal lattice axes  FULLY EXPLOITED");
+    eprintln!("    Jump distribution  : 29-band factor-2^28 spread   FULLY EXPLOITED");
+    eprintln!("    Combined speedup   : C=1.10 vs naive C=2.0");
     eprintln!("    Expected ops       : {e_ops:.2e} steps");
     eprintln!("    Theoretical floor  : Ω(√n) generic group (Shoup 1997)");
-    eprintln!("    Gap to floor       : C=1.36 vs C=1.0 = 36% above optimum");
+    eprintln!("    Gap to floor       : C=1.10 vs C=1.0 = 10% above optimum");
     eprintln!();
     eprintln!("    Conclusion: secp256k1's discrete fractal is FULLY EXPLOITED");
     eprintln!("    at all computationally distinct levels. The remaining gap");
@@ -489,6 +491,7 @@ fn process_dp(
     is_wild: bool,
     dp_table: &mut HashMap<[u64; 4], DpRecord>,
     target: Pt,
+    range_bits: u32,
 ) -> Option<Fe> {
     if let Some(prev) = dp_table.get(&canon_x) {
         if prev.is_wild != is_wild {
@@ -497,11 +500,12 @@ fn process_dp(
             } else {
                 (scalar, prev.scalar)
             };
-            let candidates = recover_k_6aut(tame_sc, wild_sc, target.x, target.y);
+            let candidates = recover_k_6aut(tame_sc, wild_sc, target.x, target.y, range_bits);
             if let Some(&k) = candidates.first() {
                 return Some(k);
             }
         }
+        // Same type: keep existing entry (first visit is as good as any)
     } else {
         dp_table.insert(canon_x, DpRecord { scalar, is_wild });
     }
@@ -512,10 +516,11 @@ fn process_dp(
 
 fn cpu_solve(args: &Args, target: Pt, dp_table: DpTable, found: Arc<AtomicBool>) -> Option<Fe> {
     const NUM_JUMPS: usize = 128;
-    let jumps = build_jumps(args.range_bits, NUM_JUMPS);
+    let jumps    = build_jumps(args.range_bits, NUM_JUMPS);
     let jump_idx = |x: Fe| (x[0] % NUM_JUMPS as u64) as usize;
     let dp_bits  = args.dp_bits.unwrap_or(28);
     let is_dp    = |x: Fe| x[3] < (1u64 << (64u32.saturating_sub(dp_bits)));
+    let range_bits = args.range_bits;
 
     let n = (args.num_animals / 2).max(1) as usize;
     let mut tames: Vec<(Pt, Fe)> = (0..n as u32).map(|i| make_tame(i, args.range_bits)).collect();
@@ -535,7 +540,7 @@ fn cpu_solve(args: &Args, target: Pt, dp_table: DpTable, found: Arc<AtomicBool>)
                 if is_dp(cx) {
                     dps += 1;
                     let mut table = dp_table.lock().unwrap();
-                    if let Some(k) = process_dp(cx, *sc, wild_flag, &mut table, target) {
+                    if let Some(k) = process_dp(cx, *sc, wild_flag, &mut table, target, range_bits) {
                         found.store(true, Ordering::Relaxed);
                         return Some(k);
                     }
@@ -713,7 +718,7 @@ fn run_gpu(
                     // Re-process this batch locally
                     let mut table = dp_table.lock().unwrap();
                     for dp in &dp_buf[..n_dps] {
-                        if let Some(k) = process_dp(dp.canon_x, dp.scalar, dp.is_wild != 0, &mut table, target) {
+                        if let Some(k) = process_dp(dp.canon_x, dp.scalar, dp.is_wild != 0, &mut table, target, args.range_bits) {
                             found.store(true, Ordering::Relaxed);
                             *result.lock().unwrap() = Some(k);
                             break;
@@ -725,7 +730,7 @@ fn run_gpu(
             // ── Standalone mode: local DP table ────────────────────────────────
             let mut table = dp_table.lock().unwrap();
             for dp in &dp_buf[..n_dps] {
-                if let Some(k) = process_dp(dp.canon_x, dp.scalar, dp.is_wild != 0, &mut table, target) {
+                if let Some(k) = process_dp(dp.canon_x, dp.scalar, dp.is_wild != 0, &mut table, target, args.range_bits) {
                     found.store(true, Ordering::Relaxed);
                     *result.lock().unwrap() = Some(k);
                     break;
@@ -792,7 +797,9 @@ fn run_gpu(
         }
 
         // ── Dead-wild restart: every 5 min, refresh 10% of wild animals ──────────
-        if !args.no_checkpoint {
+        // Independent of --no-checkpoint: preventing fruitless cycles is an
+        // algorithmic concern, not a persistence concern.
+        {
             let since_restart = Instant::now().duration_since(last_restart).as_secs_f64();
             if since_restart > RESTART_INTERVAL_S {
                 let n_wild = (args.num_animals - args.num_animals / 2) as usize;
@@ -914,7 +921,7 @@ fn main() {
     // ── Coordinator (server) mode ────────────────────────────────────────────
     if args.serve {
         eprintln!("  mode    = COORDINATOR  bind={}", args.bind);
-        if let Some(k) = coordinator::serve(&args.bind, target) {
+        if let Some(k) = coordinator::serve(&args.bind, target, args.range_bits) {
             println!("\n*** SOLUTION ***  k = 0x{}", fe_to_hex(k));
             let check = scalar_mul(G, k);
             if check.x == tx && check.y == ty && !check.inf {
