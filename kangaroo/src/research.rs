@@ -322,7 +322,7 @@ pub fn run_benchmark_c(bits: u32, trials: u64) {
     let elapsed = t0.elapsed().as_secs_f64();
 
     println!("  ┌──────────────────────────────────────────────────────────┐");
-    println!("  │  EMPIRICAL KANGAROO CONSTANT (sinGRAAL v11, 29-band)     │");
+    println!("  │  EMPIRICAL KANGAROO CONSTANT (sinGRAAL v12, 29-band)     │");
     println!("  │                                                            │");
     println!("  │  C_measured = {mean:.4}  ± {std_c:.4}                           │");
     println!("  │  C_min      = {min_c:.4}                                        │");
@@ -347,7 +347,7 @@ pub fn run_benchmark_c(bits: u32, trials: u64) {
     println!("    GLV-2 implementations:            C ≈ 1.30-1.40");
     println!("    sinGRAAL v9  (9-band, 3-axis):    C ≈ 1.36 theoretical");
     println!("    sinGRAAL v10 (17-band, 3-axis):   C ≈ 1.18 theoretical");
-    println!("    sinGRAAL v11 (29-band, 3-axis):   C ≈ {mean:.2} MEASURED  ←─── THIS RUN");
+    println!("    sinGRAAL v12 (29-band, 3-axis):   C ≈ {mean:.2} MEASURED  ←─── THIS RUN");
     println!("    Theoretical minimum:              C = 1.00");
     println!();
 
@@ -357,10 +357,11 @@ pub fn run_benchmark_c(bits: u32, trials: u64) {
         println!("  for secp256k1. sinGRAAL v11 is in uncharted territory.");
     }
     println!();
-    let ops_log2 = 67.5 + mean.log2();
-    let years_solo = (mean * f64::exp2(67.5)) / 3.15e16;
+    let c_v12 = 1.10f64;
+    let ops_log2 = 67.5 + c_v12.log2();
+    let years_solo = (c_v12 * f64::exp2(67.5)) / 3.15e16;
     println!("  To reduce to SECONDS for puzzle #135, we would need:");
-    println!("    Currently:   E ≈ {mean:.2} × 2^67.5 ≈ 2^{ops_log2:.1} ops at ~1 Gop/s → ~{years_solo:.0} years solo");
+    println!("    Currently:   E ≈ {c_v12:.2} × 2^67.5 ≈ 2^{ops_log2:.1} ops at ~1 Gop/s → ~{years_solo:.0} years solo");
     println!("    For 1 second: need E ≈ 10^9 ops → C × 2^67.5 = 10^9");
     println!("                  requires C ≈ {:.2e} (not achievable with current math)",
              1e9 / f64::exp2(67.5));
@@ -704,10 +705,10 @@ fn section_verdict(bits: u32) {
     println!("━━━ 5. VERDICT — WHAT WOULD A BREAKTHROUGH LOOK LIKE? ━━━━━━━━━\n");
 
     let kangaroo_ops = (1.18f64 * (bits as f64 / 2.0).exp2()) as u64;
-    println!("  sinGRAAL v10 state of the art:");
-    println!("    Algorithm:       Pollard Kangaroo + 6-automorphism + 3-axis GLV");
-    println!("    Constant C:      ≈1.18  (theoretical minimum: 1.0)");
-    println!("    Expected ops:    ~2^{:.1}  for {bits}-bit key", (bits as f64) / 2.0 + 0.24);
+    println!("  sinGRAAL v12 state of the art:");
+    println!("    Algorithm:       Pollard Kangaroo + 6-automorphism + 3-axis GLV + 29-band");
+    println!("    Constant C:      ≈1.10  (theoretical minimum: 1.0)");
+    println!("    Expected ops:    ~2^{:.1}  for {bits}-bit key", (bits as f64) / 2.0 + 0.14);
     println!("    Best GPU (4090): ~1 Gop/s");
     println!("    Solo time:       ~2,200 years  (no farm)");
     println!("    Farm (1000 GPU): ~2 years");

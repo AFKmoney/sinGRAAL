@@ -1,0 +1,144 @@
+# sinGRAAL v12 — Distributed Pool: Coordinator + Workers
+#
+# Usage:
+#   1. Set environment variables in a .env file or export them:
+#        TARGET_X=<64 hex chars>
+#        TARGET_Y=<64 hex chars>
+#        CUDA_ARCH=sm_89    # sm_80=A100, sm_89=RTX4090, sm_90=H100
+#
+#   2. Build images:
+#        docker compose build
+#
+#   3. Start the pool:
+#        docker compose up coordinator worker-0 worker-1 worker-2 worker-3
+#
+#   4. Scale workers horizontally (same machine):
+#        docker compose up --scale worker=8
+#
+# For multi-machine pools:
+#   - Run coordinator on a stable host (exposes :5135)
+#   - Run workers on GPU rental machines pointing to coordinator's IP
+#   - Workers only need: TARGET_X, TARGET_Y, COORDINATOR=<coordinator_ip>:5135
+
+version: "3.9"
+
+x-worker-base: &worker-base
+  build:
+    context: ../kangaroo
+    dockerfile: Dockerfile
+    args:
+      CUDA_ARCH: ${CUDA_ARCH:-sm_80}
+  image: singraal:v12-${CUDA_ARCH:-sm80}
+  environment:
+    TARGET_X: ${TARGET_X:?set TARGET_X}
+    TARGET_Y: ${TARGET_Y:?set TARGET_Y}
+    RANGE_BITS: ${RANGE_BITS:-135}
+    NUM_ANIMALS: ${NUM_ANIMALS:-262144}
+    COORDINATOR: coordinator:5135
+  volumes:
+    - checkpoints:/data
+  restart: unless-stopped
+  depends_on:
+    coordinator:
+      condition: service_healthy
+
+services:
+  # ── Coordinator — manages the global DP table ──────────────────────────────
+  coordinator:
+    build:
+      context: ../kangaroo
+      dockerfile: Dockerfile
+      args:
+        CUDA_ARCH: ${CUDA_ARCH:-sm_80}
+    image: singraal:v12-${CUDA_ARCH:-sm80}
+    environment:
+      TARGET_X: ${TARGET_X:?set TARGET_X}
+      TARGET_Y: ${TARGET_Y:?set TARGET_Y}
+      RANGE_BITS: ${RANGE_BITS:-135}
+      SERVE: "1"
+      BIND: "0.0.0.0:5135"
+      CHECKPOINT: /data/coordinator.ckpt
+    ports:
+      - "5135:5135"
+    volumes:
+      - checkpoints:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "echo > /dev/tcp/localhost/5135"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # ── Workers — GPU compute nodes (one per GPU) ──────────────────────────────
+  worker-0:
+    <<: *worker-base
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    environment:
+      TARGET_X: ${TARGET_X:?set TARGET_X}
+      TARGET_Y: ${TARGET_Y:?set TARGET_Y}
+      RANGE_BITS: ${RANGE_BITS:-135}
+      NUM_ANIMALS: ${NUM_ANIMALS:-262144}
+      COORDINATOR: coordinator:5135
+      DEVICE: "0"
+
+  worker-1:
+    <<: *worker-base
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    environment:
+      TARGET_X: ${TARGET_X:?set TARGET_X}
+      TARGET_Y: ${TARGET_Y:?set TARGET_Y}
+      RANGE_BITS: ${RANGE_BITS:-135}
+      NUM_ANIMALS: ${NUM_ANIMALS:-262144}
+      COORDINATOR: coordinator:5135
+      DEVICE: "1"
+
+  worker-2:
+    <<: *worker-base
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["2"]
+              capabilities: [gpu]
+    environment:
+      TARGET_X: ${TARGET_X:?set TARGET_X}
+      TARGET_Y: ${TARGET_Y:?set TARGET_Y}
+      RANGE_BITS: ${RANGE_BITS:-135}
+      NUM_ANIMALS: ${NUM_ANIMALS:-262144}
+      COORDINATOR: coordinator:5135
+      DEVICE: "2"
+
+  worker-3:
+    <<: *worker-base
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["3"]
+              capabilities: [gpu]
+    environment:
+      TARGET_X: ${TARGET_X:?set TARGET_X}
+      TARGET_Y: ${TARGET_Y:?set TARGET_Y}
+      RANGE_BITS: ${RANGE_BITS:-135}
+      NUM_ANIMALS: ${NUM_ANIMALS:-262144}
+      COORDINATOR: coordinator:5135
+      DEVICE: "3"
+
+volumes:
+  checkpoints:
+    driver: local
