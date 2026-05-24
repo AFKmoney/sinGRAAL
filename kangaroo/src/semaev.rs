@@ -1777,6 +1777,290 @@ fn section_macaulay_dreg() {
     println!("  └────────────────────────────────────────────────────────────────────┘\n");
 }
 
+// Result of a single d_reg measurement for a given factor-base size.
+struct DregMeasure {
+    n_orbits: usize,
+    base_size: usize,
+    d_fb: usize,
+    d_g: usize,
+    dreg_gen2: Option<usize>,   // generic 2-var measured d_reg
+    dreg_cm2:  Option<usize>,   // CM 2-var measured d_reg
+    dreg_4v:   Option<usize>,   // CM 4-var split measured d_reg
+    sol_gen2:  i64,             // D = stabilized H (# solutions) for 2-var
+    sol_4v:    i64,             // D for 4-var
+}
+
+// Cumulative-rank d_reg sweep for the 2-var system {f(x1), f(x2), S3}.
+// Returns (measured d_reg, stabilized Hilbert residual D).
+fn sweep_dreg_2var(
+    f_poly: &[u64], s3_2v: &[Vec<u64>], s3_deg: usize, d_max: usize, p: u64,
+) -> (Option<usize>, i64) {
+    let n_cols = (d_max + 1) * (d_max + 2) / 2;
+    let mut mono_idx: HashMap<(usize, usize), usize> = HashMap::new();
+    {
+        let mut col = 0usize;
+        for d in 0..=d_max {
+            for a in 0..=d { mono_idx.insert((a, d - a), col); col += 1; }
+        }
+    }
+    let deg_f = poly_degree(f_poly);
+    // f(x1): coeffs along x1 axis;  f(x2): along x2 axis
+    let mut fx1 = vec![vec![0u64; 1]; deg_f + 1];
+    for (a, &c) in f_poly.iter().enumerate() { if a <= deg_f { fx1[a][0] = c % p; } }
+    let mut fx2 = vec![vec![0u64; deg_f + 1]; 1];
+    for (b, &c) in f_poly.iter().enumerate() { if b <= deg_f { fx2[0][b] = c % p; } }
+    let gens: Vec<(Vec<Vec<u64>>, usize)> =
+        vec![(fx1, deg_f), (fx2, deg_f), (s3_2v.to_vec(), s3_deg)];
+
+    let build_row = |gc: &Vec<Vec<u64>>, am: usize, bm: usize| -> Vec<u64> {
+        let mut row = vec![0u64; n_cols];
+        for (ga, cb) in gc.iter().enumerate() {
+            for (gb, &c) in cb.iter().enumerate() {
+                if c == 0 { continue; }
+                if let Some(&idx) = mono_idx.get(&(ga + am, gb + bm)) {
+                    row[idx] = (row[idx] + c) % p;
+                }
+            }
+        }
+        row
+    };
+
+    let mut pivots: Vec<(usize, Vec<u64>)> = Vec::new();
+    let mut h_prev = 1i64;
+    let mut dreg: Option<usize> = None;
+    let mut last_h = 1i64;
+    for d in 1..=d_max {
+        for (gc, gd) in &gens {
+            if *gd > d { continue; }
+            let md = d - gd;
+            for am in 0..=md {
+                let row = build_row(gc, am, md - am);
+                if row.iter().any(|&v| v != 0) { rref_add(&mut pivots, row, p); }
+            }
+        }
+        let cols_d = (d + 1) * (d + 2) / 2;
+        let rank = pivots.iter().filter(|(pc, _)| *pc < cols_d).count();
+        let h = cols_d as i64 - rank as i64;
+        if dreg.is_none() && rank > 0 && h - h_prev == 0 { dreg = Some(d); }
+        h_prev = h;
+        last_h = h;
+        if dreg.is_some() { break; }
+    }
+    (dreg, last_h)
+}
+
+// Cumulative-rank d_reg sweep for the 4-var CM-split system
+// {g(t1), x1^3-t1, g(t2), x2^3-t2, S3}.  Returns (d_reg, D).
+fn sweep_dreg_4var(
+    g_t: &[u64], d_g: usize, s3_2v: &[Vec<u64>], s3_deg: usize,
+    d_max: usize, p: u64,
+) -> (Option<usize>, i64) {
+    let n_cols = binom(d_max + 4, 4);
+    let mut mono_idx: HashMap<(usize, usize, usize, usize), usize> = HashMap::new();
+    {
+        let mut col = 0usize;
+        for dt in 0..=d_max {
+            for a in 0..=dt {
+                for b in 0..=(dt - a) {
+                    for c in 0..=(dt - a - b) {
+                        mono_idx.insert((a, b, c, dt - a - b - c), col); col += 1;
+                    }
+                }
+            }
+        }
+    }
+    let mut gt1: Poly4Map = HashMap::new();
+    for (c, &v) in g_t.iter().enumerate() { if v != 0 { gt1.insert((0, 0, c as u8, 0), v); } }
+    let mut gt2: Poly4Map = HashMap::new();
+    for (c, &v) in g_t.iter().enumerate() { if v != 0 { gt2.insert((0, 0, 0, c as u8), v); } }
+    let mut x1t1: Poly4Map = HashMap::new();
+    x1t1.insert((3, 0, 0, 0), 1u64); x1t1.insert((0, 0, 1, 0), p - 1);
+    let mut x2t2: Poly4Map = HashMap::new();
+    x2t2.insert((0, 3, 0, 0), 1u64); x2t2.insert((0, 0, 0, 1), p - 1);
+    let mut s3v: Poly4Map = HashMap::new();
+    for (a, row) in s3_2v.iter().enumerate() {
+        for (b, &c) in row.iter().enumerate() {
+            if c != 0 { s3v.insert((a as u8, b as u8, 0, 0), c); }
+        }
+    }
+    let gens: Vec<(Poly4Map, usize)> =
+        vec![(gt1, d_g), (x1t1, 3), (gt2, d_g), (x2t2, 3), (s3v, s3_deg)];
+
+    let mut pivots: Vec<(usize, Vec<u64>)> = Vec::new();
+    let mut h_prev = 1i64;
+    let mut dreg: Option<usize> = None;
+    let mut last_h = 1i64;
+    for d in 1..=d_max {
+        for (gp, gd) in &gens {
+            if *gd > d { continue; }
+            let md = d - gd;
+            for ma in 0..=md {
+                for mb in 0..=(md - ma) {
+                    for mc in 0..=(md - ma - mb) {
+                        let mdd = md - ma - mb - mc;
+                        let mut row = vec![0u64; n_cols];
+                        let mut any = false;
+                        for (&(ga, gb, gc, ge), &c) in gp {
+                            if c == 0 { continue; }
+                            let key = (ga as usize + ma, gb as usize + mb,
+                                       gc as usize + mc, ge as usize + mdd);
+                            if let Some(&idx) = mono_idx.get(&key) {
+                                row[idx] = (row[idx] + c) % p; any = true;
+                            }
+                        }
+                        if any { rref_add(&mut pivots, row, p); }
+                    }
+                }
+            }
+        }
+        let cols_d = binom(d + 4, 4);
+        let rank = pivots.iter().filter(|(pc, _)| *pc < cols_d).count();
+        let h = cols_d as i64 - rank as i64;
+        if dreg.is_none() && rank > 0 && h - h_prev == 0 { dreg = Some(d); }
+        h_prev = h;
+        last_h = h;
+        if dreg.is_some() { break; }
+    }
+    (dreg, last_h)
+}
+
+// Measure d_reg for a factor base of n_orbits CM orbits (|B| = 3·n_orbits).
+fn measure_dreg(
+    n_orbits: usize, beta: u64, beta2: u64,
+    cm_pts: &[ToyPt], nc_pts: &[ToyPt], p: u64,
+) -> Option<DregMeasure> {
+    let want = 3 * n_orbits;
+    let x_set: HashSet<u64> = cm_pts.iter().map(|pt| pt.x).collect();
+    let mut cm_base: Vec<u64> = Vec::new();
+    let mut seen: HashSet<u64> = HashSet::new();
+    for pt in cm_pts {
+        if cm_base.len() >= want { break; }
+        if seen.contains(&pt.x) { continue; }
+        let (x, bx, b2x) = (pt.x, toy_mul(beta, pt.x), toy_mul(beta2, pt.x));
+        if x == bx || bx == b2x || x == b2x { continue; }
+        if x_set.contains(&bx) && x_set.contains(&b2x) {
+            cm_base.extend_from_slice(&[x, bx, b2x]);
+            seen.insert(x); seen.insert(bx); seen.insert(b2x);
+        }
+    }
+    if cm_base.len() < want { return None; }
+
+    let gen_base: Vec<u64> = {
+        let mut v: Vec<u64> = nc_pts.iter().map(|pt| pt.x)
+            .collect::<HashSet<_>>().into_iter().take(want).collect();
+        v.sort_unstable();
+        v
+    };
+    if gen_base.len() < want { return None; }
+
+    let x_r = cm_pts.iter().find(|pt| !cm_base.contains(&pt.x)).map(|pt| pt.x).unwrap_or(2);
+
+    let f_cm  = product_poly(&cm_base);
+    let f_gen = product_poly(&gen_base);
+    let d_fb  = poly_degree(&f_cm);
+    let orbit_cubes: Vec<u64> = (0..n_orbits).map(|i| toy_cube(cm_base[i * 3])).collect();
+    let g_t = product_poly(&orbit_cubes);
+    let d_g = poly_degree(&g_t);
+
+    let s3_2v = s3_as_poly2(x_r, p);
+    let s3_deg = s3_2v.iter().enumerate()
+        .flat_map(|(a, row)| row.iter().enumerate()
+            .filter(|(_, &c)| c != 0).map(move |(b, _)| a + b))
+        .max().unwrap_or(0);
+
+    // 2-var sweeps: generic and CM (same f-degree → expect same d_reg)
+    let d_max_2v = 2 * d_fb + 4;
+    let (dreg_gen2, sol_gen2) = sweep_dreg_2var(&f_gen, &s3_2v, s3_deg, d_max_2v, p);
+    let (dreg_cm2,  _sol_cm2) = sweep_dreg_2var(&f_cm,  &s3_2v, s3_deg, d_max_2v, p);
+
+    // 4-var sweep: cap column space to keep runtime bounded
+    let d_max_4v = (2 * d_g + 6).min(14);
+    let (dreg_4v, sol_4v) = sweep_dreg_4var(&g_t, d_g, &s3_2v, s3_deg, d_max_4v, p);
+
+    Some(DregMeasure {
+        n_orbits, base_size: want, d_fb, d_g,
+        dreg_gen2, dreg_cm2, dreg_4v, sol_gen2, sol_4v,
+    })
+}
+
+fn section_dreg_slope() {
+    println!("━━━ 4c. d_reg SLOPE vs |B| — CM 4-VAR COMPRESSION SCALING ━━━━━━\n");
+    println!("  For each factor-base size |B|=3k (k CM orbits), measure d_reg of");
+    println!("  the generic 2-var vs CM 4-var split system. Question: does the");
+    println!("  ratio d_reg(2-var)/d_reg(4-var) curve upward toward 3 as |B| grows?\n");
+
+    let p = TOY_P;
+    let beta = match toy_find_beta() { Some(b) => b, None => { println!("  No β.\n"); return; } };
+    let beta2 = toy_mul(beta, beta);
+    let cm_pts = toy_all_points(TOY_B);
+    let nc_pts = toy_all_points_gen(TOY_A_NC, TOY_B_NC);
+
+    println!("  ┌── measured d_reg ─────────────────────────────────────────────────────┐");
+    println!("  │ {:>2} {:>4} {:>5} {:>4} │ {:>5} {:>5} {:>5} │ {:>5} {:>5} │ {:>7} │",
+             "k", "|B|", "degf", "degg", "gen2", "cm2", "4var", "D_2v", "D_4v", "ratio");
+    println!("  ├{:─<73}┤", "");
+
+    let mut rows: Vec<(usize, f64, usize, usize)> = Vec::new(); // (|B|, ratio, gen2, 4v)
+    for k in 2..=5usize {
+        let t0 = Instant::now();
+        let Some(m) = measure_dreg(k, beta, beta2, &cm_pts, &nc_pts, p) else {
+            println!("  │ {:>2}  insufficient CM orbits available                                  │", k);
+            continue;
+        };
+        let fmt = |o: Option<usize>| o.map_or("  >cap".to_string(), |d| format!("{d:>5}"));
+        let ratio = match (m.dreg_gen2, m.dreg_4v) {
+            (Some(g), Some(c)) if c > 0 => Some(g as f64 / c as f64),
+            _ => None,
+        };
+        let rstr = ratio.map_or("   —  ".to_string(), |r| format!("{r:>6.3}"));
+        println!("  │ {:>2} {:>4} {:>5} {:>4} │ {} {} {} │ {:>5} {:>5} │ {} │  ({}ms)",
+                 m.n_orbits, m.base_size, m.d_fb, m.d_g,
+                 fmt(m.dreg_gen2), fmt(m.dreg_cm2), fmt(m.dreg_4v),
+                 m.sol_gen2, m.sol_4v, rstr, t0.elapsed().as_millis());
+        if let (Some(r), Some(g), Some(c)) = (ratio, m.dreg_gen2, m.dreg_4v) {
+            rows.push((m.base_size, r, g, c));
+        }
+    }
+    println!("  └{:─<73}┘", "");
+    println!();
+
+    // Slope analysis: is the ratio increasing with |B|?
+    if rows.len() >= 2 {
+        let first = rows.first().unwrap();
+        let last  = rows.last().unwrap();
+        let trend = last.1 - first.1;
+        println!("  Ratio at |B|={}: {:.3}   →   at |B|={}: {:.3}   (Δ = {:+.3})",
+                 first.0, first.1, last.0, last.1, trend);
+        // Linear fit of gen2 and 4v vs |B| to expose the two slopes
+        let n = rows.len() as f64;
+        let sx: f64 = rows.iter().map(|r| r.0 as f64).sum();
+        let lin_slope = |ys: &[f64]| -> f64 {
+            let sy: f64 = ys.iter().sum();
+            let sxy: f64 = rows.iter().zip(ys).map(|(r, y)| r.0 as f64 * y).sum();
+            let sxx: f64 = rows.iter().map(|r| (r.0 as f64).powi(2)).sum();
+            (n * sxy - sx * sy) / (n * sxx - sx * sx)
+        };
+        let ys_g: Vec<f64> = rows.iter().map(|r| r.2 as f64).collect();
+        let ys_c: Vec<f64> = rows.iter().map(|r| r.3 as f64).collect();
+        let slope_g = lin_slope(&ys_g);
+        let slope_c = lin_slope(&ys_c);
+        println!("  Linear slope d_reg/Δ|B|:  generic 2-var = {:.3},  CM 4-var = {:.3}",
+                 slope_g, slope_c);
+        println!("  Slope ratio (2var/4var) = {:.3}  (theory asymptote → 3.0)\n",
+                 if slope_c.abs() > 1e-9 { slope_g / slope_c } else { 0.0 });
+        if trend > 0.05 {
+            println!("  → Ratio INCREASES with |B|: empirical evidence the compression");
+            println!("    curves toward the 3× asymptote. Worth pushing to larger |B|.");
+        } else if trend.abs() <= 0.05 {
+            println!("  → Ratio roughly FLAT in this range: both d_reg grow linearly in |B|");
+            println!("    with a fixed offset; constant-factor gain, no sub-linear effect.");
+        } else {
+            println!("  → Ratio decreases here (small-|B| regime); need larger |B| to judge.");
+        }
+    }
+    println!();
+}
+
 fn section_orbit_speedup_m4() {
     println!("━━━ 8. CM ORBIT SPEEDUP — m=4 MEET-IN-MIDDLE (MITM) ━━━━━━━━━━━━\n");
     println!("  MITM split for S_4(x1,x2,x3,x4)=0: find (x1,x2) s.t. P1+P2=Q,");
@@ -2782,6 +3066,7 @@ pub fn run_semaev_research(_bits: u32) {
     section_complexity();
     section_groebner_degree();
     section_macaulay_dreg();
+    section_dreg_slope();
     section_higher_m();
     section_sm_invariance_all_m();
     section_t_substitution();
