@@ -43,6 +43,11 @@ __device__ volatile u64 g_dp_easy_threshold;  // set at launch; 16× easier than
 // Layout: g_G_table[i] = {x[0],x[1],x[2],x[3], y[0],y[1],y[2],y[3]}
 __constant__ u64 g_G_table[256][8];
 
+// 2D GLV lattice components per jump: dk1[ji], dk2[ji]
+// jump_pt = dk1·G + dk2·φG;  scalar = dk1 + λ·dk2 (precomputed in g_jumps[ji].s)
+__constant__ u64 g_dk1[256][4];
+__constant__ u64 g_dk2[256][4];
+
 // ─── GPU-side animal initialization (Jacobian arithmetic) ─────────────────────
 //
 // Computes k·G for tame animals and (target + offset·G) for wild animals,
@@ -189,10 +194,11 @@ void kangaroo_walk_persistent_toom6(
             }
         }
 
-        // Bidirectional + multi-coord hash: mix all 4 limbs of canonical_x to break warp correlations.
-        u64 mix = cx[0] ^ (cx[1] * 6364136223846793005ULL)
-                        ^ (cx[2] * 1442695040888963407ULL)
-                        ^  cx[3];
+        // 2D GLV lattice walk: jump selection from lattice coordinates (k₁, k₂).
+        // Tame uses positive half [0, HALF_JUMPS); wild uses negative mirrors [HALF_JUMPS, NUM_JUMPS).
+        u64 mix = a.k1[0] ^ (a.k1[1] * 6364136223846793005ULL)
+                           ^ (a.k2[0] * 1442695040888963407ULL)
+                           ^  a.k2[1];
         u32 ji  = (u32)(mix & (HALF_JUMPS - 1u)) | (a.is_wild ? HALF_JUMPS : 0u);
         const JumpPoint jp = sh_jumps[ji];
 
@@ -203,6 +209,12 @@ void kangaroo_walk_persistent_toom6(
         u64 ns[4];
         sc_add(a.scalar, jp.s, ns);
         for (int i = 0; i < 4; i++) a.scalar[i] = ns[i];
+
+        // Update 2D lattice position: k₁ += dk1[ji], k₂ += dk2[ji]
+        u64 nk1[4], nk2[4];
+        sc_add(a.k1, g_dk1[ji], nk1);
+        sc_add(a.k2, g_dk2[ji], nk2);
+        for (int i = 0; i < 4; i++) { a.k1[i] = nk1[i]; a.k2[i] = nk2[i]; }
 
         local_steps++;
         if (threadIdx.x == 0 && (local_steps & 0xFFFFu) == 0u)
@@ -457,6 +469,15 @@ void kangaroo_update_dp_threshold(KangarooCtx* ctx, u32 dp_bits) {
 int kangaroo_upload_G_table(const u64 table[256][8]) {
     return cudaMemcpyToSymbol(g_G_table, table, 256 * 8 * sizeof(u64))
            == cudaSuccess ? 0 : -1;
+}
+
+// Upload 2D GLV lattice components (dk1, dk2) per jump to constant memory.
+// dk1_flat and dk2_flat are each NUM_JUMPS×4 u64 arrays (flat row-major).
+// Must be called after kangaroo_set_jumps(), before kangaroo_launch_persistent().
+int kangaroo_upload_dk_tables(const u64* dk1_flat, const u64* dk2_flat) {
+    if (cudaMemcpyToSymbol(g_dk1, dk1_flat, NUM_JUMPS * 4 * sizeof(u64)) != cudaSuccess) return -1;
+    if (cudaMemcpyToSymbol(g_dk2, dk2_flat, NUM_JUMPS * 4 * sizeof(u64)) != cudaSuccess) return -1;
+    return 0;
 }
 
 // Initialize animal positions on GPU using Jacobian arithmetic.
