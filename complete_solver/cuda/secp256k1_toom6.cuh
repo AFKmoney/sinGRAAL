@@ -752,7 +752,8 @@ struct JumpPoint { u64 x[4]; u64 y[4]; u64 s[4]; };
 
 struct Animal {
     u64 ax[4]; u64 ay[4]; u64 scalar[4];
-    u64 k1[4]; u64 k2[4];   // 2D GLV lattice coordinates: k = k1 + λ·k2 (mod n)
+    u64 k1[4]; u64 k2[4];   // 2D GLV primary lattice (G, φG directions)
+    u64 k3[4]; u64 k4[4];   // 4D extension (G+φG, G-φG directions)
     u32 is_wild; u32 pad[3];
 };
 

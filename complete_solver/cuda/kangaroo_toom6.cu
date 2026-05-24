@@ -38,15 +38,19 @@ __device__ volatile u32 g_terminate_flag;
 __device__ unsigned long long g_step_count;
 __device__ volatile u64 g_dp_easy_threshold;  // set at launch; 16× easier than hard
 
-// ─── Precomputed G table: {2^i · G | i=0..255} in affine ────────────────────
-// Uploaded once by kangaroo_upload_G_table() before any init kernel launch.
-// Layout: g_G_table[i] = {x[0],x[1],x[2],x[3], y[0],y[1],y[2],y[3]}
-__constant__ u64 g_G_table[256][8];
+// G table in regular device memory (passed as parameter to gpu_init_animals_kernel).
+// Not in constant memory — frees 16KB for 4D dk tables.
+static u64* s_G_table_dev = nullptr;
 
-// 2D GLV lattice components per jump: dk1[ji], dk2[ji]
-// jump_pt = dk1·G + dk2·φG;  scalar = dk1 + λ·dk2 (precomputed in g_jumps[ji].s)
+// 4D GLV lattice components per jump (constant memory, 4×8KB = 32KB):
+//   dk1: Δk₁·G                (direction 1)
+//   dk2: Δk₂·φG               (direction 2)
+//   dk3: Δk₃·(G+φG)           (direction 3, diagonal [1+λ])
+//   dk4: Δk₄·(G-φG)           (direction 4, diagonal [1-λ])
 __constant__ u64 g_dk1[256][4];
 __constant__ u64 g_dk2[256][4];
+__constant__ u64 g_dk3[256][4];
+__constant__ u64 g_dk4[256][4];
 
 // ─── GPU-side animal initialization (Jacobian arithmetic) ─────────────────────
 //
@@ -60,9 +64,10 @@ __constant__ u64 g_dk2[256][4];
 //   → ~27× fewer field operations per animal init.
 __global__ __launch_bounds__(BLOCK_SIZE, 4)
 void gpu_init_animals_kernel(
-    const u64* __restrict__ scalars,   // num_animals × 4 u64 (little-endian)
+    const u64* __restrict__ scalars,
     const u32* __restrict__ is_wild_flags,
-    const u64* __restrict__ target_xy, // [x0,x1,x2,x3, y0,y1,y2,y3]
+    const u64* __restrict__ target_xy,
+    const u64* __restrict__ g_table,   // {2^i·G} table, row i = {x[4],y[4]}
     Animal* __restrict__ animals,
     u32 num_animals
 ) {
@@ -80,8 +85,8 @@ void gpu_init_animals_kernel(
     for (int i = 0; i < 256; i++) {
         int limb = i >> 6, bit = i & 63;
         if ((k[limb] >> bit) & 1ULL) {
-            const u64* Gix = g_G_table[i];
-            const u64* Giy = g_G_table[i] + 4;
+            const u64* Gix = g_table + (u64)i * 8;
+            const u64* Giy = g_table + (u64)i * 8 + 4;
             u64 Xn[4], Yn[4], Zn[4];
             jac_add_affine(X, Y, Z, Gix, Giy, Xn, Yn, Zn);
             for (int j=0;j<4;j++) { X[j]=Xn[j]; Y[j]=Yn[j]; Z[j]=Zn[j]; }
@@ -194,11 +199,13 @@ void kangaroo_walk_persistent_toom6(
             }
         }
 
-        // 2D GLV lattice walk: jump selection from lattice coordinates (k₁, k₂).
-        // Tame uses positive half [0, HALF_JUMPS); wild uses negative mirrors [HALF_JUMPS, NUM_JUMPS).
+        // 4D GLV lattice walk: jump selection from all 4 lattice coordinates.
         u64 mix = a.k1[0] ^ (a.k1[1] * 6364136223846793005ULL)
                            ^ (a.k2[0] * 1442695040888963407ULL)
-                           ^  a.k2[1];
+                           ^  a.k2[1]
+                           ^ (a.k3[0] * 2654435761ULL)
+                           ^ (a.k4[0] * 3141592653589793ULL)
+                           ^  a.k3[1] ^ a.k4[1];
         u32 ji  = (u32)(mix & (HALF_JUMPS - 1u)) | (a.is_wild ? HALF_JUMPS : 0u);
         const JumpPoint jp = sh_jumps[ji];
 
@@ -210,11 +217,16 @@ void kangaroo_walk_persistent_toom6(
         sc_add(a.scalar, jp.s, ns);
         for (int i = 0; i < 4; i++) a.scalar[i] = ns[i];
 
-        // Update 2D lattice position: k₁ += dk1[ji], k₂ += dk2[ji]
-        u64 nk1[4], nk2[4];
+        // Update 4D lattice position: k₁..k₄ += dk1..dk4[ji]
+        u64 nk1[4], nk2[4], nk3[4], nk4[4];
         sc_add(a.k1, g_dk1[ji], nk1);
         sc_add(a.k2, g_dk2[ji], nk2);
-        for (int i = 0; i < 4; i++) { a.k1[i] = nk1[i]; a.k2[i] = nk2[i]; }
+        sc_add(a.k3, g_dk3[ji], nk3);
+        sc_add(a.k4, g_dk4[ji], nk4);
+        for (int i = 0; i < 4; i++) {
+            a.k1[i] = nk1[i]; a.k2[i] = nk2[i];
+            a.k3[i] = nk3[i]; a.k4[i] = nk4[i];
+        }
 
         local_steps++;
         if (threadIdx.x == 0 && (local_steps & 0xFFFFu) == 0u)
@@ -389,6 +401,7 @@ void kangaroo_free(KangarooCtx* ctx) {
     cudaFree(ctx->d_dp_count);
     cudaFree(ctx->d_dp_easy_buf);
     cudaFree(ctx->d_dp_easy_count);
+    if (s_G_table_dev) { cudaFree(s_G_table_dev); s_G_table_dev = nullptr; }
     delete ctx;
 }
 
@@ -464,19 +477,23 @@ void kangaroo_update_dp_threshold(KangarooCtx* ctx, u32 dp_bits) {
     cudaMemcpyToSymbol(g_dp_easy_threshold, &ctx->dp_easy_threshold, sizeof(u64));
 }
 
-// Upload precomputed {2^i · G | i=0..255} table to GPU constant memory.
-// Must be called once before kangaroo_gpu_init().
-int kangaroo_upload_G_table(const u64 table[256][8]) {
-    return cudaMemcpyToSymbol(g_G_table, table, 256 * 8 * sizeof(u64))
+// Upload precomputed {2^i · G | i=0..255} table to device memory.
+// Stores in s_G_table_dev for use by kangaroo_gpu_init().
+int kangaroo_upload_G_table(const u64* table) {
+    if (s_G_table_dev) { cudaFree(s_G_table_dev); s_G_table_dev = nullptr; }
+    if (cudaMalloc(&s_G_table_dev, 256 * 8 * sizeof(u64)) != cudaSuccess) return -1;
+    return cudaMemcpy(s_G_table_dev, table, 256 * 8 * sizeof(u64), cudaMemcpyHostToDevice)
            == cudaSuccess ? 0 : -1;
 }
 
-// Upload 2D GLV lattice components (dk1, dk2) per jump to constant memory.
-// dk1_flat and dk2_flat are each NUM_JUMPS×4 u64 arrays (flat row-major).
-// Must be called after kangaroo_set_jumps(), before kangaroo_launch_persistent().
-int kangaroo_upload_dk_tables(const u64* dk1_flat, const u64* dk2_flat) {
+// Upload 4D GLV lattice components (dk1..dk4) per jump to constant memory.
+// Each flat array is NUM_JUMPS×4 u64 in row-major order.
+int kangaroo_upload_dk_tables(const u64* dk1_flat, const u64* dk2_flat,
+                               const u64* dk3_flat, const u64* dk4_flat) {
     if (cudaMemcpyToSymbol(g_dk1, dk1_flat, NUM_JUMPS * 4 * sizeof(u64)) != cudaSuccess) return -1;
     if (cudaMemcpyToSymbol(g_dk2, dk2_flat, NUM_JUMPS * 4 * sizeof(u64)) != cudaSuccess) return -1;
+    if (cudaMemcpyToSymbol(g_dk3, dk3_flat, NUM_JUMPS * 4 * sizeof(u64)) != cudaSuccess) return -1;
+    if (cudaMemcpyToSymbol(g_dk4, dk4_flat, NUM_JUMPS * 4 * sizeof(u64)) != cudaSuccess) return -1;
     return 0;
 }
 
@@ -504,7 +521,7 @@ int kangaroo_gpu_init(
     cudaMemcpy(d_target,  target_xy,    8*sizeof(u64), cudaMemcpyHostToDevice);
 
     gpu_init_animals_kernel<<<ctx->grid, BLOCK_SIZE>>>(
-        d_scalars, d_is_wild, d_target, ctx->d_animals, ctx->num_animals);
+        d_scalars, d_is_wild, d_target, s_G_table_dev, ctx->d_animals, ctx->num_animals);
     cudaDeviceSynchronize();
 
     cudaFree(d_scalars); cudaFree(d_is_wild); cudaFree(d_target);
