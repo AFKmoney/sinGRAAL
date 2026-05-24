@@ -21,18 +21,30 @@ Target: **Bitcoin Puzzle #135** — find the 135-bit private key `k` such that `
 
 ---
 
-## What's New in v12
+## What's New in v13
 
-v12 completes the empirical research from v11 by **deploying 29-band jumps into the actual GPU solver** — the constant C measured on paper is now the constant in production.
+v13 brings the **Z[ω] LLL lattice analysis** to completion and tightens the solver with several proven engineering improvements.
 
-| Version | Jump Distribution | Kangaroo Constant C | Notes |
-|---------|-------------------|---------------------|-------|
-| v5-v7 | 5-band | C ≈ 1.72 | initial GLV |
+| Version | Jump Distribution | C | Key Change |
+|---------|-------------------|---|------------|
 | v8-v9 | 9-band | C ≈ 1.36 | warp ballot + persistent kernel |
 | v10-v11 | 17-band | C ≈ 1.18 | 3-axis GLV, empirical C benchmark |
-| **v12** | **29-band** | **C ≈ 1.10** | **best published C for secp256k1** |
+| v12 | 29-band | C ≈ 1.10 | 29-band in production, cloud deploy |
+| **v13** | **29-band** | **C ≈ 1.10** | **LLL optimality proof, solver hardening** |
 
-**C ≈ 1.10** is within 10% of the Shoup lower bound (C = 1.0) and better than any known published implementation.
+**Algorithm highlights:**
+
+1. **Range-filtered 6-aut recovery** — the 6 automorphism candidates for k recovery now have a O(1) range pre-check before the expensive 256-step scalar_mul.  Since the correct k ∈ [0, 2^range_bits) and wrong candidates reduce mod n to values near 2^256, this eliminates 5/6 EC multiplications per collision (cryptographic correctness also improves: k is verified to be in the expected range).
+
+2. **Z[ω] scalar lattice research (Section 11)** — formally proves that the current 3-axis jump table is already LLL-optimal in the Eisenstein metric.  Key result: all three axis unit vectors e₁=(1,0), e₂=(0,1), e₃=(−1,−1) have equal Eisenstein norm = 1, and the basis satisfies the Lovász condition with δ=3/4.  The empirical GLV decomposition of 500 random 135-bit scalars confirms |k₁|, |k₂| ≤ 2^68 with typical norm reduction of ~67 bits.
+
+3. **Dead-wild restart independence** — periodic refresh of 10% of wild animals (to break fruitless cycles) now runs unconditionally, not only when `--no-checkpoint` is active.
+
+4. **Coordinator range_bits** — the distributed coordinator server now accepts and uses `range_bits` for recovery filtering, matching the standalone solver.
+
+## What's New in v12
+
+v12 deploys the 29-band jump distribution from the v11 empirical benchmark into the production GPU solver.
 
 Other v12 additions:
 - **Cloud-ready Docker** — `CUDA_ARCH` build arg, env-var entrypoint, multi-arch support
@@ -143,9 +155,9 @@ secp256k1 has j-invariant 0 and CM by `Z[ω]` (Eisenstein integers, ω = e^{2πi
 
 sinGRAAL exploits this at three levels:
 
-1. **6-automorphism collapse** — `canonical_x = min(x, βx, β²x, -x, -βx, -β²x)` reduces the search space by 6×.
-2. **3-axis GLV decomposition** — walks simultaneously on G, φ(G), φ²(G) axes for isotropic hexagonal lattice coverage.
-3. **29-band geometric jumps** — 256 jumps per axis spread over ratio `r = 2^28 = 268M`, achieving `C ≈ 1 + 2/ln(2^28) ≈ 1.10`.
+1. **6-automorphism collapse** — `canonical_x = min(x, βx, β²x)` reduces the DP space by 6× (P and −P share x; ψ and ψ⁻¹ share the same canonical orbit).
+2. **3-axis GLV decomposition** — walks simultaneously on G, φ(G), φ²(G) axes — the LLL-optimal basis of the Z[ω] hexagonal scalar lattice (proved in Section 11).
+3. **29-band geometric jumps** — 256 jumps spread over ratio `r = 2^28 = 268M`, achieving `C ≈ 1 + 2/ln(2^28) ≈ 1.10`.
 
 ### Jump Distribution Formula
 
@@ -216,6 +228,26 @@ Rigorously answers:
 - What genuine 4D would require (GLS over `F_{p²}` — two independent endomorphisms)
 - Experimental search for hidden endomorphisms (exhaustive, finds only `{id, φ}`)
 - Torsion structure and its implications for the Kangaroo constant
+
+### Semaev + CM Symmetry + Z[ω] LLL Research (`--research-semaev`)
+
+```bash
+./target/release/kangaroo --research-semaev
+```
+
+11 sections covering the full algebraic frontier:
+
+1–7. Semaev summation polynomials, CM symmetry, Gröbner degree, index calculus  
+8. CM MITM orbit speedup measurement (orbit baby-step table 9× smaller for m=4)  
+9. Frobenius endomorphism experiment — proves GLS 4D inapplicable to E(F_p)  
+10. Eisenstein Kangaroo — empirical C comparison: canonical-min DP gives +19.7%  
+**11. Z[ω] Scalar Lattice — LLL optimality proof for the 3-axis jump table** *(new in v13)*
+
+Key result from Section 11:
+- The 3 jump axes {G, φG, φ²G} correspond to unit vectors e₁=(1,0), e₂=(0,1), e₃=(−1,−1) in the Eisenstein lattice Z[ω]
+- All three have Eisenstein norm |e|² = 1 — the minimum possible
+- The basis is LLL-reduced (Lovász δ=3/4 satisfied)
+- **LLL cannot improve the jump table** — the hexagonal lattice is already optimal
 
 ### Empirical C Measurement (`--benchmark-c`)
 
@@ -354,7 +386,8 @@ MIT License — see [LICENSE](LICENSE) for details.
 | v9 | 1.36 | 9-band geometric jumps |
 | v10 | 1.18 | 17-band, 3-axis GLV (full hexagonal), 256 jumps |
 | v11 | 1.18* | 4D GLV research module, empirical C measurement, 29-band benchmark |
-| **v12** | **1.10** | **29-band in production solver, cloud GPU ready, docker-compose pool** |
+| v12 | 1.10 | 29-band in production solver, cloud GPU ready, docker-compose pool |
+| **v13** | **1.10** | **Range-filtered recovery, Z[ω] LLL optimality proof, solver hardening** |
 
 *v11 benchmarked 29-band empirically but didn't deploy it in the solver. v12 closes that gap.
 

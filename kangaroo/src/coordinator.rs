@@ -69,7 +69,7 @@ fn fe_to_wire(f: [u64; 4]) -> [u8; 32] {
 
 /// Run a coordinator server.  Blocks until a solution is found or the process
 /// is killed.  Workers connect, send DPs, and receive FOUND signals.
-pub fn serve(bind: &str, target: Pt) -> Option<[u64; 4]> {
+pub fn serve(bind: &str, target: Pt, range_bits: u32) -> Option<[u64; 4]> {
     let listener = TcpListener::bind(bind)
         .unwrap_or_else(|e| panic!("coordinator: cannot bind {bind}: {e}"));
     eprintln!(
@@ -121,7 +121,7 @@ pub fn serve(bind: &str, target: Pt) -> Option<[u64; 4]> {
 
         thread::spawn(move || {
             wk_cnt.fetch_add(1, Ordering::Relaxed);
-            worker_session(s, table, result, found, dp_cnt, target);
+            worker_session(s, table, result, found, dp_cnt, target, range_bits);
             wk_cnt.fetch_sub(1, Ordering::Relaxed);
         });
     }
@@ -132,12 +132,13 @@ pub fn serve(bind: &str, target: Pt) -> Option<[u64; 4]> {
 }
 
 fn worker_session(
-    stream:   TcpStream,
-    table:    Table,
-    result:   Result,
-    found:    Arc<AtomicBool>,
-    dp_total: Arc<AtomicU64>,
-    target:   Pt,
+    stream:     TcpStream,
+    table:      Table,
+    result:     Result,
+    found:      Arc<AtomicBool>,
+    dp_total:   Arc<AtomicU64>,
+    target:     Pt,
+    range_bits: u32,
 ) {
     let peer = stream.peer_addr()
         .map(|a| a.to_string())
@@ -193,7 +194,7 @@ fn worker_session(
                 let iw  = u32::from_le_bytes(
                     dp_buf[off + 64..off + 68].try_into().unwrap()
                 ) != 0;
-                if let Some(k) = process_dp(cx, sc, iw, &mut tbl, target) {
+                if let Some(k) = process_dp(cx, sc, iw, &mut tbl, target, range_bits) {
                     solved = Some(k);
                     break;
                 }
