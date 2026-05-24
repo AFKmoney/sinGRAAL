@@ -36,6 +36,7 @@
 __constant__ JumpPoint g_jumps[NUM_JUMPS];
 __device__ volatile u32 g_terminate_flag;
 __device__ unsigned long long g_step_count;
+__device__ volatile u64 g_dp_easy_threshold;  // set at launch; 16× easier than hard
 
 // ─── Precomputed G table: {2^i · G | i=0..255} in affine ────────────────────
 // Uploaded once by kangaroo_upload_G_table() before any init kernel launch.
@@ -114,9 +115,12 @@ void kangaroo_walk_persistent_toom6(
     Animal*  __restrict__ animals,
     DPEntry* __restrict__ dp_buf,
     u32*     __restrict__ dp_count,
+    DPEntry* __restrict__ dp_easy_buf,
+    u32*     __restrict__ dp_easy_count,
     u32  num_animals,
     u64  dp_threshold,
-    u32  max_dps
+    u32  max_dps,
+    u32  max_easy_dps
 ) {
     __shared__ JumpPoint sh_jumps[NUM_JUMPS];
     {
@@ -138,18 +142,18 @@ void kangaroo_walk_persistent_toom6(
         u64 cx[4];
         canonical_x_affine(a.ax, cx);
 
-        // Warp-ballot DP coalescing
-        u32 active  = __activemask();
-        bool is_dp  = (cx[3] < dp_threshold);
-        u32 dp_mask = __ballot_sync(active, is_dp);
-        if (dp_mask) {
+        // ── Level-1 (hard) DPs: coordinator-bound ───────────────────────────
+        u32 active    = __activemask();
+        bool is_hard  = (cx[3] < dp_threshold);
+        u32 hard_mask = __ballot_sync(active, is_hard);
+        if (hard_mask) {
             u32 base_slot = 0u;
             int lane = threadIdx.x & 31;
             if (lane == 0)
-                base_slot = atomicAdd(dp_count, (u32)__popc(dp_mask));
+                base_slot = atomicAdd(dp_count, (u32)__popc(hard_mask));
             base_slot = __shfl_sync(active, base_slot, 0);
-            if (is_dp) {
-                u32 my_rank = (u32)__popc(dp_mask & ((1u << lane) - 1u));
+            if (is_hard) {
+                u32 my_rank = (u32)__popc(hard_mask & ((1u << lane) - 1u));
                 u32 slot = (base_slot + my_rank) % max_dps;
                 DPEntry dp;
                 for (int i = 0; i < 4; i++) {
@@ -162,8 +166,34 @@ void kangaroo_walk_persistent_toom6(
             }
         }
 
-        // Bidirectional: tame uses positive half [0, HALF_JUMPS), wild uses negative mirrors [HALF_JUMPS, NUM_JUMPS).
-        u32 ji = (u32)(cx[0] & (HALF_JUMPS - 1u)) | (a.is_wild ? HALF_JUMPS : 0u);
+        // ── Level-2 (easy) DPs: local per-GPU ────────────────────────────────
+        bool is_easy_only = (!is_hard) && (cx[3] < g_dp_easy_threshold);
+        u32 easy_mask = __ballot_sync(active, is_easy_only);
+        if (easy_mask) {
+            u32 base_slot = 0u;
+            int lane = threadIdx.x & 31;
+            if (lane == 0)
+                base_slot = atomicAdd(dp_easy_count, (u32)__popc(easy_mask));
+            base_slot = __shfl_sync(active, base_slot, 0);
+            if (is_easy_only) {
+                u32 my_rank = (u32)__popc(easy_mask & ((1u << lane) - 1u));
+                u32 slot = (base_slot + my_rank) % max_easy_dps;
+                DPEntry dp;
+                for (int i = 0; i < 4; i++) {
+                    dp.canon_x[i] = cx[i];
+                    dp.scalar[i]  = a.scalar[i];
+                }
+                dp.is_wild = a.is_wild;
+                dp.pad[0] = dp.pad[1] = dp.pad[2] = 0;
+                dp_easy_buf[slot] = dp;
+            }
+        }
+
+        // Bidirectional + multi-coord hash: mix all 4 limbs of canonical_x to break warp correlations.
+        u64 mix = cx[0] ^ (cx[1] * 6364136223846793005ULL)
+                        ^ (cx[2] * 1442695040888963407ULL)
+                        ^  cx[3];
+        u32 ji  = (u32)(mix & (HALF_JUMPS - 1u)) | (a.is_wild ? HALF_JUMPS : 0u);
         const JumpPoint jp = sh_jumps[ji];
 
         u64 nx[4], ny[4];
@@ -229,8 +259,11 @@ void kangaroo_walk_toom6(
             dp_buf[slot] = dp;
         }
 
-        // Bidirectional: tame uses positive half [0, HALF_JUMPS), wild uses negative mirrors [HALF_JUMPS, NUM_JUMPS).
-        u32 ji = (u32)(cx[0] & (HALF_JUMPS - 1u)) | (a.is_wild ? HALF_JUMPS : 0u);
+        // Bidirectional + multi-coord hash: mix all 4 limbs of canonical_x to break warp correlations.
+        u64 mix = cx[0] ^ (cx[1] * 6364136223846793005ULL)
+                        ^ (cx[2] * 1442695040888963407ULL)
+                        ^  cx[3];
+        u32 ji  = (u32)(mix & (HALF_JUMPS - 1u)) | (a.is_wild ? HALF_JUMPS : 0u);
         const JumpPoint jp = sh_jumps[ji];
 
         u64 nx[4], ny[4];
@@ -258,6 +291,11 @@ struct KangarooCtx {
     u64      dp_threshold;
     u32      grid;
     u32      steps_per_launch;
+    // Hierarchical DP: easy (local) + hard (coordinator)
+    DPEntry* d_dp_easy_buf;
+    u32*     d_dp_easy_count;
+    u32      max_easy_dps;
+    u64      dp_easy_threshold;
 };
 
 int kangaroo_set_jumps(const JumpPoint* jumps, int n) {
@@ -285,6 +323,13 @@ KangarooCtx* kangaroo_init(
     cudaMemcpy(ctx->d_animals, host_animals,
                num_animals * sizeof(Animal), cudaMemcpyHostToDevice);
     cudaMemset(ctx->d_dp_count, 0, sizeof(u32));
+
+    ctx->max_easy_dps     = MAX_DPS * 4;
+    ctx->dp_easy_threshold = ctx->dp_threshold << 4;  // 4 bits easier = 16× more frequent
+    cudaMalloc(&ctx->d_dp_easy_buf,   ctx->max_easy_dps * sizeof(DPEntry));
+    cudaMalloc(&ctx->d_dp_easy_count, sizeof(u32));
+    cudaMemset(ctx->d_dp_easy_count, 0, sizeof(u32));
+
     cudaFuncSetAttribute(kangaroo_walk_persistent_toom6,
         cudaFuncAttributePreferredSharedMemoryCarveout,
         cudaSharedmemCarveoutMaxShared);
@@ -330,6 +375,8 @@ void kangaroo_free(KangarooCtx* ctx) {
     cudaFree(ctx->d_animals);
     cudaFree(ctx->d_dp_buf);
     cudaFree(ctx->d_dp_count);
+    cudaFree(ctx->d_dp_easy_buf);
+    cudaFree(ctx->d_dp_easy_count);
     delete ctx;
 }
 
@@ -352,9 +399,12 @@ void kangaroo_launch_persistent(KangarooCtx* ctx) {
     cudaMemcpyToSymbol(g_terminate_flag, &zero,   sizeof(u32));
     cudaMemcpyToSymbol(g_step_count,     &zero64, sizeof(unsigned long long));
     cudaMemset(ctx->d_dp_count, 0, sizeof(u32));
+    cudaMemcpyToSymbol(g_dp_easy_threshold, &ctx->dp_easy_threshold, sizeof(u64));
+    cudaMemset(ctx->d_dp_easy_count, 0, sizeof(u32));
     kangaroo_walk_persistent_toom6<<<ctx->grid, BLOCK_SIZE>>>(
         ctx->d_animals, ctx->d_dp_buf, ctx->d_dp_count,
-        ctx->num_animals, ctx->dp_threshold, ctx->max_dps
+        ctx->d_dp_easy_buf, ctx->d_dp_easy_count,
+        ctx->num_animals, ctx->dp_threshold, ctx->max_dps, ctx->max_easy_dps
     );
 }
 
@@ -383,8 +433,23 @@ u32 kangaroo_read_dps_live(KangarooCtx* ctx, DPEntry* host_buf, u32 max) {
     return to_read;
 }
 
+u32 kangaroo_read_easy_dps(KangarooCtx* ctx, DPEntry* host_buf, u32 max) {
+    u32 count;
+    cudaMemcpy(&count, ctx->d_dp_easy_count, sizeof(u32), cudaMemcpyDeviceToHost);
+    u32 to_read = count < max ? count : max;
+    to_read = to_read < ctx->max_easy_dps ? to_read : ctx->max_easy_dps;
+    if (to_read > 0) {
+        cudaMemcpy(host_buf, ctx->d_dp_easy_buf,
+                   to_read * sizeof(DPEntry), cudaMemcpyDeviceToHost);
+        cudaMemset(ctx->d_dp_easy_count, 0, sizeof(u32));
+    }
+    return to_read;
+}
+
 void kangaroo_update_dp_threshold(KangarooCtx* ctx, u32 dp_bits) {
-    ctx->dp_threshold = (dp_bits >= 64) ? 0ULL : (1ULL << (64 - dp_bits));
+    ctx->dp_threshold      = (dp_bits >= 64) ? 0ULL : (1ULL << (64 - dp_bits));
+    ctx->dp_easy_threshold = ctx->dp_threshold << 4;
+    cudaMemcpyToSymbol(g_dp_easy_threshold, &ctx->dp_easy_threshold, sizeof(u64));
 }
 
 // Upload precomputed {2^i · G | i=0..255} table to GPU constant memory.

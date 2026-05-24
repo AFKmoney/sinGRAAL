@@ -127,6 +127,7 @@ mod ffi {
             is_wild: *const u32,
             target_xy: *const u64,
         ) -> c_int;
+        pub fn kangaroo_read_easy_dps(ctx: *mut KangarooCtx, host_buf: *mut DPEntry, max: u32) -> u32;
     }
 }
 
@@ -323,7 +324,12 @@ fn cpu_solve(args: &Args, target: Pt, dp_table: DpTable, found: Arc<AtomicBool>)
     const NUM_JUMPS: usize = 128;
     let half     = NUM_JUMPS / 2;
     let jumps    = build_jumps(args.range_bits, NUM_JUMPS);
-    let jump_idx = |x: Fe, wild: bool| (x[0] & (half as u64 - 1)) as usize + if wild { half } else { 0 };
+    let jump_idx = |x: Fe, wild: bool| {
+        let mix = x[0] ^ x[1].wrapping_mul(6364136223846793005)
+                        ^ x[2].wrapping_mul(1442695040888963407)
+                        ^ x[3];
+        (mix & (half as u64 - 1)) as usize + if wild { half } else { 0 }
+    };
     let dp_bits  = args.dp_bits.unwrap_or(28);
     let is_dp    = |x: Fe| x[3] < (1u64 << (64u32.saturating_sub(dp_bits)));
     let range_bits = args.range_bits;
@@ -445,8 +451,13 @@ fn run_gpu(
         }
     }
 
+    // Hard DPs → coordinator / global table
     let dp_cap = 1u32 << 21;
     let mut dp_buf: Vec<DPEntry> = (0..dp_cap).map(|_| unsafe { std::mem::zeroed() }).collect();
+    // Easy DPs (4 bits easier = 16× more frequent) → local per-GPU table, no coordinator traffic
+    let easy_cap = 1u32 << 23;
+    let mut easy_buf: Vec<DPEntry> = (0..easy_cap).map(|_| unsafe { std::mem::zeroed() }).collect();
+    let mut local_dp_table: HashMap<[u64; 4], DpRecord> = HashMap::new();
 
     let mut coord: Option<coordinator::CoordConn> = args.coordinator.as_deref()
         .and_then(|addr| coordinator::CoordConn::connect(addr)
@@ -469,9 +480,20 @@ fn run_gpu(
 
     while !found.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // ── Level-1 easy DPs: checked locally, no coordinator traffic ────────
+        let n_easy = unsafe { kangaroo_read_easy_dps(ctx, easy_buf.as_mut_ptr(), easy_cap) } as usize;
+        for dp in &easy_buf[..n_easy] {
+            if let Some(k) = process_dp(dp.canon_x, dp.scalar, dp.is_wild != 0,
+                                         &mut local_dp_table, target, args.range_bits) {
+                found.store(true, Ordering::Relaxed); *result.lock().unwrap() = Some(k);
+            }
+        }
+
+        // ── Level-2 hard DPs: coordinator / global table ─────────────────────
         let n_dps = unsafe { kangaroo_read_dps_live(ctx, dp_buf.as_mut_ptr(), dp_cap) } as usize;
         total_steps = unsafe { kangaroo_read_step_count() };
-        total_dps  += n_dps as u64;
+        total_dps  += n_dps as u64 + n_easy as u64;
 
         {
             let now = Instant::now();
@@ -593,7 +615,7 @@ fn main() {
     let ty = fe_from_hex(&args.target_y).expect("--target-y: 64 hex chars required");
     let target = Pt { x: tx, y: ty, inf: false };
 
-    eprintln!("sinGRAAL complete_solver — Toom-6 CUDA Kangaroo (6-aut + bidir-GLV + LDS-bands + Jac-GPU-init)");
+    eprintln!("sinGRAAL complete_solver — Toom-6 CUDA Kangaroo (6-aut + bidir-GLV + LDS + multicoord-hash + hier-DP)");
     eprintln!("  target  = 0x{}:0x{}", fe_to_hex(tx), fe_to_hex(ty));
     eprintln!("  range   = [0, 2^{})", args.range_bits);
     eprintln!("  animals = {} per device", args.num_animals);
