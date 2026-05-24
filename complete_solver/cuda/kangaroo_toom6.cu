@@ -156,6 +156,12 @@ void kangaroo_walk_persistent_toom6(
     // Detects short cycles (period ≤ 4) and perturbs the jump index.
     u64 r0 = 0, r1 = 0, r2 = 0, r3 = 0;
 
+    // ── Adaptive steering: stagnation detector ────────────────────────────────
+    // Tracks steps since last DP. If > STAGNATION_STEPS with no DP → stuck:
+    // aggressively perturb scramble + reset ring buffer to force exploration.
+    u32 steps_since_dp = 0u;
+    const u32 STAGNATION_STEPS = 1u << 25; // 32M steps; safe for dp_bits ≤ 25
+
     while (!g_terminate_flag) {
         u64 cx[4];
         canonical_x_affine(a.ax, cx);
@@ -205,6 +211,20 @@ void kangaroo_walk_persistent_toom6(
                 dp.pad[0] = dp.pad[1] = dp.pad[2] = 0;
                 dp_easy_buf[slot] = dp;
             }
+        }
+
+        // ── Adaptive steering: stagnation response ────────────────────────────
+        // Update steps_since_dp counter; if stagnating, perturb to escape.
+        bool any_dp = is_hard || is_easy_only;
+        if (any_dp) {
+            steps_since_dp = 0u;
+        } else if (++steps_since_dp >= STAGNATION_STEPS) {
+            // No DP in 32M steps: force exploration via scramble perturbation.
+            // Invalidating the ring buffer prevents false cycle detections
+            // after the sudden direction change.
+            animal_scramble ^= local_steps * 2246822519u ^ steps_since_dp;
+            r0 = r1 = r2 = r3 = ~0ULL;
+            steps_since_dp = 0u;
         }
 
         // ── Enhanced jump selection: full-state hash + per-animal scramble ────
