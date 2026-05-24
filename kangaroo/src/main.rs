@@ -20,6 +20,7 @@
 
 mod secp;
 mod glv;
+mod fp2;
 mod coordinator;
 mod research;
 mod glv4d;
