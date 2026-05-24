@@ -25,6 +25,7 @@ mod coordinator;
 mod research;
 mod glv4d;
 mod semaev;
+mod quantum;
 
 use clap::Parser;
 use secp::*;
@@ -140,6 +141,13 @@ struct Args {
     /// Example: kangaroo --research-canonical
     #[arg(long)]
     research_canonical: bool,
+
+    /// Quantum walk + superposition research: complexity landscape, 'états superposés',
+    /// LLL primal/dual (self-dual Z[ω]), quantum resource estimates, hybrid path.
+    /// Answers: what does quantum superposition mean for Kangaroo ECDLP?
+    /// Example: kangaroo --research-quantum --range-bits 135
+    #[arg(long)]
+    research_quantum: bool,
 
     /// Measure empirical Kangaroo constant C on random small-scale DLP instances.
     /// Compares measured C against theoretical 1.10 and published literature.
@@ -890,6 +898,10 @@ fn main() {
     }
     if args.research_canonical {
         glv4d::run_canonical_benchmark();
+        return;
+    }
+    if args.research_quantum {
+        quantum::run_quantum_research(args.range_bits);
         return;
     }
     if args.benchmark_c {
