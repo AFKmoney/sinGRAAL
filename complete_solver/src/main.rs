@@ -5,7 +5,7 @@
 //   Evaluate polynomial at {0,1,...,9,∞}, pointwise multiply, interpolate
 //   via Newton forward differences (all ≥ 0 by non-neg coeff theorem)
 //
-// Kangaroo: 6-aut + bidir-GLV4D + LDS-bands + Jac-GPU-init + 29-band, C≈0.55
+// Kangaroo: 6-aut + bidir-GLV4D + LDS + decor-scramble + anti-cycle + Jac-init, C≈0.55
 // Deploy:   kangaroo --target-x <hex> --target-y <hex> --range-bits 135
 //           kangaroo --serve --target-x <hex> --target-y <hex>   [coordinator]
 //           kangaroo --coordinator <host:port> --all-gpus         [worker]
@@ -677,7 +677,7 @@ fn main() {
     let ty = fe_from_hex(&args.target_y).expect("--target-y: 64 hex chars required");
     let target = Pt { x: tx, y: ty, inf: false };
 
-    eprintln!("sinGRAAL complete_solver — Toom-6 CUDA Kangaroo (6-aut + bidir-GLV4D + LDS + 4D-hash + hier-DP)");
+    eprintln!("sinGRAAL complete_solver — Toom-6 CUDA Kangaroo (6-aut + bidir-GLV4D + decor + anti-cycle + hier-DP)");
     eprintln!("  target  = 0x{}:0x{}", fe_to_hex(tx), fe_to_hex(ty));
     eprintln!("  range   = [0, 2^{})", args.range_bits);
     eprintln!("  animals = {} per device", args.num_animals);

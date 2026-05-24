@@ -148,6 +148,14 @@ void kangaroo_walk_persistent_toom6(
     Animal a = animals[tid];
     u32 local_steps = 0u;
 
+    // ── Per-animal decorrelation: unique stable scramble per thread ───────────
+    // Guarantees Cov(Walk_i, Walk_j) ≈ 0 even if animals start near each other.
+    u32 animal_scramble = tid * 2654435761u;  // Knuth multiplicative hash
+
+    // ── Anti-cycle ring buffer: 4 canonical-x entries in registers ───────────
+    // Detects short cycles (period ≤ 4) and perturbs the jump index.
+    u64 r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+
     while (!g_terminate_flag) {
         u64 cx[4];
         canonical_x_affine(a.ax, cx);
@@ -199,14 +207,26 @@ void kangaroo_walk_persistent_toom6(
             }
         }
 
-        // 4D GLV lattice walk: jump selection from all 4 lattice coordinates.
-        u64 mix = a.k1[0] ^ (a.k1[1] * 6364136223846793005ULL)
-                           ^ (a.k2[0] * 1442695040888963407ULL)
-                           ^  a.k2[1]
-                           ^ (a.k3[0] * 2654435761ULL)
-                           ^ (a.k4[0] * 3141592653589793ULL)
-                           ^  a.k3[1] ^ a.k4[1];
-        u32 ji  = (u32)(mix & (HALF_JUMPS - 1u)) | (a.is_wild ? HALF_JUMPS : 0u);
+        // ── Enhanced jump selection: full-state hash + per-animal scramble ────
+        // Mix includes EC point x (real geometric position) + scalar state
+        // + all 4 GLV lattice coords — then XOR per-animal scramble so
+        // Cov(walk_i, walk_j) ≈ 0 even with identical initial k-coordinates.
+        u64 mix = (a.ax[0]     * 0x9e3779b97f4a7c15ULL)  // EC point x (key!)
+                ^ (a.scalar[0] * 0x6c62272e07bb0142ULL)  // scalar state
+                ^  a.k1[0] ^ (a.k1[1] * 6364136223846793005ULL)
+                ^ (a.k2[0]     * 1442695040888963407ULL) ^ a.k2[1]
+                ^ (a.k3[0]     * 2654435761ULL)          ^ a.k3[1]
+                ^ (a.k4[0]     * 3141592653589793ULL)    ^ a.k4[1];
+        u32 ji = ((u32)(mix ^ (mix >> 32)) ^ animal_scramble) & (HALF_JUMPS - 1u);
+        ji |= (a.is_wild ? HALF_JUMPS : 0u);
+
+        // ── Anti-cycle: detect revisit from ring buffer → perturb jump ────────
+        // Uses canonical x (not raw ax) so 6-aut equivalent points are caught.
+        bool cycle = (cx[0] == r0 || cx[0] == r1 || cx[0] == r2 || cx[0] == r3);
+        if (cycle)
+            ji = ((ji ^ 0x55u ^ animal_scramble) & (HALF_JUMPS - 1u)) | (a.is_wild ? HALF_JUMPS : 0u);
+        r3 = r2; r2 = r1; r1 = r0; r0 = cx[0];  // push (LIFO, 4 entries)
+
         const JumpPoint jp = sh_jumps[ji];
 
         u64 nx[4], ny[4];
@@ -231,6 +251,12 @@ void kangaroo_walk_persistent_toom6(
         local_steps++;
         if (threadIdx.x == 0 && (local_steps & 0xFFFFu) == 0u)
             atomicAdd(&g_step_count, (unsigned long long)0x10000u * BLOCK_SIZE);
+
+        // ── Periodic scramble evolution: breaks long-range correlations ────────
+        // Every 2^20 steps (~1M), evolve the per-animal scramble via LCG
+        // so that walks which were briefly correlated diverge over time.
+        if ((local_steps & 0xFFFFFu) == 0u && local_steps > 0u)
+            animal_scramble = animal_scramble * 1664525u ^ (local_steps >> 8);
     }
 
     if (threadIdx.x == 0 && (local_steps & 0xFFFFu) != 0u)
