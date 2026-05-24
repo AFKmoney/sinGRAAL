@@ -5,7 +5,7 @@
 //   Evaluate polynomial at {0,1,...,9,∞}, pointwise multiply, interpolate
 //   via Newton forward differences (all ≥ 0 by non-neg coeff theorem)
 //
-// Kangaroo: 6-aut + bidir-GLV + LDS-bands + Jac-GPU-init + 29-band, C≈0.55
+// Kangaroo: 6-aut + bidir-GLV4D + LDS-bands + Jac-GPU-init + 29-band, C≈0.55
 // Deploy:   kangaroo --target-x <hex> --target-y <hex> --range-bits 135
 //           kangaroo --serve --target-x <hex> --target-y <hex>   [coordinator]
 //           kangaroo --coordinator <host:port> --all-gpus         [worker]
@@ -88,6 +88,8 @@ mod ffi {
     #[repr(C)]
     pub struct Animal {
         pub ax: [u64;4], pub ay: [u64;4], pub scalar: [u64;4],
+        pub k1: [u64;4], pub k2: [u64;4],   // 4D GLV primary lattice (G, φG)
+        pub k3: [u64;4], pub k4: [u64;4],   // 4D extension (G+φG, G-φG)
         pub is_wild: u32, pub _pad: [u32;3],
     }
 
@@ -127,28 +129,26 @@ mod ffi {
             is_wild: *const u32,
             target_xy: *const u64,
         ) -> c_int;
+        pub fn kangaroo_read_easy_dps(ctx: *mut KangarooCtx, host_buf: *mut DPEntry, max: u32) -> u32;
+        pub fn kangaroo_upload_dk_tables(dk1: *const u64, dk2: *const u64, dk3: *const u64, dk4: *const u64) -> c_int;
     }
 }
 
-// ─── Jump table (29-band, bidirectional GLV, Halton LDS, C≈0.55) ─────────────
+// ─── Jump table (4D GLV lattice walk, bidirectional, Halton-4D, C≈0.55) ─────────
 //
-// Bidirectional meet-in-the-middle:
-//   Tame kangaroos use jump indices [0, HALF): always positive scalars → scalar grows.
-//   Wild kangaroos use jump indices [HALF, NUM): negative mirrors → scalar shrinks.
-//   When tame and wild hit the same DP: k = k_tame − k_wild (mod n) unchanged.
-//   Directed walks converge faster than independent random ± walks: ~41% fewer steps.
+// 4D GLV lattice walk: k = k₁ + λk₂ + (1+λ)k₃ + (1-λ)k₄.
+//   4 directions: G (dk₁), φG (dk₂), G+φG (dk₃), G-φG (dk₄).
+//   Each jump (Δk₁..Δk₄) drawn independently from 29-band geometric distribution
+//   via 4D Halton LDS (bases 2,3,5,7 for axis band selection).
+//   Combined point: Δk₁·G + Δk₂·φG + Δk₃·(G+φG) + Δk₄·(G-φG).
+//   Combined scalar: Δk₁ + λΔk₂ + (1+λ)Δk₃ + (1-λ)Δk₄ (mod n).
 //
-// Low-discrepancy sequences (Halton bases 2/3/5 per GLV axis):
-//   Each jump scalar within band [2^(k-1), 2^k) is placed at a Halton point
-//   rather than a hash offset. Eliminates clustering; each slot covers a unique
-//   equidistributed position → lower variance, better convergence.
-//
-// C constant history:
-//   Positive-only 3-axis:   C ≈ 1.10
-//   Random ±6-dir:          C ≈ 0.78
-//   Bidirectional + LDS:    C ≈ 0.55  ← this implementation
+// Jump selection: 4D hash mix(k₁,k₂,k₃,k₄) — ergodic across all 4 lattice axes.
+// DP detection: canonical_x of geometric point — unchanged.
+// Recovery: k_target = k_tame − k_wild (mod n), then 6-aut filter — unchanged.
+// Bidirectional: first half positive (tame), second half negative mirrors (wild).
 
-struct Jump { pt: Pt, scalar: Fe }
+struct Jump { pt: Pt, scalar: Fe, dk1: Fe, dk2: Fe, dk3: Fe, dk4: Fe }
 
 // Halton low-discrepancy sequence in given prime base.
 fn halton(mut n: u64, base: u64) -> f64 {
@@ -160,7 +160,7 @@ fn halton(mut n: u64, base: u64) -> f64 {
 // Build a scalar in [2^(k_exp-1), 2^k_exp) using Halton(base_lo) for low bits
 // and Halton(base_hi) for bits that span into the second u64 word.
 fn lds_scalar(slot: u64, axis: usize, k_exp: u32) -> Fe {
-    let (base_lo, base_hi): (u64, u64) = [(2, 7), (3, 11), (5, 13)][axis];
+    let (base_lo, base_hi): (u64, u64) = [(2, 7), (3, 11), (5, 13), (7, 17)][axis];
     let hi = k_exp.saturating_sub(1) as usize;
     let (w, b) = (hi / 64, hi % 64);
     let mut s = [0u64; 4];
@@ -181,38 +181,78 @@ fn lds_scalar(slot: u64, axis: usize, k_exp: u32) -> Fe {
 }
 
 fn build_jumps(range_bits: u32, num_jumps: usize) -> Vec<Jump> {
-    // First half: positive jumps (tame), second half: negative mirrors (wild).
-    // 3 GLV axes × (half/3) LDS-spaced slots, 29 geometric bands each.
-    let half     = num_jumps / 2;
-    let mu_bits  = (range_bits / 2) as i32;
-    let per_axis = half / 3;
+    // 4D GLV lattice walk.
+    // For each slot i: choose (k₁..k₄_exp) independently via 4D Halton(2,3,5,7),
+    // then build dk1..dk4 ~ 2^k_exp for each axis.
+    // Combined point: dk1·G + dk2·φG + dk3·(G+φG) + dk4·(G-φG).
+    // Combined scalar: dk1 + λ·dk2 + (1+λ)·dk3 + (1-λ)·dk4 (mod n).
+    let half    = num_jumps / 2;
+    let mu_bits = (range_bits / 2) as i32;
 
     const NUM_BANDS: usize = 29;
     const BAND_HALF: i32   = (NUM_BANDS / 2) as i32;
 
     let mut pos = Vec::with_capacity(half);
-    for axis in 0..3usize {
-        let n_this = if pos.len() + per_axis <= half { per_axis }
-                     else { half.saturating_sub(pos.len()) };
-        for local_i in 0..n_this {
-            let band  = (local_i % NUM_BANDS) as i32 - BAND_HALF;
-            let k_exp = (mu_bits + band).max(1) as u32;
-            let slot  = (local_i / NUM_BANDS) as u64;
-            let s     = lds_scalar(slot, axis, k_exp);
-            let base_pt = scalar_mul(G, s);
-            let (pt, scalar) = match axis {
-                0 => (base_pt, s),
-                1 => (phi_point(base_pt),  sc_mul_lambda(s)),
-                _ => (phi2_point(base_pt), sc_mul_lambda2(s)),
-            };
-            pos.push(Jump { pt, scalar });
-        }
+    for i in 0..half {
+        let slot = i as u64;
+        // 4D Halton: independent band index per GLV dimension (bases 2,3,5,7)
+        let t1 = halton(slot + 1, 2);
+        let t2 = halton(slot + 1, 3);
+        let t3 = halton(slot + 1, 5);
+        let t4 = halton(slot + 1, 7);
+        let band = |t: f64| ((t * NUM_BANDS as f64) as i32 - BAND_HALF).max(-BAND_HALF).min(BAND_HALF);
+
+        let k1_exp = (mu_bits + band(t1)).max(1) as u32;
+        let k2_exp = (mu_bits + band(t2)).max(1) as u32;
+        let k3_exp = (mu_bits + band(t3)).max(1) as u32;
+        let k4_exp = (mu_bits + band(t4)).max(1) as u32;
+
+        let dk1 = lds_scalar(slot, 0, k1_exp);  // G direction
+        let dk2 = lds_scalar(slot, 1, k2_exp);  // φG direction
+        let dk3 = lds_scalar(slot, 2, k3_exp);  // (G+φG) direction
+        let dk4 = lds_scalar(slot, 3, k4_exp);  // (G-φG) direction
+
+        // Combined EC point: dk1·G + dk2·φG + dk3·(G+φG) + dk4·(G-φG)
+        let p1 = scalar_mul(G, dk1);
+        let p2 = phi_point(scalar_mul(G, dk2));
+        let p3 = {
+            let pa = scalar_mul(G, dk3);
+            let pb = phi_point(scalar_mul(G, dk3));
+            if pa.inf { pb } else if pb.inf { pa } else { pt_add(pa, pb) }
+        };
+        let p4 = {
+            let pa = scalar_mul(G, dk4);
+            let pb = pt_neg(phi_point(scalar_mul(G, dk4)));
+            if pa.inf { pb } else if pb.inf { pa } else { pt_add(pa, pb) }
+        };
+        let pt12 = if p1.inf { p2 } else if p2.inf { p1 } else { pt_add(p1, p2) };
+        let pt34 = if p3.inf { p4 } else if p4.inf { p3 } else { pt_add(p3, p4) };
+        let pt   = if pt12.inf { pt34 } else if pt34.inf { pt12 } else { pt_add(pt12, pt34) };
+
+        // Combined scalar: dk1 + λ·dk2 + (1+λ)·dk3 + (1-λ)·dk4 (mod n)
+        let lam_dk2 = sc_mul_lambda(dk2);
+        let lam_dk3 = sc_mul_lambda(dk3);
+        let lam_dk4 = sc_mul_lambda(dk4);
+        let scalar = sc_add(
+            sc_add(dk1, lam_dk2),
+            sc_add(sc_add(dk3, lam_dk3), sc_add(dk4, sc_neg(lam_dk4))),
+        );
+
+        pos.push(Jump { pt, scalar, dk1, dk2, dk3, dk4 });
     }
 
-    // Tame half first, then negative mirrors for wild.
+    // Tame half (positive), then negative mirrors for wild.
     let mut jumps = Vec::with_capacity(num_jumps);
-    for j in &pos { jumps.push(Jump { pt: j.pt, scalar: j.scalar }); }
-    for j in &pos { jumps.push(Jump { pt: pt_neg(j.pt), scalar: sc_neg(j.scalar) }); }
+    for j in &pos {
+        jumps.push(Jump { pt: j.pt, scalar: j.scalar, dk1: j.dk1, dk2: j.dk2, dk3: j.dk3, dk4: j.dk4 });
+    }
+    for j in &pos {
+        jumps.push(Jump {
+            pt: pt_neg(j.pt), scalar: sc_neg(j.scalar),
+            dk1: sc_neg(j.dk1), dk2: sc_neg(j.dk2),
+            dk3: sc_neg(j.dk3), dk4: sc_neg(j.dk4),
+        });
+    }
     jumps
 }
 
@@ -323,7 +363,12 @@ fn cpu_solve(args: &Args, target: Pt, dp_table: DpTable, found: Arc<AtomicBool>)
     const NUM_JUMPS: usize = 128;
     let half     = NUM_JUMPS / 2;
     let jumps    = build_jumps(args.range_bits, NUM_JUMPS);
-    let jump_idx = |x: Fe, wild: bool| (x[0] & (half as u64 - 1)) as usize + if wild { half } else { 0 };
+    let jump_idx = |x: Fe, wild: bool| {
+        let mix = x[0] ^ x[1].wrapping_mul(6364136223846793005)
+                        ^ x[2].wrapping_mul(1442695040888963407)
+                        ^ x[3];
+        (mix & (half as u64 - 1)) as usize + if wild { half } else { 0 }
+    };
     let dp_bits  = args.dp_bits.unwrap_or(28);
     let is_dp    = |x: Fe| x[3] < (1u64 << (64u32.saturating_sub(dp_bits)));
     let range_bits = args.range_bits;
@@ -387,15 +432,31 @@ fn run_gpu(
     let rc = unsafe { kangaroo_set_jumps(jump_ffi.as_ptr(), num_jumps as i32) };
     assert_eq!(rc, 0, "kangaroo_set_jumps failed on GPU {}", dev);
 
+    // ── Upload 4D GLV lattice components (dk1..dk4) per jump ─────────────────
+    {
+        let mut dk1_flat = Vec::<u64>::with_capacity(num_jumps * 4);
+        let mut dk2_flat = Vec::<u64>::with_capacity(num_jumps * 4);
+        let mut dk3_flat = Vec::<u64>::with_capacity(num_jumps * 4);
+        let mut dk4_flat = Vec::<u64>::with_capacity(num_jumps * 4);
+        for j in &jumps_cpu {
+            dk1_flat.extend_from_slice(&j.dk1);
+            dk2_flat.extend_from_slice(&j.dk2);
+            dk3_flat.extend_from_slice(&j.dk3);
+            dk4_flat.extend_from_slice(&j.dk4);
+        }
+        let rc = unsafe { kangaroo_upload_dk_tables(dk1_flat.as_ptr(), dk2_flat.as_ptr(),
+                                                    dk3_flat.as_ptr(), dk4_flat.as_ptr()) };
+        if rc != 0 { eprintln!("[GPU {}] dk_tables upload failed (non-fatal)", dev); }
+    }
+
     // ── Precompute {2^i · G | i=0..255} and upload to GPU constant memory ───
-    // Used by gpu_init_animals_kernel (Jacobian scalar-mul, ~27× faster than CPU affine).
     {
         let mut g_table_flat = Vec::<u64>::with_capacity(256 * 8);
         let mut pt = G;
         for _ in 0..256 {
             g_table_flat.extend_from_slice(&pt.x);
             g_table_flat.extend_from_slice(&pt.y);
-            pt = pt_add(pt, pt);  // pt_add(P,P) → doubling internally
+            pt = pt_add(pt, pt);
         }
         let rc = unsafe { kangaroo_upload_G_table(g_table_flat.as_ptr()) };
         if rc != 0 { eprintln!("[GPU {}] G_table upload failed (non-fatal)", dev); }
@@ -409,14 +470,19 @@ fn run_gpu(
     let mut global_tame_idx = gpu_idx as u32;
     while tame_count < n_tame as u32 {
         let (pt, sc) = make_tame(global_tame_idx, args.range_bits);
-        host_animals.push(Animal { ax: pt.x, ay: pt.y, scalar: sc, is_wild: 0, _pad: [0;3] });
+        // k1=scalar, k2=k3=k4=0: k = k1 + λ·k2 + (1+λ)·k3 + (1-λ)·k4 = scalar
+        host_animals.push(Animal { ax: pt.x, ay: pt.y, scalar: sc,
+                                   k1: sc, k2: [0u64;4], k3: [0u64;4], k4: [0u64;4],
+                                   is_wild: 0, _pad: [0;3] });
         global_tame_idx += n_gpus as u32;
         tame_count += 1;
     }
     for i in 0..n_wild {
         let global_wild_idx = (gpu_idx * n_wild + i) as u32;
         let (wp, ws) = make_wild(global_wild_idx, gpu_idx, target, args.range_bits);
-        host_animals.push(Animal { ax: wp.x, ay: wp.y, scalar: ws, is_wild: 1, _pad: [0;3] });
+        host_animals.push(Animal { ax: wp.x, ay: wp.y, scalar: ws,
+                                   k1: ws, k2: [0u64;4], k3: [0u64;4], k4: [0u64;4],
+                                   is_wild: 1, _pad: [0;3] });
     }
 
     let ctx = unsafe {
@@ -445,8 +511,13 @@ fn run_gpu(
         }
     }
 
+    // Hard DPs → coordinator / global table
     let dp_cap = 1u32 << 21;
     let mut dp_buf: Vec<DPEntry> = (0..dp_cap).map(|_| unsafe { std::mem::zeroed() }).collect();
+    // Easy DPs (4 bits easier = 16× more frequent) → local per-GPU table, no coordinator traffic
+    let easy_cap = 1u32 << 23;
+    let mut easy_buf: Vec<DPEntry> = (0..easy_cap).map(|_| unsafe { std::mem::zeroed() }).collect();
+    let mut local_dp_table: HashMap<[u64; 4], DpRecord> = HashMap::new();
 
     let mut coord: Option<coordinator::CoordConn> = args.coordinator.as_deref()
         .and_then(|addr| coordinator::CoordConn::connect(addr)
@@ -469,9 +540,20 @@ fn run_gpu(
 
     while !found.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // ── Level-1 easy DPs: checked locally, no coordinator traffic ────────
+        let n_easy = unsafe { kangaroo_read_easy_dps(ctx, easy_buf.as_mut_ptr(), easy_cap) } as usize;
+        for dp in &easy_buf[..n_easy] {
+            if let Some(k) = process_dp(dp.canon_x, dp.scalar, dp.is_wild != 0,
+                                         &mut local_dp_table, target, args.range_bits) {
+                found.store(true, Ordering::Relaxed); *result.lock().unwrap() = Some(k);
+            }
+        }
+
+        // ── Level-2 hard DPs: coordinator / global table ─────────────────────
         let n_dps = unsafe { kangaroo_read_dps_live(ctx, dp_buf.as_mut_ptr(), dp_cap) } as usize;
         total_steps = unsafe { kangaroo_read_step_count() };
-        total_dps  += n_dps as u64;
+        total_dps  += n_dps as u64 + n_easy as u64;
 
         {
             let now = Instant::now();
@@ -558,7 +640,9 @@ fn run_gpu(
                     .wrapping_add(i as u32)
                     .wrapping_add(restarts_done.wrapping_mul(0x517cc1b7));
                 let (wp, ws) = make_wild(gw ^ 0xcafe0000, gpu_idx + 1000*restarts_done as usize, target, args.range_bits);
-                ha[wild_idx] = Animal { ax: wp.x, ay: wp.y, scalar: ws, is_wild: 1, _pad: [0;3] };
+                ha[wild_idx] = Animal { ax: wp.x, ay: wp.y, scalar: ws,
+                                        k1: ws, k2: [0u64;4], k3: [0u64;4], k4: [0u64;4],
+                                        is_wild: 1, _pad: [0;3] };
             }
             unsafe { kangaroo_write_animals(ctx, ha.as_ptr()) };
             last_restart = Instant::now();
@@ -593,7 +677,7 @@ fn main() {
     let ty = fe_from_hex(&args.target_y).expect("--target-y: 64 hex chars required");
     let target = Pt { x: tx, y: ty, inf: false };
 
-    eprintln!("sinGRAAL complete_solver — Toom-6 CUDA Kangaroo (6-aut + bidir-GLV + LDS-bands + Jac-GPU-init)");
+    eprintln!("sinGRAAL complete_solver — Toom-6 CUDA Kangaroo (6-aut + bidir-GLV4D + LDS + 4D-hash + hier-DP)");
     eprintln!("  target  = 0x{}:0x{}", fe_to_hex(tx), fe_to_hex(ty));
     eprintln!("  range   = [0, 2^{})", args.range_bits);
     eprintln!("  animals = {} per device", args.num_animals);
