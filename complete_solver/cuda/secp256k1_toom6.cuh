@@ -630,6 +630,122 @@ void sc_add(const u64 a[4], const u64 b[4], u64 r[4]) {
     }
 }
 
+// ─── Jacobian point arithmetic (inversion-free) ───────────────────────────────
+//
+// Jacobian coordinates: (X:Y:Z) represents affine point (X/Z², Y/Z³).
+// All three functions avoid field inversion in the hot path.
+//
+// Use case: GPU-side scalar multiplication for kangaroo initialization.
+//   • jac_dbl        — doubling,      cost 2M + 5S
+//   • jac_add_affine — mixed add,     cost 7M + 4S  (Q in affine, Z_Q = 1)
+//   • jac_to_affine  — normalization, cost 1I + 4M + 1S  (called once per animal)
+//
+// NOT used in the kangaroo random-walk loop: each walk step requires the affine
+// x-coordinate to select the next jump (ji = cx[0] & 255), which mandates
+// normalization to affine at every step.  The walk loop keeps Z=1 throughout
+// (standard affine + fp_inv approach) which remains optimal for that path.
+
+// Jacobian doubling for a=0 Weierstrass (secp256k1): 2M + 5S
+// Formula: dbl-2009-l (hyperelliptic.org)
+//   A = X1²,  B = Y1²,  C = B²
+//   D = 2·((X1+B)² - A - C)   [= 4·X1·B]
+//   E = 3·A,  F = E²
+//   X3 = F - 2·D
+//   Y3 = E·(D - X3) - 8·C
+//   Z3 = 2·Y1·Z1
+__device__ __forceinline__
+void jac_dbl(
+    const u64 X1[4], const u64 Y1[4], const u64 Z1[4],
+    u64 X3[4], u64 Y3[4], u64 Z3[4]
+) {
+    if ((Z1[0]|Z1[1]|Z1[2]|Z1[3]) == 0) {
+        for (int i=0;i<4;i++) { X3[i]=0; Y3[i]=0; Z3[i]=0; }
+        return;
+    }
+    u64 A[4], B[4], C[4], D[4], E[4], F[4], tmp[4];
+
+    fp_sqr(X1, A);                       // A = X1²                          [S]
+    fp_sqr(Y1, B);                       // B = Y1²                          [S]
+    fp_sqr(B,  C);                       // C = B²                           [S]
+    // D = 2·((X1+B)² - A - C)
+    fp_add(X1, B, D); fp_sqr(D, D);     // D = (X1+B)²                      [S]
+    fp_sub(D, A, D); fp_sub(D, C, D);
+    fp_add(D, D, D);                     // D = 2·(...)  = 4·X1·B
+    // E = 3·A
+    fp_add(A, A, E); fp_add(E, A, E);   // E = 3·A
+    fp_sqr(E, F);                        // F = E²                           [S]
+    // X3 = F - 2·D
+    fp_sub(F, D, X3); fp_sub(X3, D, X3);
+    // Y3 = E·(D - X3) - 8·C
+    fp_sub(D, X3, tmp); fp_mul(E, tmp, Y3);                                  // [M]
+    fp_add(C, C, tmp); fp_add(tmp, tmp, tmp); fp_add(tmp, tmp, tmp); // 8·C
+    fp_sub(Y3, tmp, Y3);
+    // Z3 = 2·Y1·Z1
+    fp_mul(Y1, Z1, Z3); fp_add(Z3, Z3, Z3);                                 // [M]
+}
+
+// Jacobian + affine mixed addition: P=(X1:Y1:Z1) + Q=(x2,y2,1) → 7M + 4S
+// Formula: madd-2007-bl (hyperelliptic.org)
+//   Z1Z1 = Z1²,  U2 = x2·Z1Z1,  S2 = y2·Z1·Z1Z1
+//   H = U2 - X1,  HH = H²,  I = 4·HH,  J = H·I
+//   r = 2·(S2 - Y1),  V = X1·I
+//   X3 = r² - J - 2·V
+//   Y3 = r·(V - X3) - 2·Y1·J
+//   Z3 = 2·Z1·H  [= (Z1+H)² - Z1Z1 - HH]
+__device__ __forceinline__
+void jac_add_affine(
+    const u64 X1[4], const u64 Y1[4], const u64 Z1[4],
+    const u64 x2[4], const u64 y2[4],
+    u64 X3[4], u64 Y3[4], u64 Z3[4]
+) {
+    // Identity input → output is Q in Jacobian
+    if ((Z1[0]|Z1[1]|Z1[2]|Z1[3]) == 0) {
+        for (int i=0;i<4;i++) { X3[i]=x2[i]; Y3[i]=y2[i]; }
+        Z3[0]=1; Z3[1]=Z3[2]=Z3[3]=0;
+        return;
+    }
+    u64 Z1Z1[4], U2[4], S2[4], H[4], HH[4], I[4], J[4], rv[4], V[4], tmp[4];
+
+    fp_sqr(X1, Z1Z1);                            // Z1Z1 = Z1²               [S]
+    fp_mul(x2, Z1Z1, U2);                        // U2 = x2·Z1Z1             [M]
+    fp_mul(Z1, Z1Z1, tmp); fp_mul(y2, tmp, S2);  // S2 = y2·Z1³             [M+M]
+    fp_sub(U2, X1, H);                           // H = U2 - X1
+    fp_sqr(H, HH);                               // HH = H²                  [S]
+    fp_add(HH, HH, I); fp_add(I, I, I);          // I = 4·HH
+    fp_mul(H, I, J);                             // J = H·I = 4·H³           [M]
+    fp_sub(S2, Y1, rv); fp_add(rv, rv, rv);      // rv = 2·(S2 - Y1)
+    fp_mul(X1, I, V);                            // V = X1·I = 4·X1·H²       [M]
+    // X3 = rv² - J - 2·V
+    fp_sqr(rv, X3);                              // X3 = rv²                  [S]
+    fp_sub(X3, J, X3); fp_sub(X3, V, X3); fp_sub(X3, V, X3);
+    // Y3 = rv·(V - X3) - 2·Y1·J
+    fp_sub(V, X3, tmp); fp_mul(rv, tmp, Y3);                                  // [M]
+    fp_mul(Y1, J, tmp); fp_add(tmp, tmp, tmp);
+    fp_sub(Y3, tmp, Y3);                                                       // [M]
+    // Z3 = (Z1+H)² - Z1Z1 - HH  (= 2·Z1·H)
+    fp_add(Z1, H, Z3); fp_sqr(Z3, Z3);           //                           [S]
+    fp_sub(Z3, Z1Z1, Z3); fp_sub(Z3, HH, Z3);
+}
+
+// Normalize Jacobian (X:Y:Z) → affine (x, y) = (X·Z^{-2}, Y·Z^{-3})
+// Cost: 1I + 4M + 1S.  Only called once per animal at init, not in the walk loop.
+__device__ __forceinline__
+void jac_to_affine(
+    const u64 X[4], const u64 Y[4], const u64 Z[4],
+    u64 ax[4], u64 ay[4]
+) {
+    if ((Z[0]|Z[1]|Z[2]|Z[3]) == 0) {  // point at infinity
+        for (int i=0;i<4;i++) { ax[i]=0; ay[i]=0; }
+        return;
+    }
+    u64 zi[4], zi2[4], zi3[4];
+    fp_inv(Z, zi);          // zi = Z^{-1}               [I]
+    fp_sqr(zi, zi2);        // zi2 = Z^{-2}              [S]
+    fp_mul(zi, zi2, zi3);   // zi3 = Z^{-3}              [M]
+    fp_mul(X, zi2, ax);     // ax = X·Z^{-2}             [M]
+    fp_mul(Y, zi3, ay);     // ay = Y·Z^{-3}             [M]
+}
+
 // ─── Structures ───────────────────────────────────────────────────────────────
 
 struct JumpPoint { u64 x[4]; u64 y[4]; u64 s[4]; };
