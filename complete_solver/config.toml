@@ -1,0 +1,47 @@
+# sinGRAAL — puzzle #135 configuration
+# Bitcoin puzzle #135: 135-bit ECDLP on secp256k1
+# Target public key (compressed):
+#   0x02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16
+
+[puzzle]
+bits        = 135
+# Range: [2^134, 2^135)
+range_low   = "0x4000000000000000000000000000000000"
+range_high  = "0x7fffffffffffffffffffffffffffffffff"
+target_pubkey = "02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16"
+
+[kangaroo]
+# Distinguished point threshold: 2^dp_bits LSBs == 0
+dp_bits     = 20
+# Number of kangaroos per GPU thread block
+# Tame = 512, Wild = 512 (1024 total per block)
+tame_count  = 512
+wild_count  = 512
+# Jump table: 29 bands, geometric spread r = 2^28
+jump_bands  = 29
+jump_r      = 268435456   # 2^28
+# Dead-wild restart: every N seconds, refresh this fraction of wild animals
+dead_restart_secs    = 300
+dead_restart_fraction = 0.10
+
+[gpu]
+# CUDA architecture — override with CUDA_ARCH env var at build time
+arch        = "sm_80"
+# Blocks and threads (tuned for A100)
+blocks      = 256
+threads     = 128
+# Warp ballot DP coalescing (v8): enabled
+warp_ballot = true
+# Persistent kernel: runs until solution found
+persistent  = true
+
+[distributed]
+# SGR2 coordinator port
+port        = 5135
+# Coordinator listen address (when running --serve)
+listen      = "0.0.0.0:5135"
+
+[output]
+checkpoint_file  = "singraal_checkpoint.bin"
+checkpoint_secs  = 60
+log_interval_secs = 10
