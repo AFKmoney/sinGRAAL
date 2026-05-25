@@ -8,7 +8,7 @@ secp256k1, ciblant le puzzle Bitcoin #135 (clé 135 bits).
 ### Structure du dépôt
 
 ```
-complete_solver/          ← SOLVEUR CANONIQUE (utiliser celui-ci)
+singraal/          ← SOLVEUR CANONIQUE (utiliser celui-ci)
   src/
     main.rs               — Orchestration Rust, table DP, coordinateur
     secp.rs               — Arithmétique secp256k1 CPU (scalar_mul, canonical_x...)
