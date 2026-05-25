@@ -1,0 +1,17 @@
+[package]
+name    = "bsgs2d"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "bsgs2d"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+hex  = "0.4"
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
