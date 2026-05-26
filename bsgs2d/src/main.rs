@@ -91,9 +91,13 @@ struct Args {
     #[arg(long)]
     prune: bool,
 
-    /// Benchmarker le taux de rejet du filtre Coppersmith (N blocs aléatoires).
+    /// Benchmarker le taux de rejet du filtre Coppersmith univarié (N blocs aléatoires).
     #[arg(long)]
     prune_bench: bool,
+
+    /// Benchmarker le taux de rejet du filtre Coppersmith bivarié (δ et ε simultanés).
+    #[arg(long)]
+    prune_bivar: bool,
 
     /// Afficher les estimations sans lancer la recherche.
     #[arg(long)]
@@ -617,21 +621,38 @@ fn main() {
         lll::print_lll_report(args.range_bits);
     }
 
-    // ── Benchmark filtre Coppersmith ──────────────────────────────────────────
+    // ── Benchmark filtre Coppersmith univarié ────────────────────────────────
     if args.prune_bench {
         let block_bits = args.block_bits.unwrap_or(5);
-        // Utiliser target_x si fourni, sinon un x quelconque pour le bench
-        let dummy_x = GX; // x de G comme cible de bench
+        let dummy_x = GX;
         let pruner = coppersmith::LatticePruner::new(dummy_x, 8);
         let n_blocks = 1000u64;
-        eprintln!("[prune-bench] block_bits={block_bits}  dim=8  n_blocks={n_blocks}");
+        eprintln!("[prune-bench] univarié  block_bits={block_bits}  dim=8  n_blocks={n_blocks}");
         let t0 = std::time::Instant::now();
         let rate = pruner.benchmark_rejection_rate(block_bits, n_blocks, args.range_bits);
         eprintln!("[prune-bench] Taux de rejet : {:.1}%  ({:.2}s)",
             rate * 100.0, t0.elapsed().as_secs_f64());
-        eprintln!("[prune-bench] Interprétation :");
-        eprintln!("  > 99% → filtre efficace, chaque bloc géant évite 2^{block_bits} op EC");
-        eprintln!("  ~0%   → filtre non-discriminant (base S₃ sans x_right fixé)");
+        eprintln!("  > 99% → filtre efficace");
+        eprintln!("  ~20%  → baseline univarié observé");
+        if !args.estimate_only { println!(); }
+    }
+
+    // ── Benchmark filtre Coppersmith bivarié ─────────────────────────────────
+    if args.prune_bivar {
+        let block_bits = args.block_bits.unwrap_or(5);
+        let dummy_x = GX;
+        let pruner = coppersmith::LatticePruner::new(dummy_x, 8);
+        let n_blocks = 1000u64;
+        eprintln!("[prune-bivar] bivarié  block_bits={block_bits}  dim=15 (m=2)  n_blocks={n_blocks}");
+        eprintln!("[prune-bivar] lattice Jochemsz-May m=2, S₃(A+δ, B+ε, x_P), δ,ε ∈ [0,2^{block_bits})");
+        let t0 = std::time::Instant::now();
+        let rate = pruner.benchmark_bivariate_rejection_rate(block_bits, n_blocks, args.range_bits);
+        eprintln!("[prune-bivar] Taux de rejet : {:.1}%  ({:.2}s)",
+            rate * 100.0, t0.elapsed().as_secs_f64());
+        eprintln!("[prune-bivar] Interprétation :");
+        eprintln!("  > 99% → chaque paire (bloc_G, bloc_D) prouvée vide en O(dim³) LLL");
+        eprintln!("  ~50%  → gain ×2 sur univarié");
+        eprintln!("  < 20% → bivarié moins efficace qu'univarié (bornes HG trop larges)");
         if !args.estimate_only { println!(); }
     }
 
