@@ -54,7 +54,7 @@ use std::time::Instant;
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
-#[command(name = "bsgs2d", about = "BSGS 1D/2D-GLV 6-aut secp256k1 — utile jusqu'à ~50 bits")]
+#[command(name = "bsgs2d", about = "BSGS 1D/2D-GLV/Semaev-MitM 6-aut secp256k1")]
 struct Args {
     #[arg(long, default_value = "")]
     target_x: String,
@@ -65,13 +65,21 @@ struct Args {
     #[arg(long, default_value = "40")]
     range_bits: u32,
 
-    /// baby_bits : M = 2^baby_bits per dimension.
+    /// baby_bits : M = 2^baby_bits par dimension (BSGS 1D/2D).
     #[arg(long)]
     baby_bits: Option<u32>,
 
     /// Activer le mode 2D GLV : baby table (a₁,a₂), giant (j₁,j₂).
     #[arg(long)]
     glv: bool,
+
+    /// Activer le mode Semaev Meet-in-the-Middle (arbre de Semaev).
+    #[arg(long)]
+    semaev: bool,
+
+    /// Bits par bloc pour Semaev MitM (défaut : range_bits/4, arrondi en haut).
+    #[arg(long)]
+    block_bits: Option<u32>,
 
     /// Afficher les estimations sans lancer la recherche.
     #[arg(long)]
@@ -404,6 +412,181 @@ fn random_key(seed: u64, range_bits: u32) -> Fe {
     k
 }
 
+// ─── Semaev Tree Meet-in-the-Middle ──────────────────────────────────────────
+//
+// k = Σ_{i=0}^{B-1} v_i · 2^(i·block_bits)   v_i ∈ [0, 2^block_bits)
+// G_i = 2^(i·block_bits) · G
+//
+// Gauche (blocs 0..L) :
+//   T[canonical_x(Σ v_i·G_i)] = k_gauche    pour tous (v_0,...,v_{L-1})
+//
+// Droite (blocs L..B) :
+//   query = P − Σ v_j·G_j
+//   si canonical_x(query) ∈ T → récupération 6-aut : k = α·k_G + k_D
+
+// 2^exp comme scalaire Fe (exp < 256)
+fn pow2_fe(exp: u32) -> Fe {
+    let mut s = [0u64; 4];
+    if exp < 256 {
+        s[(exp / 64) as usize] |= 1u64 << (exp % 64);
+    }
+    s
+}
+
+// Récupération 6-aut après collision canonical_x :
+//   α(left_sum) + right_sum = P  →  k = α·k_gauche + k_droite
+fn semaev_recover_6aut(sc_left: Fe, sc_right: Fe, target: Pt, range_bits: u32) -> Option<Fe> {
+    let alphas: [Fe; 6] = [
+        [1,0,0,0], sc_neg([1,0,0,0]),
+        LAMBDA,    sc_neg(LAMBDA),
+        LAMBDA2,   sc_neg(LAMBDA2),
+    ];
+    for alpha in alphas {
+        let k = sc_add(sc_mul(alpha, sc_left), sc_right);
+        if !in_range(k, range_bits) { continue; }
+        let pt = scalar_mul(G, k);
+        if !pt.inf && pt.x == target.x && pt.y == target.y { return Some(k); }
+    }
+    None
+}
+
+// Construction récursive de la table gauche (incrémentale, 0 scalar_mul)
+fn semaev_left_recurse(
+    table:        &mut HashMap<[u64;4], Fe>,
+    base_pts:     &[Pt],
+    base_scalars: &[Fe],
+    block_size:   u64,
+    depth:        usize,
+    pt:           Pt,
+    sc:           Fe,
+) {
+    if depth == base_pts.len() {
+        if !pt.inf {
+            let cx = canonical_x(pt.x);
+            table.entry(cx).or_insert(sc);
+        }
+        return;
+    }
+    let gi = base_pts[depth];
+    let si = base_scalars[depth];
+    let mut cur_pt = pt;
+    let mut cur_sc = sc;
+    for _ in 0..block_size {
+        semaev_left_recurse(table, base_pts, base_scalars, block_size, depth + 1, cur_pt, cur_sc);
+        cur_pt = pt_add(cur_pt, gi);
+        cur_sc = sc_add(cur_sc, si);
+    }
+}
+
+// Recherche droite récursive (incrémentale, early exit dès solution trouvée)
+#[allow(clippy::too_many_arguments)]
+fn semaev_right_recurse(
+    table:        &HashMap<[u64;4], Fe>,
+    neg_pts:      &[Pt],   // -G_{L+i} pour chaque dimension droite
+    base_scalars: &[Fe],   // pas scalaire par dimension droite
+    block_size:   u64,
+    depth:        usize,
+    query:        Pt,      // P − partial_right_sum courant
+    sc_right:     Fe,
+    target:       Pt,
+    range_bits:   u32,
+    found:        &mut Option<Fe>,
+    steps:        &mut u64,
+    t0:           &Instant,
+    total_steps:  u64,
+) {
+    if found.is_some() { return; }
+
+    if depth == neg_pts.len() {
+        *steps += 1;
+        if *steps & 0x3FFFF == 0 {
+            eprint!("\r[semaev-R] {}/{total_steps}  ({:.1}%)  {:.2}s   ",
+                steps, *steps as f64 / total_steps as f64 * 100.0,
+                t0.elapsed().as_secs_f64());
+        }
+        if !query.inf {
+            let cx = canonical_x(query.x);
+            if let Some(&sc_left) = table.get(&cx) {
+                if let Some(k) = semaev_recover_6aut(sc_left, sc_right, target, range_bits) {
+                    *found = Some(k);
+                }
+            }
+        }
+        return;
+    }
+    let gi_neg = neg_pts[depth];
+    let si     = base_scalars[depth];
+    let mut cur_query = query;
+    let mut cur_sc    = sc_right;
+    for _ in 0..block_size {
+        if found.is_some() { return; }
+        semaev_right_recurse(
+            table, neg_pts, base_scalars, block_size,
+            depth + 1, cur_query, cur_sc, target, range_bits,
+            found, steps, t0, total_steps,
+        );
+        cur_query = pt_add(cur_query, gi_neg);
+        cur_sc    = sc_add(cur_sc, si);
+    }
+}
+
+fn run_semaev(target: Pt, range_bits: u32, block_bits: u32) -> Option<Fe> {
+    // Nombre de blocs (toujours pair pour équilibrer gauche/droite)
+    let n_blocks = {
+        let nb = ((range_bits + block_bits - 1) / block_bits).max(2);
+        if nb % 2 == 1 { nb + 1 } else { nb }
+    };
+    let left_count  = (n_blocks / 2) as usize;
+    let right_count = left_count;
+    let block_size  = 1u64 << block_bits;
+
+    let left_entries  = (block_size as u128).pow(left_count as u32);
+    let right_entries = (block_size as u128).pow(right_count as u32);
+
+    eprintln!("[semaev] range_bits={range_bits}  block_bits={block_bits}  n_blocks={n_blocks}  block_size={block_size}");
+    eprintln!("[semaev] gauche : {left_count} blocs → {left_entries} entrées");
+    eprintln!("[semaev] droite : {right_count} blocs → {right_entries} requêtes");
+
+    // G_i = 2^(i·block_bits) · G
+    let base_pts: Vec<Pt> = (0..n_blocks)
+        .map(|i| scalar_mul(G, pow2_fe(i * block_bits)))
+        .collect();
+
+    // Scalaires de pas par dimension : 2^(i·block_bits)
+    let base_scalars: Vec<Fe> = (0..n_blocks)
+        .map(|i| pow2_fe(i * block_bits))
+        .collect();
+
+    // ── Table gauche ──────────────────────────────────────────────────────────
+    eprintln!("[semaev-L] Construction...");
+    let t_left = Instant::now();
+    let mut table: HashMap<[u64;4], Fe> = HashMap::with_capacity(left_entries as usize);
+    semaev_left_recurse(
+        &mut table,
+        &base_pts[..left_count],
+        &base_scalars[..left_count],
+        block_size, 0, INF, [0u64;4],
+    );
+    eprintln!("[semaev-L] {} entrées en {:.3}s", table.len(), t_left.elapsed().as_secs_f64());
+
+    // ── Recherche droite ──────────────────────────────────────────────────────
+    eprintln!("[semaev-R] Recherche...");
+    let neg_right_pts: Vec<Pt> = base_pts[left_count..].iter().map(|&p| pt_neg(p)).collect();
+    let total_steps = right_entries.min(u64::MAX as u128) as u64;
+    let mut found: Option<Fe> = None;
+    let mut steps = 0u64;
+    let t0 = Instant::now();
+
+    semaev_right_recurse(
+        &table, &neg_right_pts, &base_scalars[left_count..],
+        block_size, 0, target, [0u64;4], target, range_bits,
+        &mut found, &mut steps, &t0, total_steps,
+    );
+    eprintln!("\r[semaev-R] terminé en {:.3}s  ({steps} requêtes)          ",
+        t0.elapsed().as_secs_f64());
+    found
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -415,8 +598,10 @@ fn main() {
         bb
     });
 
-    print_feasibility(args.range_bits, baby_bits, args.glv);
-    println!();
+    if !args.semaev {
+        print_feasibility(args.range_bits, baby_bits, args.glv);
+        println!();
+    }
 
     if args.estimate_only { return; }
 
@@ -452,8 +637,15 @@ fn main() {
         (1u64 << args.range_bits).saturating_sub(1)
     };
 
-    // ── Dispatch 1D / 2D ──────────────────────────────────────────────────────
-    let result = if args.glv {
+    // ── Dispatch 1D / 2D / Semaev ────────────────────────────────────────────
+    let result = if args.semaev {
+        let block_bits = args.block_bits.unwrap_or_else(|| {
+            let bb = ((args.range_bits + 3) / 4).max(3).min(20);
+            eprintln!("[auto] block_bits = {bb}");
+            bb
+        });
+        run_semaev(target, args.range_bits, block_bits)
+    } else if args.glv {
         let k2_bits = glv_k2_bits(args.range_bits);
         let n2 = if k2_bits == 0 { 1u64 }
                  else if k2_bits >= 64 { u64::MAX }
