@@ -277,14 +277,24 @@ fn make_tame(total_idx: u32, range_bits: u32) -> (Pt, Fe) {
 }
 
 fn make_wild(animal_idx: u32, gpu_idx: usize, target: Pt, range_bits: u32) -> (Pt, [u64;4]) {
+    // Generate 4 independent pseudo-random words from (gpu_idx, animal_idx) seed.
+    // xorshift64 chained 4 times → unique, well-distributed 256-bit offset.
+    // Critical for range_bits > 64: offset must cover all bits of the search space,
+    // otherwise wild animals cluster near target and never explore the full range.
     let seed: u64 = ((gpu_idx as u64).wrapping_mul(0x9e3779b97f4a7c15))
         ^ (animal_idx as u64).wrapping_mul(0x6c62272e07bb0142);
-    let mut x = seed ^ 0xdeadbeefcafe0000;
-    x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+    let xorshift = |mut v: u64| -> u64 {
+        v ^= v << 13; v ^= v >> 7; v ^= v << 17; v
+    };
+    let w0 = xorshift(seed ^ 0xdeadbeefcafe0000);
+    let w1 = xorshift(w0  ^ 0x1234567890abcdef);
+    let w2 = xorshift(w1  ^ 0xfedcba9876543210);
+    let w3 = xorshift(w2  ^ 0x0f1e2d3c4b5a6978);
+
     let mask_word = ((range_bits / 64) as usize).min(3);
     let mask_bit  = range_bits % 64;
-    let mut offset = [0u64; 4];
-    offset[0] = x;
+    let mut offset = [w0, w1, w2, w3];
+    // Zero all words above the range boundary, mask the top word.
     if mask_word < 4 {
         offset[mask_word] &= if mask_bit == 0 { 0 } else { (1u64 << mask_bit) - 1 };
         for i in (mask_word + 1)..4 { offset[i] = 0; }
