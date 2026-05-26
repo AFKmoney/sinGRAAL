@@ -247,6 +247,8 @@ pub fn pt_add(a: Pt, b: Pt) -> Pt {
     Pt { x: x3, y: y3, inf: false }
 }
 
+pub fn pt_dbl_pub(a: Pt) -> Pt { pt_dbl(a) }
+
 fn pt_dbl(a: Pt) -> Pt {
     if a.inf || a.y == [0u64;4] { return INF; }
     let lam = fp_mul(fp_mul([3,0,0,0], fp_sqr(a.x)), fp_inv(fp_add(a.y, a.y)));
