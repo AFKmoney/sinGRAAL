@@ -27,7 +27,7 @@
 
 use num_bigint::{BigInt, ToBigInt};
 use num_traits::{Zero, One, Signed, ToPrimitive};
-use crate::secp::{Fe, fp_mul, fp_sub, fp_add, fp_neg, fp_inv, FIELD_P, fe_lt};
+use crate::secp::{Fe, fp_mul, fp_sub, fp_add, fp_neg, fp_inv, FIELD_P, fe_lt, BETA, BETA2};
 
 // ─── Conversion Fe ↔ BigInt ──────────────────────────────────────────────────
 
@@ -55,6 +55,46 @@ pub fn bigint_to_fe(n: &BigInt) -> Fe {
 }
 
 fn p_bigint() -> BigInt { fe_to_bigint(FIELD_P) }
+
+/// Applique β^k (k ∈ {0,1,2}) à une coordonnée x (BigInt mod p).
+/// β^0·x = x,  β^1·x = β·x mod p,  β^2·x = β²·x mod p.
+pub fn beta_pow_bigint(x: &BigInt, k: u8) -> BigInt {
+    match k {
+        0 => x.clone(),
+        1 => {
+            let beta = fe_to_bigint(BETA);
+            fp_mod(&(x * &beta))
+        }
+        2 => {
+            let beta2 = fe_to_bigint(BETA2);
+            fp_mod(&(x * &beta2))
+        }
+        _ => x.clone(),
+    }
+}
+
+/// Cherche parmi les 9 combinaisons (β^i·x_L, β^j·x_R) celle où c₀₀=0.
+/// Retourne (i, j, coeffs) pour la combinaison gagnante, ou (0,0,coeffs_0) si aucune.
+pub fn find_glv_coeffs(
+    x_l: &BigInt,
+    x_r: &BigInt,
+    x_p: &BigInt,
+    p:   &BigInt,
+) -> (u8, u8, [BigInt; 6]) {
+    for i in 0u8..3 {
+        for j in 0u8..3 {
+            let xl_k = beta_pow_bigint(x_l, i);
+            let xr_k = beta_pow_bigint(x_r, j);
+            let c = s3_bivariate_coeffs(&xl_k, &xr_k, x_p, p);
+            if c[0].is_zero() {
+                return (i, j, c);
+            }
+        }
+    }
+    // Aucune combinaison exacte — retourner (0,0) avec coeffs bruts
+    let c = s3_bivariate_coeffs(x_l, x_r, x_p, p);
+    (0, 0, c)
+}
 
 fn fp_mod(a: &BigInt) -> BigInt {
     let p = p_bigint();
@@ -312,10 +352,12 @@ impl LatticePruner {
 
     /// Bivarié m=2 (Jochemsz-May) : teste si la paire (δ∈[0,X), ε∈[0,X)) peut contenir
     /// une solution de S₃(A+δ, B+ε, x_P) ≡ 0 (mod p).
-    /// Matrice 15×15, bound p²/√15. false = REJET prouvé.
+    /// Essaie les 9 combinaisons GLV (β^i·A, β^j·B) — De-GLV fix.
+    /// Matrice 15×15, bound p⁴/15. false = REJET prouvé.
     pub fn is_block_pair_viable(&self, start_a: &BigInt, start_b: &BigInt, block_bits: u32) -> bool {
         let x_big = BigInt::one() << block_bits as usize;
-        let coeffs = s3_bivariate_coeffs(start_a, start_b, &self.target_x, &self.p);
+        // Essayer les 9 combinaisons GLV pour trouver c₀₀=0 ou la moins mauvaise
+        let (_i, _j, coeffs) = find_glv_coeffs(start_a, start_b, &self.target_x, &self.p);
         if coeffs[0].is_zero() { return true; }
 
         let mat = build_macaulay_bivariate_m2(&coeffs, &x_big, &self.p);
