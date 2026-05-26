@@ -91,9 +91,17 @@ struct Args {
     #[arg(long)]
     prune: bool,
 
-    /// Benchmarker le taux de rejet du filtre Coppersmith (N blocs aléatoires).
+    /// Benchmarker le taux de rejet du filtre Coppersmith univarié (N blocs aléatoires).
     #[arg(long)]
     prune_bench: bool,
+
+    /// Benchmarker le taux de rejet du filtre Coppersmith bivarié (δ et ε simultanés).
+    #[arg(long)]
+    prune_bivar: bool,
+
+    /// Golden Block Test : valider que le bloc solution survit au filtre bivarié m=2.
+    #[arg(long)]
+    golden_test: bool,
 
     /// Afficher les estimations sans lancer la recherche.
     #[arg(long)]
@@ -601,6 +609,123 @@ fn run_semaev(target: Pt, range_bits: u32, block_bits: u32) -> Option<Fe> {
     found
 }
 
+// ─── Golden Block Test ────────────────────────────────────────────────────────
+//
+// Valide que le filtre bivarié m=2 laisse SURVIVRE le bloc contenant la vraie clé.
+//
+// Protocole :
+//   k = random_key(seed, range_bits)   → clé connue
+//   target = k · G
+//   Split 2 blocs : k = v_L · G_L + v_R · G_R
+//     G_L = G,  G_R = 2^(range_bits/2) · G
+//     v_L = k & mask,  v_R = k >> half
+//   x_L = x(v_L · G_L),  x_R = x(v_R · G_R)
+//   Vérif : S₃(x_L, x_R, x_P) = 0  ✓
+//
+//   Block base :  A = x_L - (x_L mod X),  B = x_R - (x_R mod X)
+//   Roots dans le bloc :  δ₀ = x_L mod X,  ε₀ = x_R mod X
+//   Appel filtre :  is_block_pair_viable(A, B, block_bits)  → doit retourner TRUE
+fn run_golden_block_test(seed: u64, range_bits: u32, block_bits: u32) {
+    use coppersmith::{fe_to_bigint, s3_bivariate_coeffs, find_glv_coeffs,
+                     build_macaulay_bivariate_m2,
+                     lll_reduce_bigint, norm_sq_bigint, LatticePruner};
+    use num_bigint::BigInt;
+    use num_traits::Zero;
+
+    let k = random_key(seed, range_bits);
+    let target = scalar_mul(G, k);
+    eprintln!("[golden] k     = 0x{}", fe_to_hex(k));
+    eprintln!("[golden] x_P   = 0x{}", fe_to_hex(target.x));
+
+    // Split : v_L = lower (range_bits/2) bits, v_R = upper bits
+    let half = range_bits / 2;
+    let g_r  = scalar_mul(G, pow2_fe(half));
+
+    // v_L : k & ((1<<half)-1)
+    let mut v_l = k;
+    let wl = (half / 64) as usize;
+    let bl = half % 64;
+    if wl < 4 { v_l[wl] &= if bl == 0 { 0 } else { (1u64<<bl)-1 }; }
+    for i in (wl+1)..4 { v_l[i] = 0; }
+
+    // v_R : k >> half  (multi-word right shift)
+    let mut v_r = [0u64; 4];
+    let shift_words = (half / 64) as usize;
+    let shift_bits  = (half % 64) as u32;
+    for i in 0..(4-shift_words) {
+        v_r[i] = k[i + shift_words] >> shift_bits;
+        if shift_bits > 0 && i + shift_words + 1 < 4 {
+            v_r[i] |= k[i + shift_words + 1] << (64 - shift_bits);
+        }
+    }
+
+    let pt_l = scalar_mul(G,   v_l);
+    let pt_r = scalar_mul(g_r, v_r);
+    let sum  = pt_add(pt_l, pt_r);
+
+    let ok = !sum.inf && sum.x == target.x && sum.y == target.y;
+    eprintln!("[golden] split check (pt_L + pt_R == target) : {ok}");
+    if !ok {
+        eprintln!("[golden] ERREUR split — abort");
+        return;
+    }
+
+    let x_l = fe_to_bigint(pt_l.x);
+    let x_r = fe_to_bigint(pt_r.x);
+    let x_p = fe_to_bigint(target.x);
+    let p   = fe_to_bigint(FIELD_P);
+
+    // Vérif S₃(x_L, x_R, x_P) ≡ 0 (mod p) — tester les 9 combinaisons GLV
+    let (ei, ej, coeffs_exact) = find_glv_coeffs(&x_l, &x_r, &x_p, &p);
+    eprintln!("[golden] S₃(β^{}·x_L, β^{}·x_R, x_P) mod p = {}  (doit être 0)",
+        ei, ej, &coeffs_exact[0]);
+    if !coeffs_exact[0].is_zero() {
+        eprintln!("[golden] AVERTISSEMENT : aucune combinaison GLV ne donne c₀₀=0 — vérifier split");
+    }
+
+    // Block boundaries (sur x_L et x_R bruts — les β^k sont appliqués dans find_glv_coeffs)
+    let xblk = BigInt::from(1u64) << block_bits as usize;
+    let a_base = &x_l - (&x_l % &xblk);
+    let b_base = &x_r - (&x_r % &xblk);
+    let delta0 = &x_l - &a_base;
+    let eps0   = &x_r - &b_base;
+
+    eprintln!("[golden] block_bits={block_bits}  X={}", &xblk);
+    eprintln!("[golden] δ₀ = {delta0}  (doit être < {xblk})");
+    eprintln!("[golden] ε₀ = {eps0}  (doit être < {xblk})");
+
+    // Calculer manuellement norme LLL vs borne pour le bloc solution
+    // Utiliser find_glv_coeffs sur les bases de blocs (β^i·A, β^j·B)
+    let (gi, gj, coeffs) = find_glv_coeffs(&a_base, &b_base, &x_p, &p);
+    eprintln!("[golden] GLV combo (i={gi}, j={gj}) : c₀₀ = S₃(β^{gi}·A, β^{gj}·B, x_P)");
+    eprintln!("[golden] c₀₀ ≠ 0 : {}", !coeffs[0].is_zero());
+
+    let mat     = build_macaulay_bivariate_m2(&coeffs, &xblk, &p);
+    let reduced = lll_reduce_bigint(mat);
+
+    let shortest = reduced.iter()
+        .map(|row| norm_sq_bigint(row))
+        .filter(|n| !n.is_zero())
+        .min()
+        .unwrap_or_else(BigInt::zero);
+
+    let p2      = &p * &p;
+    let bound   = (&p2 * &p2) / 15i64;
+
+    let survives = &shortest < &bound;
+
+    eprintln!("[golden] norm²  ≈ 2^{:.1}", shortest.bits() as f64);
+    eprintln!("[golden] bound² ≈ 2^{:.1}  (p⁴/15)", bound.bits() as f64);
+    eprintln!("[golden] Golden Block {} → filtre {}",
+        if survives { "SURVIT ✓" } else { "TUÉ ✗" },
+        if survives { "GO (vert)" } else { "NO-GO (rouge)" });
+
+    // Tester aussi via l'API haut-niveau
+    let pruner  = LatticePruner::new(target.x, 8);
+    let api_ok  = pruner.is_block_pair_viable(&a_base, &b_base, block_bits);
+    eprintln!("[golden] is_block_pair_viable API : {api_ok}");
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -617,21 +742,47 @@ fn main() {
         lll::print_lll_report(args.range_bits);
     }
 
-    // ── Benchmark filtre Coppersmith ──────────────────────────────────────────
+    // ── Golden Block Test ────────────────────────────────────────────────────
+    if args.golden_test {
+        let block_bits = args.block_bits.unwrap_or(5);
+        let seed_s = args.seed.trim_start_matches("0x");
+        let seed   = u64::from_str_radix(seed_s, 16).expect("--seed: hex u64");
+        run_golden_block_test(seed, args.range_bits, block_bits);
+        return;
+    }
+
+    // ── Benchmark filtre Coppersmith univarié ────────────────────────────────
     if args.prune_bench {
         let block_bits = args.block_bits.unwrap_or(5);
-        // Utiliser target_x si fourni, sinon un x quelconque pour le bench
-        let dummy_x = GX; // x de G comme cible de bench
+        let dummy_x = GX;
         let pruner = coppersmith::LatticePruner::new(dummy_x, 8);
         let n_blocks = 1000u64;
-        eprintln!("[prune-bench] block_bits={block_bits}  dim=8  n_blocks={n_blocks}");
+        eprintln!("[prune-bench] univarié  block_bits={block_bits}  dim=8  n_blocks={n_blocks}");
         let t0 = std::time::Instant::now();
         let rate = pruner.benchmark_rejection_rate(block_bits, n_blocks, args.range_bits);
         eprintln!("[prune-bench] Taux de rejet : {:.1}%  ({:.2}s)",
             rate * 100.0, t0.elapsed().as_secs_f64());
-        eprintln!("[prune-bench] Interprétation :");
-        eprintln!("  > 99% → filtre efficace, chaque bloc géant évite 2^{block_bits} op EC");
-        eprintln!("  ~0%   → filtre non-discriminant (base S₃ sans x_right fixé)");
+        eprintln!("  > 99% → filtre efficace");
+        eprintln!("  ~20%  → baseline univarié observé");
+        if !args.estimate_only { println!(); }
+    }
+
+    // ── Benchmark filtre Coppersmith bivarié ─────────────────────────────────
+    if args.prune_bivar {
+        let block_bits = args.block_bits.unwrap_or(5);
+        let dummy_x = GX;
+        let pruner = coppersmith::LatticePruner::new(dummy_x, 8);
+        let n_blocks = 1000u64;
+        eprintln!("[prune-bivar] bivarié  block_bits={block_bits}  dim=15 (m=2)  n_blocks={n_blocks}");
+        eprintln!("[prune-bivar] lattice Jochemsz-May m=2, S₃(A+δ, B+ε, x_P), δ,ε ∈ [0,2^{block_bits})");
+        let t0 = std::time::Instant::now();
+        let rate = pruner.benchmark_bivariate_rejection_rate(block_bits, n_blocks, args.range_bits);
+        eprintln!("[prune-bivar] Taux de rejet : {:.1}%  ({:.2}s)",
+            rate * 100.0, t0.elapsed().as_secs_f64());
+        eprintln!("[prune-bivar] Interprétation :");
+        eprintln!("  > 99% → chaque paire (bloc_G, bloc_D) prouvée vide en O(dim³) LLL");
+        eprintln!("  ~50%  → gain ×2 sur univarié");
+        eprintln!("  < 20% → bivarié moins efficace qu'univarié (bornes HG trop larges)");
         if !args.estimate_only { println!(); }
     }
 

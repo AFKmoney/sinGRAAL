@@ -27,7 +27,7 @@
 
 use num_bigint::{BigInt, ToBigInt};
 use num_traits::{Zero, One, Signed, ToPrimitive};
-use crate::secp::{Fe, fp_mul, fp_sub, fp_add, fp_neg, fp_inv, FIELD_P, fe_lt};
+use crate::secp::{Fe, fp_mul, fp_sub, fp_add, fp_neg, fp_inv, FIELD_P, fe_lt, BETA, BETA2};
 
 // ─── Conversion Fe ↔ BigInt ──────────────────────────────────────────────────
 
@@ -55,6 +55,46 @@ pub fn bigint_to_fe(n: &BigInt) -> Fe {
 }
 
 fn p_bigint() -> BigInt { fe_to_bigint(FIELD_P) }
+
+/// Applique β^k (k ∈ {0,1,2}) à une coordonnée x (BigInt mod p).
+/// β^0·x = x,  β^1·x = β·x mod p,  β^2·x = β²·x mod p.
+pub fn beta_pow_bigint(x: &BigInt, k: u8) -> BigInt {
+    match k {
+        0 => x.clone(),
+        1 => {
+            let beta = fe_to_bigint(BETA);
+            fp_mod(&(x * &beta))
+        }
+        2 => {
+            let beta2 = fe_to_bigint(BETA2);
+            fp_mod(&(x * &beta2))
+        }
+        _ => x.clone(),
+    }
+}
+
+/// Cherche parmi les 9 combinaisons (β^i·x_L, β^j·x_R) celle où c₀₀=0.
+/// Retourne (i, j, coeffs) pour la combinaison gagnante, ou (0,0,coeffs_0) si aucune.
+pub fn find_glv_coeffs(
+    x_l: &BigInt,
+    x_r: &BigInt,
+    x_p: &BigInt,
+    p:   &BigInt,
+) -> (u8, u8, [BigInt; 6]) {
+    for i in 0u8..3 {
+        for j in 0u8..3 {
+            let xl_k = beta_pow_bigint(x_l, i);
+            let xr_k = beta_pow_bigint(x_r, j);
+            let c = s3_bivariate_coeffs(&xl_k, &xr_k, x_p, p);
+            if c[0].is_zero() {
+                return (i, j, c);
+            }
+        }
+    }
+    // Aucune combinaison exacte — retourner (0,0) avec coeffs bruts
+    let c = s3_bivariate_coeffs(x_l, x_r, x_p, p);
+    (0, 0, c)
+}
 
 fn fp_mod(a: &BigInt) -> BigInt {
     let p = p_bigint();
@@ -280,12 +320,10 @@ impl LatticePruner {
             .min()
             .unwrap_or_else(BigInt::zero);
 
-        // Borne de Howgrave-Graham : ||h||₂ < p^m / sqrt(dim)
-        // Pour m=1 : bound² = p² / dim
+        // HG : survie (true) si et seulement si norm_min < p/√dim
+        // Contraposé : norm_min ≥ p/√dim → aucune racine → REJET (false)
         let bound_sq = (&self.p * &self.p) / (self.dim as i64);
-
-        // REJET si norme minimale >= borne (aucune petite racine possible)
-        shortest_norm_sq >= bound_sq
+        shortest_norm_sq < bound_sq
     }
 
     /// Compte le taux de rejet sur N blocs aléatoires (benchmark)
@@ -300,8 +338,7 @@ impl LatticePruner {
         let xs = |v: u64| -> u64 { let v=v^(v<<13); let v=v^(v>>7); v^(v<<17) };
 
         for i in 0..n_blocks {
-            rng_state = xs(rng_state ^ (i * 0x9e3779b97f4a7c15));
-            // start_a et x_right aléatoires dans [0, 2^range_bits)
+            rng_state = xs(rng_state ^ i.wrapping_mul(0x9e3779b97f4a7c15));
             let start_a = BigInt::from(rng_state & ((1u64 << range_bits.min(63)) - 1));
             rng_state = xs(rng_state);
             let x_right = BigInt::from(rng_state & ((1u64 << range_bits.min(63)) - 1));
@@ -312,4 +349,272 @@ impl LatticePruner {
         }
         rejected as f64 / n_blocks as f64
     }
+
+    /// Bivarié m=2 (Jochemsz-May) : teste si la paire (δ∈[0,X), ε∈[0,X)) peut contenir
+    /// une solution de S₃(A+δ, B+ε, x_P) ≡ 0 (mod p).
+    /// Essaie les 9 combinaisons GLV (β^i·A, β^j·B) — De-GLV fix.
+    /// Matrice 15×15, bound p⁴/15. false = REJET prouvé.
+    pub fn is_block_pair_viable(&self, start_a: &BigInt, start_b: &BigInt, block_bits: u32) -> bool {
+        let x_big = BigInt::one() << block_bits as usize;
+        // Essayer les 9 combinaisons GLV pour trouver c₀₀=0 ou la moins mauvaise
+        let (_i, _j, coeffs) = find_glv_coeffs(start_a, start_b, &self.target_x, &self.p);
+        if coeffs[0].is_zero() { return true; }
+
+        let mat = build_macaulay_bivariate_m2(&coeffs, &x_big, &self.p);
+        let reduced = lll_reduce_bigint(mat);
+
+        let shortest_norm_sq = reduced.iter()
+            .map(|row| norm_sq_bigint(row))
+            .filter(|n| !n.is_zero())
+            .min()
+            .unwrap_or_else(BigInt::zero);
+
+        // HG m=2, dim=15 : survie si norm < p²/√15
+        let p2 = &self.p * &self.p;
+        let bound_sq = (&p2 * &p2) / 15i64;
+        shortest_norm_sq < bound_sq
+    }
+
+    /// Benchmark du taux de rejet bivarié m=2 sur N paires aléatoires
+    pub fn benchmark_bivariate_rejection_rate(
+        &self,
+        block_bits: u32,
+        n_blocks: u64,
+        range_bits: u32,
+    ) -> f64 {
+        let mut rejected = 0u64;
+        let mut rng_state = 0xfedcba9876543210u64;
+        let xs = |v: u64| -> u64 { let v=v^(v<<13); let v=v^(v>>7); v^(v<<17) };
+
+        for i in 0..n_blocks {
+            rng_state = xs(rng_state ^ i.wrapping_mul(0x9e3779b97f4a7c15));
+            let start_a = BigInt::from(rng_state & ((1u64 << range_bits.min(63)) - 1));
+            rng_state = xs(rng_state);
+            let start_b = BigInt::from(rng_state & ((1u64 << range_bits.min(63)) - 1));
+
+            if !self.is_block_pair_viable(&start_a, &start_b, block_bits) {
+                rejected += 1;
+            }
+        }
+        rejected as f64 / n_blocks as f64
+    }
+}
+
+// ─── Coefficients bivariés de S₃(A+x, B+y, w) ───────────────────────────────
+//
+// f(x,y) = S₃(A+x, B+y, w) = Σ c_{ij} x^i y^j  (mod p)
+//
+// Ordre : [c00, c10, c01, c20, c11, c02]   (colonnes : {1, x, y, x², xy, y²})
+//
+// Calculé par dérivées partielles en (x=0, y=0) :
+//   S₃(u,v,w) = (u-v)²w² − 2(u+v)(uv+7)w + (uv-7)²
+//
+//   c20 = c02 = w²
+//   c10 = 2(A-B)w² − 2(2AB+B²+7)w + 2B(AB-7)
+//   c01 = −2(A-B)w² − 2(2AB+A²+7)w + 2A(AB-7)
+//   c11 = −2w² − 4(A+B)w + 4AB − 14
+pub fn s3_bivariate_coeffs(
+    a: &BigInt,
+    b: &BigInt,
+    x_p: &BigInt,
+    _p: &BigInt,
+) -> [BigInt; 6] {
+    let p   = p_bigint();
+    let w   = x_p;
+    let w2  = fp_mod(&(w * w));
+    let ab  = fp_mod(&(a * b));
+    let apb = fp_mod(&(a + b));
+    let amb = fp_mod(&(a - b));       // A - B (peut être négatif → fp_mod OK)
+    let a2  = fp_mod(&(a * a));
+    let b2  = fp_mod(&(b * b));
+    let abm7 = fp_mod(&(&ab - 7));    // AB - 7
+
+    // c00 = S₃(A, B, w)
+    let d2   = fp_mod(&(&amb * &amb));
+    let s    = &apb;
+    let ab7  = fp_mod(&(&ab + 7));
+    let abm7sq = fp_mod(&(&abm7 * &abm7));
+    let c00 = fp_mod(&(&d2 * &w2
+        - 2 * fp_mod(&(s * &ab7)) * w
+        + &abm7sq));
+
+    // c10 = 2(A-B)w² − 2(2AB+B²+7)w + 2B(AB-7)
+    let t1  = fp_mod(&(2 * &amb * &w2));
+    let t2  = fp_mod(&(2 * fp_mod(&(2 * &ab + &b2 + 7)) * w));
+    let t3  = fp_mod(&(2 * b * &abm7));
+    let c10 = fp_mod(&(&t1 + &p - &t2 + &t3));
+
+    // c01 = −2(A-B)w² − 2(2AB+A²+7)w + 2A(AB-7)
+    let t4  = fp_mod(&(2 * fp_mod(&(2 * &ab + &a2 + 7)) * w));
+    let t5  = fp_mod(&(2 * a * &abm7));
+    // -t1 → &p - &t1  (t1 ∈ [0,p) donc p-t1 ∈ (0,p])
+    let c01 = fp_mod(&((&p - &t1) + &p - &t4 + &t5));
+
+    // c20 = w²
+    let c20 = w2.clone();
+
+    // c11 = −2w² − 4(A+B)w + 4AB − 14
+    let t6  = fp_mod(&(2 * &w2));
+    let t7  = fp_mod(&(4 * &apb * w));
+    let t8  = fp_mod(&(4 * &ab));
+    // -2w² - 4(A+B)w + 4AB - 14
+    let c11 = fp_mod(&((&p - &t6) + &p - &t7 + &t8 + &p - 14));
+
+    // c02 = w²
+    let c02 = w2;
+
+    [fp_mod(&c00), fp_mod(&c10), fp_mod(&c01), fp_mod(&c20), fp_mod(&c11), fp_mod(&c02)]
+}
+
+// ─── Matrice de Macaulay bivariée (Jochemsz-May m=1) ─────────────────────────
+//
+// Monomômes (colonnes, scalés) : {1, x·X, y·Y, x²·X², xy·XY, y²·Y²}
+//
+// Ligne 0 : f(x,y) scalé            → [c00, c10·X, c01·Y, c20·X², c11·XY, c02·Y²]
+// Ligne 1 : p                       → [p,   0,     0,    0,      0,      0      ]
+// Ligne 2 : p·x scalé               → [0,   p·X,   0,    0,      0,      0      ]
+// Ligne 3 : p·y scalé               → [0,   0,     p·Y,  0,      0,      0      ]
+// Ligne 4 : p·x² scalé              → [0,   0,     0,    p·X²,   0,      0      ]
+// Ligne 5 : p·xy scalé              → [0,   0,     0,    0,      p·XY,   0      ]
+//
+// La colonne y² n'a pas de ligne p dédiée — c02=w²≠0 assure le rang plein.
+pub fn build_macaulay_bivariate(
+    coeffs: &[BigInt; 6],
+    x_big: &BigInt,
+    y_big: &BigInt,
+    p: &BigInt,
+) -> Vec<Vec<BigInt>> {
+    let dim = 6usize;
+    let mut mat = vec![vec![BigInt::zero(); dim]; dim];
+    let [c00, c10, c01, c20, c11, c02] = coeffs;
+
+    let x2 = x_big * x_big;
+    let y2 = y_big * y_big;
+    let xy = x_big * y_big;
+
+    // Ligne 0 : f scalé
+    mat[0][0] = c00.clone();
+    mat[0][1] = c10 * x_big;
+    mat[0][2] = c01 * y_big;
+    mat[0][3] = c20 * &x2;
+    mat[0][4] = c11 * &xy;
+    mat[0][5] = c02 * &y2;
+
+    // Lignes p-shift
+    mat[1][0] = p.clone();
+    mat[2][1] = p * x_big;
+    mat[3][2] = p * y_big;
+    mat[4][3] = p * &x2;
+    mat[5][4] = p * &xy;
+
+    mat
+}
+
+// ─── Matrice Jochemsz-May m=2 bivariée (15×15) ───────────────────────────────
+//
+// Monomômes (cols) ordonnés par degré total croissant :
+//   0:(0,0)  1:(1,0)  2:(0,1)  3:(2,0)  4:(1,1)  5:(0,2)
+//   6:(3,0)  7:(2,1)  8:(1,2)  9:(0,3)
+//   10:(4,0) 11:(3,1) 12:(2,2) 13:(1,3) 14:(0,4)
+//   Colonne (a,b) scalée par X^a·Y^b  (X=Y=2^block_bits).
+//
+// 15 lignes :
+//   Ligne 0      : f²(xX,yY)
+//   Lignes 1-6   : p·{1,x,y,x²,xy,y²}·f(xX,yY)
+//   Lignes 7-14  : p²·{1,x,y,x²,xy,y²,x³,x²y}  (diagonale)
+//
+// Borne HG m=2 : survie ⟺ norm_min² < p⁴/15
+pub fn build_macaulay_bivariate_m2(coeffs: &[BigInt; 6], x_big: &BigInt, p: &BigInt) -> Vec<Vec<BigInt>> {
+    let [c00, c10, c01, c20, c11, c02] = coeffs;
+    let dim = 15usize;
+    let mut mat = vec![vec![BigInt::zero(); dim]; dim];
+
+    let x  = x_big;
+    let x2 = x * x;
+    let x3 = &x2 * x;
+    let x4 = &x3 * x;
+    // X = Y (blocs carrés)
+    let y2  = &x2;
+    let y3  = &x3;
+    let y4  = &x4;
+    let xy   = x * x;      // X·Y = X²
+    let x2y  = &x2 * x;    // X²·Y = X³
+    let xy2  = x * &x2;    // X·Y² = X³
+    let x2y2 = &x2 * &x2;  // X²·Y² = X⁴
+    let x3y  = &x3 * x;    // X³·Y = X⁴
+    let xy3  = x * &x3;    // X·Y³ = X⁴
+    let p2   = p * p;
+
+    // ── Ligne 0 : f²(xX,yY) ──────────────────────────────────────────────────
+    mat[0][ 0] = c00 * c00;
+    mat[0][ 1] = 2 * c00 * c10 * x;
+    mat[0][ 2] = 2 * c00 * c01 * x;           // Y=X
+    mat[0][ 3] = (c10 * c10 + 2 * c00 * c20) * &x2;
+    mat[0][ 4] = (2 * c10 * c01 + 2 * c00 * c11) * &xy;
+    mat[0][ 5] = (c01 * c01 + 2 * c00 * c02) * y2;
+    mat[0][ 6] = 2 * c10 * c20 * &x3;
+    mat[0][ 7] = (2 * c10 * c11 + 2 * c01 * c20) * &x2y;
+    mat[0][ 8] = (2 * c10 * c02 + 2 * c01 * c11) * &xy2;
+    mat[0][ 9] = 2 * c01 * c02 * y3;
+    mat[0][10] = c20 * c20 * &x4;
+    mat[0][11] = 2 * c20 * c11 * &x3y;
+    mat[0][12] = (2 * c20 * c02 + c11 * c11) * &x2y2;
+    mat[0][13] = 2 * c11 * c02 * &xy3;
+    mat[0][14] = c02 * c02 * y4;
+
+    // ── Lignes 1-6 : p·x^a·y^b·f scalé, (a,b) ∈ {(0,0)…(0,2)} ─────────────
+    // Ligne 1: (0,0)
+    mat[1][0] = p * c00;
+    mat[1][1] = p * c10 * x;
+    mat[1][2] = p * c01 * x;
+    mat[1][3] = p * c20 * &x2;
+    mat[1][4] = p * c11 * &xy;
+    mat[1][5] = p * c02 * y2;
+    // Ligne 2: (1,0) — shift x
+    mat[2][1] = p * c00 * x;
+    mat[2][3] = p * c10 * &x2;
+    mat[2][4] = p * c01 * &xy;
+    mat[2][6] = p * c20 * &x3;
+    mat[2][7] = p * c11 * &x2y;
+    mat[2][8] = p * c02 * &xy2;
+    // Ligne 3: (0,1) — shift y=x
+    mat[3][2] = p * c00 * x;
+    mat[3][4] = p * c10 * &xy;
+    mat[3][5] = p * c01 * y2;
+    mat[3][7] = p * c20 * &x2y;
+    mat[3][8] = p * c11 * &xy2;
+    mat[3][9] = p * c02 * y3;
+    // Ligne 4: (2,0) — shift x²
+    mat[4][ 3] = p * c00 * &x2;
+    mat[4][ 6] = p * c10 * &x3;
+    mat[4][ 7] = p * c01 * &x2y;
+    mat[4][10] = p * c20 * &x4;
+    mat[4][11] = p * c11 * &x3y;
+    mat[4][12] = p * c02 * &x2y2;
+    // Ligne 5: (1,1) — shift xy
+    mat[5][ 4] = p * c00 * &xy;
+    mat[5][ 7] = p * c10 * &x2y;
+    mat[5][ 8] = p * c01 * &xy2;
+    mat[5][11] = p * c20 * &x3y;
+    mat[5][12] = p * c11 * &x2y2;
+    mat[5][13] = p * c02 * &xy3;
+    // Ligne 6: (0,2) — shift y²
+    mat[6][ 5] = p * c00 * y2;
+    mat[6][ 8] = p * c10 * &xy2;
+    mat[6][ 9] = p * c01 * y3;
+    mat[6][12] = p * c20 * &x2y2;
+    mat[6][13] = p * c11 * &xy3;
+    mat[6][14] = p * c02 * y4;
+
+    // ── Lignes 7-14 : p²·monomôme (diagonale) ────────────────────────────────
+    mat[ 7][ 0] = p2.clone();
+    mat[ 8][ 1] = &p2 * x;
+    mat[ 9][ 2] = &p2 * x;      // Y=X
+    mat[10][ 3] = &p2 * &x2;
+    mat[11][ 4] = &p2 * &xy;
+    mat[12][ 5] = &p2 * y2;
+    mat[13][ 6] = &p2 * &x3;
+    mat[14][ 7] = &p2 * &x2y;
+
+    mat
 }
