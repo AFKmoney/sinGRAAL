@@ -45,6 +45,7 @@
 //   puzzle #135   : M=2^67 → 590 exaoctets              → impossible ✗
 
 mod secp;
+mod lll;
 
 use clap::Parser;
 use secp::*;
@@ -80,6 +81,10 @@ struct Args {
     /// Bits par bloc pour Semaev MitM (défaut : range_bits/4, arrondi en haut).
     #[arg(long)]
     block_bits: Option<u32>,
+
+    /// Afficher l'analyse LLL du réseau GLV avant la recherche.
+    #[arg(long)]
+    lll: bool,
 
     /// Afficher les estimations sans lancer la recherche.
     #[arg(long)]
@@ -597,6 +602,11 @@ fn main() {
         eprintln!("[auto] baby_bits = {bb}  (M = 2^{bb})");
         bb
     });
+
+    // ── Analyse LLL (optionnelle) ─────────────────────────────────────────────
+    if args.lll {
+        lll::print_lll_report(args.range_bits);
+    }
 
     if !args.semaev {
         print_feasibility(args.range_bits, baby_bits, args.glv);
