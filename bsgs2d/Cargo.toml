@@ -8,8 +8,10 @@ name = "bsgs2d"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
-hex  = "0.4"
+clap    = { version = "4", features = ["derive"] }
+hex     = "0.4"
+num-bigint = "0.4"
+num-traits = "0.2"
 
 [profile.release]
 opt-level     = 3

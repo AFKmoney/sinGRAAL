@@ -46,6 +46,7 @@
 
 mod secp;
 mod lll;
+mod coppersmith;
 
 use clap::Parser;
 use secp::*;
@@ -85,6 +86,14 @@ struct Args {
     /// Afficher l'analyse LLL du réseau GLV avant la recherche.
     #[arg(long)]
     lll: bool,
+
+    /// Activer le filtre Coppersmith LLL en amont du MitM Semaev.
+    #[arg(long)]
+    prune: bool,
+
+    /// Benchmarker le taux de rejet du filtre Coppersmith (N blocs aléatoires).
+    #[arg(long)]
+    prune_bench: bool,
 
     /// Afficher les estimations sans lancer la recherche.
     #[arg(long)]
@@ -606,6 +615,24 @@ fn main() {
     // ── Analyse LLL (optionnelle) ─────────────────────────────────────────────
     if args.lll {
         lll::print_lll_report(args.range_bits);
+    }
+
+    // ── Benchmark filtre Coppersmith ──────────────────────────────────────────
+    if args.prune_bench {
+        let block_bits = args.block_bits.unwrap_or(5);
+        // Utiliser target_x si fourni, sinon un x quelconque pour le bench
+        let dummy_x = GX; // x de G comme cible de bench
+        let pruner = coppersmith::LatticePruner::new(dummy_x, 8);
+        let n_blocks = 1000u64;
+        eprintln!("[prune-bench] block_bits={block_bits}  dim=8  n_blocks={n_blocks}");
+        let t0 = std::time::Instant::now();
+        let rate = pruner.benchmark_rejection_rate(block_bits, n_blocks, args.range_bits);
+        eprintln!("[prune-bench] Taux de rejet : {:.1}%  ({:.2}s)",
+            rate * 100.0, t0.elapsed().as_secs_f64());
+        eprintln!("[prune-bench] Interprétation :");
+        eprintln!("  > 99% → filtre efficace, chaque bloc géant évite 2^{block_bits} op EC");
+        eprintln!("  ~0%   → filtre non-discriminant (base S₃ sans x_right fixé)");
+        if !args.estimate_only { println!(); }
     }
 
     if !args.semaev {
