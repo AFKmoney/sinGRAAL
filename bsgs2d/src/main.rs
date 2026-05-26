@@ -47,6 +47,7 @@
 mod secp;
 mod lll;
 mod coppersmith;
+mod lll_earlyabort;
 
 use clap::Parser;
 use secp::*;
@@ -102,6 +103,10 @@ struct Args {
     /// Golden Block Test : valider que le bloc solution survit au filtre bivarié m=2.
     #[arg(long)]
     golden_test: bool,
+
+    /// Benchmarker le Kill Switch PNC (GS partiel + LLL f64 early-abort).
+    #[arg(long)]
+    pnc_bench: bool,
 
     /// Test du juge de paix : évaluer S₃(x_L, x_R, x_P) sur la vraie racine → doit donner 0.
     #[arg(long)]
@@ -981,6 +986,20 @@ fn main() {
     if !args.semaev {
         print_feasibility(args.range_bits, baby_bits, args.glv);
         println!();
+    }
+
+    // ── Benchmark Kill Switch PNC ─────────────────────────────────────────────
+    if args.pnc_bench {
+        let block_bits = args.block_bits.unwrap_or(5);
+        eprintln!("[pnc-bench] Kill Switch PNC — GS partiel f64 + LLL f64 early-abort");
+        eprintln!("[pnc-bench] dim=15 (m=2 bivarié)  block_bits={block_bits}");
+        eprintln!("[pnc-bench] Borne HG : log2(p⁴/15) = {:.1}", lll_earlyabort::hg_bound_log2(15));
+        let stats = lll_earlyabort::benchmark_killswitch(15, 200);
+        stats.print();
+        eprintln!("[pnc-bench] Interprétation :");
+        eprintln!("  > 80% → Kill Switch efficace (économie majeure de LLL BigRational)");
+        eprintln!("  ~0%   → matrices toutes viables (Kill Switch conservateur)");
+        if !args.estimate_only { println!(); }
     }
 
     if args.estimate_only { return; }
