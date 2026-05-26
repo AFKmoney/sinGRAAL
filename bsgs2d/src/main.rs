@@ -47,6 +47,7 @@
 mod secp;
 mod lll;
 mod coppersmith;
+mod cuda_filter;
 
 use clap::Parser;
 use secp::*;
@@ -110,6 +111,10 @@ struct Args {
     /// Afficher les estimations sans lancer la recherche.
     #[arg(long)]
     estimate_only: bool,
+
+    /// Benchmark du filtre PNC direct (S₃ quadratique exact, CPU fallback).
+    #[arg(long)]
+    pnc_bench: bool,
 
     /// Auto-test : générer k aléatoire, chercher, vérifier.
     #[arg(long)]
@@ -941,6 +946,27 @@ fn main() {
         let seed   = u64::from_str_radix(seed_s, 16).expect("--seed: hex u64");
         run_golden_block_test(seed, args.range_bits, block_bits);
         return;
+    }
+
+    // ── Benchmark filtre PNC direct (S₃ quadratique exact) ──────────────────
+    if args.pnc_bench {
+        use coppersmith::fe_to_bigint;
+        let block_bits = args.block_bits.unwrap_or(5);
+        let tx         = fe_to_bigint(GX); // use generator x as surrogate target
+        let p          = fe_to_bigint(secp::FIELD_P);
+        let filter     = cuda_filter::DirectFilter::new(tx, block_bits, p);
+        let n_pairs    = 10_000usize;
+        eprintln!("[pnc-bench] S₃ direct filter  block_bits={block_bits}  n_pairs={n_pairs}");
+        let t0 = std::time::Instant::now();
+        let rej = filter.benchmark_rejection_rate(n_pairs);
+        let elapsed = t0.elapsed().as_secs_f64();
+        eprintln!("[pnc-bench] Taux de rejet : {:.2}%  ({:.3}s  →  {:.0} paires/s)",
+            rej * 100.0, elapsed, n_pairs as f64 / elapsed);
+        eprintln!("[pnc-bench] Interprétation :");
+        eprintln!("  ~100%  → PNC tue quasi tout en O(field_mul)");
+        eprintln!("  <100%  → faux positifs (paires sans solution dans [A, A+X)×[B, B+X))");
+        eprintln!("  Note   : CPU scan couvre seulement x1=A (1 point) par paire");
+        eprintln!("           GPU scan couvre TOUS les x1 ∈ [A, A+2^block_bits)");
     }
 
     // ── Benchmark filtre Coppersmith univarié ────────────────────────────────
