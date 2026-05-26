@@ -731,3 +731,161 @@ pub fn build_macaulay_bivariate_m2(coeffs: &[BigInt; 6], x_big: &BigInt, p: &Big
 
     mat
 }
+
+// ─── Helpers for m=3 bivariate (monomial indexing) ───────────────────────────
+
+fn mono_to_col(a: usize, b: usize) -> usize {
+    let d = a + b;
+    d * (d + 1) / 2 + b
+}
+
+fn col_to_mono(col: usize) -> (usize, usize) {
+    let mut d = 0usize;
+    while (d + 1) * (d + 2) / 2 <= col {
+        d += 1;
+    }
+    let b = col - d * (d + 1) / 2;
+    (d - b, b)
+}
+
+/// Multiply two polynomials (coefficient vectors indexed by col), keeping total degree ≤ max_deg.
+fn poly_mul_trunc(a: &[BigInt], b: &[BigInt], max_deg: usize) -> Vec<BigInt> {
+    let ncols = (max_deg + 1) * (max_deg + 2) / 2;
+    let mut result = vec![BigInt::zero(); ncols];
+    for ai in 0..a.len() {
+        if a[ai].is_zero() { continue; }
+        let (ax, ay) = col_to_mono(ai);
+        for bi in 0..b.len() {
+            if b[bi].is_zero() { continue; }
+            let (bx, by) = col_to_mono(bi);
+            let cx = ax + bx;
+            let cy = ay + by;
+            if cx + cy <= max_deg {
+                let ci = mono_to_col(cx, cy);
+                result[ci] += &a[ai] * &b[bi];
+            }
+        }
+    }
+    result
+}
+
+// ─── Matrice Jochemsz-May m=3 bivariée (28×28) ───────────────────────────────
+//
+// Monomômes (cols) ordonnés par degré total croissant, 28 = C(8,2) :
+//   deg 0: (0,0)
+//   deg 1: (1,0) (0,1)
+//   deg 2: (2,0) (1,1) (0,2)
+//   deg 3: (3,0) (2,1) (1,2) (0,3)
+//   deg 4: (4,0) (3,1) (2,2) (1,3) (0,4)
+//   deg 5: (5,0) (4,1) (3,2) (2,3) (1,4) (0,5)
+//   deg 6: (6,0) (5,1) (4,2) (3,3) (2,4) (1,5) (0,6)
+//
+// Colonne (a,b) scalée par X^(a+b) (X=Y=2^block_bits).
+//
+// 28 lignes :
+//   Ligne 0       : f³ scalé
+//   Lignes 1-6    : p · x^sa·y^sb · f²,  (sa,sb) avec sa+sb ≤ 2  (6 lignes)
+//   Lignes 7-21   : p² · x^sa·y^sb · f,  (sa,sb) avec sa+sb ≤ 4  (15 lignes)
+//   Lignes 22-27  : p³ · diagonale (pour les 6 colonnes restantes)
+//
+// Borne HG m=3 : survie ⟺ norm_min² < p⁶/28
+pub fn build_macaulay_bivariate_m3(coeffs: &[BigInt; 6], x_big: &BigInt, p: &BigInt) -> Vec<Vec<BigInt>> {
+    let dim = 28usize;
+    let max_deg = 6usize;
+    let mut mat = vec![vec![BigInt::zero(); dim]; dim];
+
+    // f as coefficient vector (28 entries, only first 6 non-zero)
+    let mut f_poly = vec![BigInt::zero(); dim];
+    for i in 0..6 {
+        f_poly[i] = coeffs[i].clone();
+    }
+
+    // f², f³
+    let f2_poly = poly_mul_trunc(&f_poly, &f_poly, max_deg);
+    let f3_poly = poly_mul_trunc(&f2_poly, &f_poly, max_deg);
+
+    // Scaling: entry at column (a,b) gets multiplied by x_big^(a+b)
+    let mut x_pows = vec![BigInt::one(); max_deg + 1];
+    for i in 1..=max_deg {
+        x_pows[i] = &x_pows[i - 1] * x_big;
+    }
+
+    // Helper: build a row for p^k * x^shift_a*y^shift_b * poly_coeffs, scaled
+    let build_row = |poly: &[BigInt], shift_a: usize, shift_b: usize, pk: &BigInt| -> Vec<BigInt> {
+        let mut row = vec![BigInt::zero(); dim];
+        for col in 0..dim {
+            let (a, b) = col_to_mono(col);
+            if a < shift_a || b < shift_b { continue; }
+            let src_col = mono_to_col(a - shift_a, b - shift_b);
+            if src_col >= poly.len() { continue; }
+            if poly[src_col].is_zero() { continue; }
+            row[col] = pk * &poly[src_col] * &x_pows[a + b];
+        }
+        row
+    };
+
+    let p2 = p * p;
+    let p3 = &p2 * p;
+
+    // Row 0: f³ scaled
+    mat[0] = build_row(&f3_poly, 0, 0, &BigInt::one());
+
+    // Rows 1-6: p * x^sa*y^sb * f², (sa,sb) with sa+sb ≤ 2
+    let mut row_idx = 1usize;
+    for d in 0..=2usize {
+        for sb in 0..=d {
+            let sa = d - sb;
+            mat[row_idx] = build_row(&f2_poly, sa, sb, p);
+            row_idx += 1;
+        }
+    }
+    // row_idx = 7 now
+
+    // Rows 7-21: p² * x^sa*y^sb * f, (sa,sb) with sa+sb ≤ 4
+    for d in 0..=4usize {
+        for sb in 0..=d {
+            let sa = d - sb;
+            mat[row_idx] = build_row(&f_poly, sa, sb, &p2);
+            row_idx += 1;
+        }
+    }
+    // row_idx = 22 now
+
+    // Fill any zero diagonal entries with p³ * X^(a+b)
+    for i in 0..dim {
+        if mat[i][i].is_zero() {
+            let (a, b) = col_to_mono(i);
+            mat[i][i] = &p3 * &x_pows[a + b];
+        }
+    }
+    // Ensure the last 6 rows (22-27) are p³ diagonal
+    for i in 22..dim {
+        let (a, b) = col_to_mono(i);
+        mat[i][i] = &p3 * &x_pows[a + b];
+    }
+
+    mat
+}
+
+impl LatticePruner {
+    /// Bivarié m=3 (Jochemsz-May) : teste si la paire (δ∈[0,X), ε∈[0,X)) peut contenir
+    /// une solution de S₃(A+δ, B+ε, x_P) ≡ 0 (mod p).
+    /// Essaie les 9 combinaisons GLV (β^i·A, β^j·B) — De-GLV fix.
+    /// Matrice 28×28, borne p⁶/28. false = REJET prouvé.
+    pub fn is_block_pair_viable_m3(&self, start_a: &BigInt, start_b: &BigInt, block_bits: u32) -> bool {
+        let x_big = BigInt::one() << block_bits as usize;
+        let (_i, _j, coeffs) = find_glv_coeffs(start_a, start_b, &self.target_x, &self.p);
+        if coeffs[0].is_zero() { return true; }
+        let mat = build_macaulay_bivariate_m3(&coeffs, &x_big, &self.p);
+        let reduced = lll_reduce_bigint(mat);
+        let shortest_norm_sq = reduced.iter()
+            .map(|row| norm_sq_bigint(row))
+            .filter(|n| !n.is_zero())
+            .min()
+            .unwrap_or_else(BigInt::zero);
+        // HG m=3, dim=28 : survie si norm < p³/√28
+        let p3 = &self.p * &self.p * &self.p;
+        let bound_sq = (&p3 * &p3) / 28i64;
+        shortest_norm_sq < bound_sq
+    }
+}
