@@ -26,7 +26,9 @@
 //   L'implémentation actuelle itère sur k_R et filtre sur δ.
 
 use num_bigint::{BigInt, ToBigInt};
+use num_rational::BigRational;
 use num_traits::{Zero, One, Signed, ToPrimitive};
+use num_integer::Integer;
 use crate::secp::{Fe, fp_mul, fp_sub, fp_add, fp_neg, fp_inv, FIELD_P, fe_lt, BETA, BETA2};
 
 // ─── Conversion Fe ↔ BigInt ──────────────────────────────────────────────────
@@ -221,58 +223,157 @@ pub fn build_macaulay_matrix(
 
 // ─── LLL sur matrice BigInt (δ=3/4) ─────────────────────────────────────────
 //
-// LLL classique, condition de Lovász vérifiée sur les normes exactes.
-// Arithmétique BigInt pour les vecteurs, f64 pour les tests de Lovász.
+// LLL classique avec Gram-Schmidt EXACT en BigRational.
+// Anciens bugs : (1) Lovász utilisait f64 → overflow en inf → aucun swap ;
+//               (2) µ projetait sur b_j au lieu de b*_j → taille réduit faux.
+// Cette implémentation recalcule le Gram-Schmidt exact à chaque étape.
+// Complexité O(n⁵) BigRational, acceptable pour n ≤ 15.
 
 pub fn dot_bigint(a: &[BigInt], b: &[BigInt]) -> BigInt {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
-fn norm_sq_f64(v: &[BigInt]) -> f64 {
-    v.iter().map(|x| { let f = x.to_f64().unwrap_or(f64::MAX / 2.0); f * f }).sum()
+fn dot_rat(a: &[BigRational], b: &[BigRational]) -> BigRational {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
-pub fn lll_reduce_bigint(mut b: Vec<Vec<BigInt>>) -> Vec<Vec<BigInt>> {
-    let n = b.len();
-    if n <= 1 { return b; }
+fn to_rat(v: &[BigInt]) -> Vec<BigRational> {
+    v.iter().map(|x| BigRational::from(x.clone())).collect()
+}
 
-    let mut k = 1usize;
-    while k < n {
-        // ── Size reduce b[k] against b[k-1..0] ──────────────────────────────
-        for j in (0..k).rev() {
-            let n_jj = dot_bigint(&b[j], &b[j]);
-            if n_jj.is_zero() { continue; }
-            let n_kj = dot_bigint(&b[k], &b[j]);
-            // µ = round(n_kj / n_jj)
-            let double: BigInt = &n_kj * 2;
-            let mu = if double.abs() > n_jj.abs() {
-                // |µ| > 1/2 → subtract
-                let q = &n_kj / &n_jj;
-                let r = &n_kj - &q * &n_jj;
-                if (2 * r.abs()) > n_jj.abs() {
-                    if n_kj.is_positive() { q + 1 } else { q - 1 }
-                } else { q }
-            } else {
-                BigInt::zero()
-            };
-            if !mu.is_zero() {
-                let bj = b[j].clone();
-                for l in 0..b[k].len() {
-                    b[k][l] -= &mu * &bj[l];
-                }
+fn rat_round(r: &BigRational) -> BigInt {
+    let q = r.to_integer();           // floor
+    let frac = r - BigRational::from(q.clone());
+    let half = BigRational::new(BigInt::one(), BigInt::from(2u32));
+    if frac >= half { q + 1 } else if frac < -half.clone() { q - 1 } else { q }
+}
+
+// Gram-Schmidt orthogonalisation exacte.
+// Retourne (bstar, mu) où bstar[i] est le i-ème vecteur GS, mu[i][j] le coeff.
+fn gram_schmidt(b: &[Vec<BigInt>]) -> (Vec<Vec<BigRational>>, Vec<Vec<BigRational>>) {
+    let n  = b.len();
+    let dim = b[0].len();
+    let mut bstar: Vec<Vec<BigRational>> = Vec::with_capacity(n);
+    let mut mu: Vec<Vec<BigRational>>    = vec![vec![BigRational::zero(); n]; n];
+
+    for i in 0..n {
+        let mut bs = to_rat(&b[i]);
+        for j in 0..i {
+            let b_norm_sq = dot_rat(&bstar[j], &bstar[j]);
+            if b_norm_sq.is_zero() { continue; }
+            let mu_ij = dot_rat(&to_rat(&b[i]), &bstar[j]) / &b_norm_sq;
+            mu[i][j] = mu_ij.clone();
+            for k in 0..dim {
+                let sub = &mu_ij * &bstar[j][k];
+                bs[k] -= sub;
             }
         }
+        bstar.push(bs);
+    }
+    (bstar, mu)
+}
 
-        // ── Lovász condition : 4·||b_k||² >= 3·||b_{k-1}||² ────────────────
-        let nk  = norm_sq_f64(&b[k]);
-        let nk1 = norm_sq_f64(&b[k-1]);
-        if nk1 == 0.0 || 4.0 * nk >= 3.0 * nk1 {
+// ─── LLL BigRational INCRÉMENTAL ─────────────────────────────────────────────
+//
+// Formules fermées pour le swap (O(n) par swap, pas de recomputation GS) :
+//   Après b[k]↔b[k-1], avec λ=mu[k][k-1], B0=norm[k-1], B1=norm[k] :
+//     new_B0 = B1 + λ²·B0
+//     new_B1 = B0·B1 / new_B0
+//     new_mu[k][k-1] = λ·B0 / new_B0
+//     For i>k : new_mu[i][k-1] = (mu[i][k]·B1 + λ·mu[i][k-1]·B0) / new_B0
+//               new_mu[i][k]   = mu[i][k-1] − λ·mu[i][k]
+//   Échange des colonnes j<k-1 dans les lignes k-1 et k.
+pub fn lll_reduce_bigint(mut b: Vec<Vec<BigInt>>) -> Vec<Vec<BigInt>> {
+    let n   = b.len();
+    let dim = b[0].len();
+    if n <= 1 { return b; }
+
+    // ── Initialisation GS exacte (une seule fois) ────────────────────────────
+    let mut bstar:   Vec<Vec<BigRational>> = Vec::with_capacity(n);
+    let mut mu:      Vec<Vec<BigRational>> = vec![vec![BigRational::zero(); n]; n];
+    let mut norm_sq: Vec<BigRational>      = vec![BigRational::zero(); n];
+
+    for i in 0..n {
+        let mut bs = to_rat(&b[i]);
+        for j in 0..i {
+            if norm_sq[j].is_zero() { continue; }
+            let m = dot_rat(&to_rat(&b[i]), &bstar[j]) / &norm_sq[j];
+            mu[i][j] = m.clone();
+            for l in 0..dim { bs[l] -= &m * &bstar[j][l]; }
+        }
+        norm_sq[i] = dot_rat(&bs, &bs);
+        bstar.push(bs);
+    }
+
+    let delta = BigRational::new(BigInt::from(3u32), BigInt::from(4u32));
+    let mut k = 1usize;
+    let mut iters = 0usize;
+    let mut swaps = 0usize;
+
+    while k < n {
+        iters += 1;
+        if iters > 300_000 { eprintln!("[lll] garde 300k ({} swaps)", swaps); break; }
+
+        // ── Réduction de taille ───────────────────────────────────────────────
+        // NOTE : ne change PAS norm_sq[k] ni bstar[k], seulement mu[k][*].
+        for j in (0..k).rev() {
+            let m = rat_round(&mu[k][j]);
+            if m.is_zero() { continue; }
+            let mq = BigRational::from(m.clone());
+            let bj = b[j].clone();
+            for l in 0..dim { b[k][l] -= &m * &bj[l]; }
+            mu[k][j] -= &mq;
+            for i in 0..j { let u = &mu[k][i] - &mq * &mu[j][i]; mu[k][i] = u; }
+        }
+
+        // ── Lovász ───────────────────────────────────────────────────────────
+        let rhs = (&delta - &mu[k][k-1] * &mu[k][k-1]) * &norm_sq[k-1];
+        if norm_sq[k] >= rhs {
             k += 1;
         } else {
-            b.swap(k, k-1);
+            swaps += 1;
+            b.swap(k, k - 1);
+
+            // ── Mise à jour incrémentale du GS ────────────────────────────────
+            let lam  = mu[k][k-1].clone();
+            let b0   = norm_sq[k-1].clone();
+            let b1   = norm_sq[k].clone();
+            let nb0  = &b1 + &lam * &lam * &b0;  // new norm_sq[k-1]
+            let nb1  = &b0 * &b1 / &nb0;          // new norm_sq[k]
+
+            // Mise à jour mu pour lignes i > k
+            for i in k+1..n {
+                let a  = mu[i][k-1].clone();
+                let bv = mu[i][k].clone();
+                mu[i][k-1] = (&bv * &b1 + &lam * &a * &b0) / &nb0;
+                mu[i][k]   = &a - &lam * &bv;
+            }
+
+            // Échange lignes k-1 et k dans mu (colonnes j < k-1)
+            for j in 0..k-1 {
+                let tmp = mu[k][j].clone();
+                mu[k][j]   = mu[k-1][j].clone();
+                mu[k-1][j] = tmp;
+            }
+            mu[k][k-1]   = &lam * &b0 / &nb0;
+            norm_sq[k-1] = nb0;
+            norm_sq[k]   = nb1;
+
+            // Mise à jour bstar[k-1] et bstar[k]
+            let old_bk  = bstar[k].clone();
+            let old_bkm = bstar[k-1].clone();
+            for l in 0..dim {
+                bstar[k-1][l] = &old_bk[l] + &lam * &old_bkm[l];
+            }
+            let nb0_v = &norm_sq[k-1];
+            for l in 0..dim {
+                bstar[k][l] = (&b1 * &old_bkm[l] - &lam * &b0 * &old_bk[l]) / nb0_v;
+            }
+
             if k > 1 { k -= 1; }
         }
     }
+    eprintln!("[lll] terminé : {} iters, {} swaps", iters, swaps);
     b
 }
 
@@ -610,15 +711,23 @@ pub fn build_macaulay_bivariate_m2(coeffs: &[BigInt; 6], x_big: &BigInt, p: &Big
     mat[6][13] = p * c11 * &xy3;
     mat[6][14] = p * c02 * y4;
 
+    // ── Remplissage diagonal lignes 2-6 (p·X^a·Y^b) ─────────────────────────
+    // Cols 2:(0,1) 3:(2,0) 4:(1,1) 5:(0,2) 6:(3,0) — zéros si f ne les couvre pas
+    mat[2][2] = p * x;       // (0,1) → Y = X
+    mat[3][3] = p * &x2;     // (2,0) → X²
+    mat[4][4] = p * &xy;     // (1,1) → XY = X²
+    mat[5][5] = p * y2;      // (0,2) → Y² = X²
+    mat[6][6] = p * &x3;     // (3,0) → X³
+
     // ── Lignes 7-14 : p²·monomôme (diagonale) ────────────────────────────────
-    mat[ 7][ 0] = p2.clone();
-    mat[ 8][ 1] = &p2 * x;
-    mat[ 9][ 2] = &p2 * x;      // Y=X
-    mat[10][ 3] = &p2 * &x2;
-    mat[11][ 4] = &p2 * &xy;
-    mat[12][ 5] = &p2 * y2;
-    mat[13][ 6] = &p2 * &x3;
-    mat[14][ 7] = &p2 * &x2y;
+    mat[ 7][ 7] = p2.clone();
+    mat[ 8][ 8] = &p2 * x;
+    mat[ 9][ 9] = &p2 * x;      // Y=X
+    mat[10][10] = &p2 * &x2;
+    mat[11][11] = &p2 * &xy;
+    mat[12][12] = &p2 * y2;
+    mat[13][13] = &p2 * &x3;
+    mat[14][14] = &p2 * &x2y;
 
     mat
 }
