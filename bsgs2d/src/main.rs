@@ -704,7 +704,81 @@ fn run_golden_block_test(seed: u64, range_bits: u32, block_bits: u32) {
     eprintln!("[golden] GLV combo (i={gi}, j={gj}) : c₀₀ = S₃(β^{gi}·A, β^{gj}·B, x_P)");
     eprintln!("[golden] c₀₀ ≠ 0 : {}", !coeffs[0].is_zero());
 
-    let mat     = build_macaulay_bivariate_m2(&coeffs, &xblk, &p);
+    let mat = build_macaulay_bivariate_m2(&coeffs, &xblk, &p);
+
+    // ── Sondes diagnostiques avant LLL ───────────────────────────────────────
+    let mut max_bits: u64 = 0;
+    let mut zero_rows: Vec<usize> = Vec::new();
+    for (i, row) in mat.iter().enumerate() {
+        let all_zero = row.iter().all(|v| v.is_zero());
+        if all_zero { zero_rows.push(i); }
+        for val in row {
+            let b = val.bits();
+            if b > max_bits { max_bits = b; }
+        }
+    }
+    eprintln!("[debug-lll] dim={}×{}  max_coeff_bits={}  zero_rows={:?}",
+        mat.len(), mat[0].len(), max_bits, zero_rows);
+
+    // Vérifier la dépendance linéaire basique : lignes proportionnelles ?
+    let dim = mat.len();
+    let mut colinear_pairs: Vec<(usize,usize)> = Vec::new();
+    'outer: for i in 0..dim {
+        for j in (i+1)..dim {
+            // Vérifie si row[i] et row[j] sont proportionnelles
+            let nz_i: Vec<_> = mat[i].iter().enumerate().filter(|(_,v)| !v.is_zero()).collect();
+            let nz_j: Vec<_> = mat[j].iter().enumerate().filter(|(_,v)| !v.is_zero()).collect();
+            if nz_i.is_empty() || nz_j.is_empty() { continue; }
+            if nz_i.len() != nz_j.len() { continue; }
+            // ratio du premier terme non-nul
+            let (ki, vi) = nz_i[0]; let (kj, vj) = nz_j[0];
+            if ki != kj { continue; }
+            // ratio = vi/vj ; vérifie tous les termes
+            let prop = nz_i.iter().zip(nz_j.iter()).all(|((ai, av), (aj, bv))| {
+                ai == aj && vi * (*bv) == vj * (*av)
+            });
+            if prop { colinear_pairs.push((i, j));
+                      if colinear_pairs.len() >= 3 { break 'outer; } }
+        }
+    }
+    if !colinear_pairs.is_empty() {
+        eprintln!("[debug-lll] LIGNES COLINÉAIRES : {:?}", colinear_pairs);
+    } else {
+        eprintln!("[debug-lll] Aucune colinéarité triviale détectée");
+    }
+    // ── Test A : diagonale ────────────────────────────────────────────────────
+    eprintln!("[debug-lll] Diagonale (bits de mat[i][i]) :");
+    for i in 0..mat.len() {
+        eprintln!("  ligne {:2} : {:4} bits  (val mod 2^32 = {})",
+            i, mat[i][i].bits(),
+            &mat[i][i] % BigInt::from(1u64 << 32));
+    }
+
+    // ── Test B : dump matrice pour SageMath / vérif déterminant ──────────────
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create("/tmp/macaulay_matrix.txt").unwrap();
+        writeln!(f, "# 15x15 Macaulay m=2 pour S3 Semaev secp256k1").unwrap();
+        writeln!(f, "# block_bits={block_bits}  seed=0x{seed:x}  range_bits={range_bits}",
+            block_bits=block_bits, seed=seed, range_bits=range_bits).unwrap();
+        writeln!(f, "M = Matrix(ZZ, [").unwrap();
+        for (i, row) in mat.iter().enumerate() {
+            let row_str: Vec<String> = row.iter().map(|v| v.to_string()).collect();
+            let comma = if i < mat.len()-1 { "," } else { "" };
+            writeln!(f, "  [{}]{}", row_str.join(", "), comma).unwrap();
+        }
+        writeln!(f, "])").unwrap();
+        writeln!(f, "print('det =', M.det())").unwrap();
+        writeln!(f, "print('rank =', M.rank())").unwrap();
+        writeln!(f, "L = M.LLL()").unwrap();
+        writeln!(f, "norms = sorted([v.norm() for v in L.rows() if v != 0])").unwrap();
+        writeln!(f, "print('shortest norm =', norms[0] if norms else 'N/A')").unwrap();
+    }
+    eprintln!("[debug-lll] Matrice dumpée dans /tmp/macaulay_matrix.txt");
+    eprintln!("[debug-lll] Pour vérifier : sage /tmp/macaulay_matrix.txt");
+    eprintln!("[debug-lll]   ou : python3 -c \"exec(open('/tmp/macaulay_matrix.txt').read())\" (avec fpylll)");
+    // ─────────────────────────────────────────────────────────────────────────
+
     let reduced = lll_reduce_bigint(mat);
 
     let shortest = reduced.iter()
