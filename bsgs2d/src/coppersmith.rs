@@ -26,7 +26,9 @@
 //   L'implémentation actuelle itère sur k_R et filtre sur δ.
 
 use num_bigint::{BigInt, ToBigInt};
+use num_rational::BigRational;
 use num_traits::{Zero, One, Signed, ToPrimitive};
+use num_integer::Integer;
 use crate::secp::{Fe, fp_mul, fp_sub, fp_add, fp_neg, fp_inv, FIELD_P, fe_lt, BETA, BETA2};
 
 // ─── Conversion Fe ↔ BigInt ──────────────────────────────────────────────────
@@ -103,42 +105,44 @@ fn fp_mod(a: &BigInt) -> BigInt {
 
 // ─── S₃ coefficients en δ ─────────────────────────────────────────────────────
 //
-// S₃(A + δ, x_R, x_P) = c₀ + c₁·δ + c₂·δ²  (mod p)
+// Formule correcte pour y²=x³+b (a=0, b=7) — dérivée de la condition d'addition EC :
+//   f₃(x₁,x₂,x₃) = (x₁-x₂)²·x₃² − 2[x₁x₂(x₁+x₂)+2b]·x₃ + (x₁x₂)²−4b(x₁+x₂)
 //
-// avec :
-//   c₂ = (x_P - x_R)²                         (mod p)
-//   c₁ = 2·(A - x_R)·x_P² − 2·(A·x_R + x_R² + A + x_R)·x_P
-//          + 2·x_R·(A·x_R − 7)                 (mod p)  [dérivée de S₃ en x₁=A]
-//   c₀ = S₃(A, x_R, x_P)                       (mod p)
-pub fn s3_poly_coeffs(a: &BigInt, x_r: &BigInt, x_p: &BigInt, p: &BigInt) -> [BigInt; 3] {
-    // c₂ = (x_P - x_R)² mod p
-    let diff = fp_mod(&(x_p - x_r));
-    let c2 = fp_mod(&(&diff * &diff));
+// Coefficients de Taylor en δ pour f₃(A+δ, x_R, x_P) :
+//   c₂ = (x_P − x_R)²
+//   c₁ = 2(A−x_R)·x_P² − 2x_R(2A+x_R)·x_P + 2A·x_R² − 4b
+//   c₀ = (A−x_R)²·x_P² − 2[A·x_R(A+x_R)+2b]·x_P + (A·x_R)²−4b(A+x_R)
+pub fn s3_poly_coeffs(a: &BigInt, x_r: &BigInt, x_p: &BigInt, _p: &BigInt) -> [BigInt; 3] {
+    let b14 = BigInt::from(14u32);   // 2b
+    let b28 = BigInt::from(28u32);   // 4b
 
-    // c₀ = S₃(A, x_R, x_P) mod p
-    // S₃(x1,x2,x3) = (x1-x2)²·x3² - 2·(x1+x2)·(x1·x2+7)·x3 + (x1·x2-7)²
-    let d01 = fp_mod(&(a - x_r));
-    let s01 = fp_mod(&(a + x_r));
-    let pr  = fp_mod(&(a * x_r));
-    let p7  = fp_mod(&(&pr + 7));
-    let m7  = fp_mod(&(&pr - 7));
+    let d   = fp_mod(&(a - x_r));
+    let d2  = fp_mod(&(&d * &d));
+    let ar  = fp_mod(&(a * x_r));
+    let apr = fp_mod(&(a + x_r));
+    let r2  = fp_mod(&(x_r * x_r));
     let xp2 = fp_mod(&(x_p * x_p));
-    let c0  = fp_mod(&(fp_mod(&(&d01 * &d01)) * &xp2
-              - 2 * fp_mod(&(&s01 * &p7)) * x_p
-              + fp_mod(&(&m7 * &m7))));
 
-    // c₁ = ∂S₃/∂x₁ at x₁=A
-    //    = 2·(A−x_R)·x_P² − 2·(A·x_R+7+x_R²+x_R)·x_P + 2·x_R·(A·x_R−7)
-    // Dérivée exacte :
-    //  ∂/∂x₁ [(x₁-x₂)²x₃²] = 2(x₁-x₂)x₃²
-    //  ∂/∂x₁ [-2(x₁+x₂)(x₁x₂+7)x₃] = -2(x₁x₂+7+x₂(x₁+x₂))x₃ = -2(2x₁x₂+x₂²+7)x₃
-    //  ∂/∂x₁ [(x₁x₂-7)²] = 2x₂(x₁x₂-7)
-    let t1 = fp_mod(&(2 * &d01 * &xp2));
-    let t2 = fp_mod(&(2 * (2 * fp_mod(&(a * x_r)) + fp_mod(&(x_r * x_r)) + 7) * x_p));
-    let t3 = fp_mod(&(2 * x_r * &m7));
-    let c1 = fp_mod(&(&t1 - &t2 + &t3));
+    // c₂ = (x_P − x_R)²
+    let diff = fp_mod(&(x_p - x_r));
+    let c2   = fp_mod(&(&diff * &diff));
 
-    // Réduction finale mod p
+    // c₀ = d²·x_P² − 2[ar·(A+x_R)+2b]·x_P + ar²−4b(A+x_R)
+    let mid0 = fp_mod(&(fp_mod(&(&ar * &apr)) + &b14));
+    let c0   = fp_mod(
+        &(&d2 * &xp2
+          - BigInt::from(2u32) * &mid0 * x_p
+          + fp_mod(&(&ar * &ar))
+          - &b28 * &apr),
+    );
+
+    // c₁ = 2d·x_P² − 2x_R(2A+x_R)·x_P + 2A·x_R²−4b
+    let inner = fp_mod(&(BigInt::from(2u32) * a + x_r));
+    let t1 = fp_mod(&(BigInt::from(2u32) * &d  * &xp2));
+    let t2 = fp_mod(&(BigInt::from(2u32) * x_r * &inner * x_p));
+    let t3 = fp_mod(&(BigInt::from(2u32) * a   * &r2));
+    let c1 = fp_mod(&(&t1 - &t2 + &t3 - &b28));
+
     [fp_mod(&c0), fp_mod(&c1), fp_mod(&c2)]
 }
 
@@ -219,58 +223,157 @@ pub fn build_macaulay_matrix(
 
 // ─── LLL sur matrice BigInt (δ=3/4) ─────────────────────────────────────────
 //
-// LLL classique, condition de Lovász vérifiée sur les normes exactes.
-// Arithmétique BigInt pour les vecteurs, f64 pour les tests de Lovász.
+// LLL classique avec Gram-Schmidt EXACT en BigRational.
+// Anciens bugs : (1) Lovász utilisait f64 → overflow en inf → aucun swap ;
+//               (2) µ projetait sur b_j au lieu de b*_j → taille réduit faux.
+// Cette implémentation recalcule le Gram-Schmidt exact à chaque étape.
+// Complexité O(n⁵) BigRational, acceptable pour n ≤ 15.
 
 pub fn dot_bigint(a: &[BigInt], b: &[BigInt]) -> BigInt {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
-fn norm_sq_f64(v: &[BigInt]) -> f64 {
-    v.iter().map(|x| { let f = x.to_f64().unwrap_or(f64::MAX / 2.0); f * f }).sum()
+fn dot_rat(a: &[BigRational], b: &[BigRational]) -> BigRational {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
-pub fn lll_reduce_bigint(mut b: Vec<Vec<BigInt>>) -> Vec<Vec<BigInt>> {
-    let n = b.len();
-    if n <= 1 { return b; }
+fn to_rat(v: &[BigInt]) -> Vec<BigRational> {
+    v.iter().map(|x| BigRational::from(x.clone())).collect()
+}
 
-    let mut k = 1usize;
-    while k < n {
-        // ── Size reduce b[k] against b[k-1..0] ──────────────────────────────
-        for j in (0..k).rev() {
-            let n_jj = dot_bigint(&b[j], &b[j]);
-            if n_jj.is_zero() { continue; }
-            let n_kj = dot_bigint(&b[k], &b[j]);
-            // µ = round(n_kj / n_jj)
-            let double: BigInt = &n_kj * 2;
-            let mu = if double.abs() > n_jj.abs() {
-                // |µ| > 1/2 → subtract
-                let q = &n_kj / &n_jj;
-                let r = &n_kj - &q * &n_jj;
-                if (2 * r.abs()) > n_jj.abs() {
-                    if n_kj.is_positive() { q + 1 } else { q - 1 }
-                } else { q }
-            } else {
-                BigInt::zero()
-            };
-            if !mu.is_zero() {
-                let bj = b[j].clone();
-                for l in 0..b[k].len() {
-                    b[k][l] -= &mu * &bj[l];
-                }
+fn rat_round(r: &BigRational) -> BigInt {
+    let q = r.to_integer();           // floor
+    let frac = r - BigRational::from(q.clone());
+    let half = BigRational::new(BigInt::one(), BigInt::from(2u32));
+    if frac >= half { q + 1 } else if frac < -half.clone() { q - 1 } else { q }
+}
+
+// Gram-Schmidt orthogonalisation exacte.
+// Retourne (bstar, mu) où bstar[i] est le i-ème vecteur GS, mu[i][j] le coeff.
+fn gram_schmidt(b: &[Vec<BigInt>]) -> (Vec<Vec<BigRational>>, Vec<Vec<BigRational>>) {
+    let n  = b.len();
+    let dim = b[0].len();
+    let mut bstar: Vec<Vec<BigRational>> = Vec::with_capacity(n);
+    let mut mu: Vec<Vec<BigRational>>    = vec![vec![BigRational::zero(); n]; n];
+
+    for i in 0..n {
+        let mut bs = to_rat(&b[i]);
+        for j in 0..i {
+            let b_norm_sq = dot_rat(&bstar[j], &bstar[j]);
+            if b_norm_sq.is_zero() { continue; }
+            let mu_ij = dot_rat(&to_rat(&b[i]), &bstar[j]) / &b_norm_sq;
+            mu[i][j] = mu_ij.clone();
+            for k in 0..dim {
+                let sub = &mu_ij * &bstar[j][k];
+                bs[k] -= sub;
             }
         }
+        bstar.push(bs);
+    }
+    (bstar, mu)
+}
 
-        // ── Lovász condition : 4·||b_k||² >= 3·||b_{k-1}||² ────────────────
-        let nk  = norm_sq_f64(&b[k]);
-        let nk1 = norm_sq_f64(&b[k-1]);
-        if nk1 == 0.0 || 4.0 * nk >= 3.0 * nk1 {
+// ─── LLL BigRational INCRÉMENTAL ─────────────────────────────────────────────
+//
+// Formules fermées pour le swap (O(n) par swap, pas de recomputation GS) :
+//   Après b[k]↔b[k-1], avec λ=mu[k][k-1], B0=norm[k-1], B1=norm[k] :
+//     new_B0 = B1 + λ²·B0
+//     new_B1 = B0·B1 / new_B0
+//     new_mu[k][k-1] = λ·B0 / new_B0
+//     For i>k : new_mu[i][k-1] = (mu[i][k]·B1 + λ·mu[i][k-1]·B0) / new_B0
+//               new_mu[i][k]   = mu[i][k-1] − λ·mu[i][k]
+//   Échange des colonnes j<k-1 dans les lignes k-1 et k.
+pub fn lll_reduce_bigint(mut b: Vec<Vec<BigInt>>) -> Vec<Vec<BigInt>> {
+    let n   = b.len();
+    let dim = b[0].len();
+    if n <= 1 { return b; }
+
+    // ── Initialisation GS exacte (une seule fois) ────────────────────────────
+    let mut bstar:   Vec<Vec<BigRational>> = Vec::with_capacity(n);
+    let mut mu:      Vec<Vec<BigRational>> = vec![vec![BigRational::zero(); n]; n];
+    let mut norm_sq: Vec<BigRational>      = vec![BigRational::zero(); n];
+
+    for i in 0..n {
+        let mut bs = to_rat(&b[i]);
+        for j in 0..i {
+            if norm_sq[j].is_zero() { continue; }
+            let m = dot_rat(&to_rat(&b[i]), &bstar[j]) / &norm_sq[j];
+            mu[i][j] = m.clone();
+            for l in 0..dim { bs[l] -= &m * &bstar[j][l]; }
+        }
+        norm_sq[i] = dot_rat(&bs, &bs);
+        bstar.push(bs);
+    }
+
+    let delta = BigRational::new(BigInt::from(3u32), BigInt::from(4u32));
+    let mut k = 1usize;
+    let mut iters = 0usize;
+    let mut swaps = 0usize;
+
+    while k < n {
+        iters += 1;
+        if iters > 300_000 { eprintln!("[lll] garde 300k ({} swaps)", swaps); break; }
+
+        // ── Réduction de taille ───────────────────────────────────────────────
+        // NOTE : ne change PAS norm_sq[k] ni bstar[k], seulement mu[k][*].
+        for j in (0..k).rev() {
+            let m = rat_round(&mu[k][j]);
+            if m.is_zero() { continue; }
+            let mq = BigRational::from(m.clone());
+            let bj = b[j].clone();
+            for l in 0..dim { b[k][l] -= &m * &bj[l]; }
+            mu[k][j] -= &mq;
+            for i in 0..j { let u = &mu[k][i] - &mq * &mu[j][i]; mu[k][i] = u; }
+        }
+
+        // ── Lovász ───────────────────────────────────────────────────────────
+        let rhs = (&delta - &mu[k][k-1] * &mu[k][k-1]) * &norm_sq[k-1];
+        if norm_sq[k] >= rhs {
             k += 1;
         } else {
-            b.swap(k, k-1);
+            swaps += 1;
+            b.swap(k, k - 1);
+
+            // ── Mise à jour incrémentale du GS ────────────────────────────────
+            let lam  = mu[k][k-1].clone();
+            let b0   = norm_sq[k-1].clone();
+            let b1   = norm_sq[k].clone();
+            let nb0  = &b1 + &lam * &lam * &b0;  // new norm_sq[k-1]
+            let nb1  = &b0 * &b1 / &nb0;          // new norm_sq[k]
+
+            // Mise à jour mu pour lignes i > k
+            for i in k+1..n {
+                let a  = mu[i][k-1].clone();
+                let bv = mu[i][k].clone();
+                mu[i][k-1] = (&bv * &b1 + &lam * &a * &b0) / &nb0;
+                mu[i][k]   = &a - &lam * &bv;
+            }
+
+            // Échange lignes k-1 et k dans mu (colonnes j < k-1)
+            for j in 0..k-1 {
+                let tmp = mu[k][j].clone();
+                mu[k][j]   = mu[k-1][j].clone();
+                mu[k-1][j] = tmp;
+            }
+            mu[k][k-1]   = &lam * &b0 / &nb0;
+            norm_sq[k-1] = nb0;
+            norm_sq[k]   = nb1;
+
+            // Mise à jour bstar[k-1] et bstar[k]
+            let old_bk  = bstar[k].clone();
+            let old_bkm = bstar[k-1].clone();
+            for l in 0..dim {
+                bstar[k-1][l] = &old_bk[l] + &lam * &old_bkm[l];
+            }
+            let nb0_v = &norm_sq[k-1];
+            for l in 0..dim {
+                bstar[k][l] = (&b1 * &old_bkm[l] - &lam * &b0 * &old_bk[l]) / nb0_v;
+            }
+
             if k > 1 { k -= 1; }
         }
     }
+    eprintln!("[lll] terminé : {} iters, {} swaps", iters, swaps);
     b
 }
 
@@ -400,68 +503,70 @@ impl LatticePruner {
     }
 }
 
-// ─── Coefficients bivariés de S₃(A+x, B+y, w) ───────────────────────────────
+// ─── Coefficients bivariés de f₃(A+x, B+y, w) ───────────────────────────────
 //
-// f(x,y) = S₃(A+x, B+y, w) = Σ c_{ij} x^i y^j  (mod p)
+// Formule correcte : f₃(u,v,w) = (u-v)²w² − 2[uv(u+v)+2b]w + (uv)²−4b(u+v)  (b=7)
 //
-// Ordre : [c00, c10, c01, c20, c11, c02]   (colonnes : {1, x, y, x², xy, y²})
-//
-// Calculé par dérivées partielles en (x=0, y=0) :
-//   S₃(u,v,w) = (u-v)²w² − 2(u+v)(uv+7)w + (uv-7)²
-//
-//   c20 = c02 = w²
-//   c10 = 2(A-B)w² − 2(2AB+B²+7)w + 2B(AB-7)
-//   c01 = −2(A-B)w² − 2(2AB+A²+7)w + 2A(AB-7)
-//   c11 = −2w² − 4(A+B)w + 4AB − 14
+// Dérivées partielles en (u,v,w) = (A,B,w) :
+//   c20 = ½ ∂²f₃/∂u² = (w−B)²
+//   c02 = ½ ∂²f₃/∂v² = (w−A)²
+//   c11 =   ∂²f₃/∂u∂v = −2w²−4(A+B)w+4AB
+//   c10 = ∂f₃/∂u = 2(A−B)w²−2B(2A+B)w+2AB²−4b
+//   c01 = ∂f₃/∂v = −2(A−B)w²−2A(A+2B)w+2A²B−4b
+//   c00 = f₃(A,B,w)
 pub fn s3_bivariate_coeffs(
     a: &BigInt,
     b: &BigInt,
     x_p: &BigInt,
     _p: &BigInt,
 ) -> [BigInt; 6] {
-    let p   = p_bigint();
+    let b14 = BigInt::from(14u32);   // 2b
+    let b28 = BigInt::from(28u32);   // 4b
     let w   = x_p;
     let w2  = fp_mod(&(w * w));
     let ab  = fp_mod(&(a * b));
     let apb = fp_mod(&(a + b));
-    let amb = fp_mod(&(a - b));       // A - B (peut être négatif → fp_mod OK)
+    let amb = fp_mod(&(a - b));
     let a2  = fp_mod(&(a * a));
     let b2  = fp_mod(&(b * b));
-    let abm7 = fp_mod(&(&ab - 7));    // AB - 7
 
-    // c00 = S₃(A, B, w)
-    let d2   = fp_mod(&(&amb * &amb));
-    let s    = &apb;
-    let ab7  = fp_mod(&(&ab + 7));
-    let abm7sq = fp_mod(&(&abm7 * &abm7));
-    let c00 = fp_mod(&(&d2 * &w2
-        - 2 * fp_mod(&(s * &ab7)) * w
-        + &abm7sq));
+    // c00 = (A-B)²w² − 2[AB(A+B)+2b]w + (AB)²−4b(A+B)
+    let d2     = fp_mod(&(&amb * &amb));
+    let abapb  = fp_mod(&(&ab * &apb));
+    let mid00  = fp_mod(&(&abapb + &b14));
+    let ab2    = fp_mod(&(&ab * &ab));
+    let c00    = fp_mod(
+        &(&d2 * &w2
+          - BigInt::from(2u32) * &mid00 * w
+          + &ab2
+          - &b28 * &apb),
+    );
 
-    // c10 = 2(A-B)w² − 2(2AB+B²+7)w + 2B(AB-7)
-    let t1  = fp_mod(&(2 * &amb * &w2));
-    let t2  = fp_mod(&(2 * fp_mod(&(2 * &ab + &b2 + 7)) * w));
-    let t3  = fp_mod(&(2 * b * &abm7));
-    let c10 = fp_mod(&(&t1 + &p - &t2 + &t3));
+    // c10 = 2(A-B)w² − 2B(2A+B)w + 2AB²−4b
+    let t1  = fp_mod(&(BigInt::from(2u32) * &amb * &w2));
+    let t2  = fp_mod(&(BigInt::from(2u32) * b * fp_mod(&(BigInt::from(2u32) * a + b)) * w));
+    let t3  = fp_mod(&(BigInt::from(2u32) * a * &b2));
+    let c10 = fp_mod(&(&t1 - &t2 + &t3 - &b28));
 
-    // c01 = −2(A-B)w² − 2(2AB+A²+7)w + 2A(AB-7)
-    let t4  = fp_mod(&(2 * fp_mod(&(2 * &ab + &a2 + 7)) * w));
-    let t5  = fp_mod(&(2 * a * &abm7));
-    // -t1 → &p - &t1  (t1 ∈ [0,p) donc p-t1 ∈ (0,p])
-    let c01 = fp_mod(&((&p - &t1) + &p - &t4 + &t5));
+    // c01 = −2(A-B)w² − 2A(A+2B)w + 2A²B−4b
+    let t4  = fp_mod(&(BigInt::from(2u32) * a * fp_mod(&(a + BigInt::from(2u32) * b)) * w));
+    let t5  = fp_mod(&(BigInt::from(2u32) * &a2 * b));
+    let c01 = fp_mod(&(-&t1 - &t4 + &t5 - &b28));
 
-    // c20 = w²
-    let c20 = w2.clone();
+    // c20 = (w−B)²
+    let wmb = fp_mod(&(w - b));
+    let c20 = fp_mod(&(&wmb * &wmb));
 
-    // c11 = −2w² − 4(A+B)w + 4AB − 14
-    let t6  = fp_mod(&(2 * &w2));
-    let t7  = fp_mod(&(4 * &apb * w));
-    let t8  = fp_mod(&(4 * &ab));
-    // -2w² - 4(A+B)w + 4AB - 14
-    let c11 = fp_mod(&((&p - &t6) + &p - &t7 + &t8 + &p - 14));
+    // c02 = (w−A)²
+    let wma = fp_mod(&(w - a));
+    let c02 = fp_mod(&(&wma * &wma));
 
-    // c02 = w²
-    let c02 = w2;
+    // c11 = −2w²−4(A+B)w+4AB
+    let c11 = fp_mod(
+        &(-BigInt::from(2u32) * &w2
+          - BigInt::from(4u32) * &apb * w
+          + BigInt::from(4u32) * &ab),
+    );
 
     [fp_mod(&c00), fp_mod(&c10), fp_mod(&c01), fp_mod(&c20), fp_mod(&c11), fp_mod(&c02)]
 }
@@ -606,15 +711,23 @@ pub fn build_macaulay_bivariate_m2(coeffs: &[BigInt; 6], x_big: &BigInt, p: &Big
     mat[6][13] = p * c11 * &xy3;
     mat[6][14] = p * c02 * y4;
 
+    // ── Remplissage diagonal lignes 2-6 (p·X^a·Y^b) ─────────────────────────
+    // Cols 2:(0,1) 3:(2,0) 4:(1,1) 5:(0,2) 6:(3,0) — zéros si f ne les couvre pas
+    mat[2][2] = p * x;       // (0,1) → Y = X
+    mat[3][3] = p * &x2;     // (2,0) → X²
+    mat[4][4] = p * &xy;     // (1,1) → XY = X²
+    mat[5][5] = p * y2;      // (0,2) → Y² = X²
+    mat[6][6] = p * &x3;     // (3,0) → X³
+
     // ── Lignes 7-14 : p²·monomôme (diagonale) ────────────────────────────────
-    mat[ 7][ 0] = p2.clone();
-    mat[ 8][ 1] = &p2 * x;
-    mat[ 9][ 2] = &p2 * x;      // Y=X
-    mat[10][ 3] = &p2 * &x2;
-    mat[11][ 4] = &p2 * &xy;
-    mat[12][ 5] = &p2 * y2;
-    mat[13][ 6] = &p2 * &x3;
-    mat[14][ 7] = &p2 * &x2y;
+    mat[ 7][ 7] = p2.clone();
+    mat[ 8][ 8] = &p2 * x;
+    mat[ 9][ 9] = &p2 * x;      // Y=X
+    mat[10][10] = &p2 * &x2;
+    mat[11][11] = &p2 * &xy;
+    mat[12][12] = &p2 * y2;
+    mat[13][13] = &p2 * &x3;
+    mat[14][14] = &p2 * &x2y;
 
     mat
 }
