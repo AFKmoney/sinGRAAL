@@ -746,32 +746,29 @@ pub fn benchmark_dispatcher(range_bits: u32, block_bits: u32, m_level: u32, n_pa
 
         let (_, _, coeffs) = find_glv_coeffs(&a_x, &b_x, &x_p, &p);
 
-        // PNC
+        // Kill certifié (early-abort) + test final sur les vecteurs réduits.
         let t0 = Instant::now();
         let mat = match m_level {
             3 => build_macaulay_bivariate_m3(&coeffs, &x_big, &p),
             _ => build_macaulay_bivariate_m2(&coeffs, &x_big, &p),
         };
-        let dead = is_dead_fast(&mat);
-        t_pnc_total += t0.elapsed().as_secs_f64() * 1e6;
-
-        if dead { pnc_killed += 1; continue; }
-
-        // LLL complet
-        let t1 = Instant::now();
-        let mat2 = match m_level {
-            3 => build_macaulay_bivariate_m3(&coeffs, &x_big, &p),
-            _ => build_macaulay_bivariate_m2(&coeffs, &x_big, &p),
-        };
-        let reduced = lll_reduce_bigint(mat2);
-        let shortest = reduced.iter()
-            .map(|row| norm_sq_bigint(row))
-            .filter(|n| !n.is_zero())
-            .min()
-            .unwrap_or_else(BigInt::zero);
-        t_lll_total += t1.elapsed().as_secs_f64() * 1e6;
-
-        if shortest < bound_sq { survived += 1; } else { lll_killed += 1; }
+        match lll_reduce_bigint_killcheck(mat, &bound_sq) {
+            None => {
+                // KILL certifié anticipé (λ₁² ≥ borne prouvé pendant la réduction).
+                pnc_killed += 1;
+                t_pnc_total += t0.elapsed().as_secs_f64() * 1e6;
+            }
+            Some(reduced) => {
+                t_pnc_total += t0.elapsed().as_secs_f64() * 1e6;
+                let shortest = reduced.iter()
+                    .map(|row| norm_sq_bigint(row))
+                    .filter(|n| !n.is_zero())
+                    .min()
+                    .unwrap_or_else(BigInt::zero);
+                t_lll_total += t0.elapsed().as_secs_f64() * 1e6;
+                if shortest < bound_sq { survived += 1; } else { lll_killed += 1; }
+            }
+        }
     }
 
     let total_rej  = pnc_killed + lll_killed;
