@@ -4,7 +4,8 @@
 #   1. Exporter les variables :
 #        export TARGET_X=<64 hex chars>   # x-coord clé publique puzzle #135
 #        export TARGET_Y=<64 hex chars>   # y-coord
-#        export CUDA_ARCH=sm_89           # sm_80=A100, sm_89=RTX4090, sm_90=H100
+#        # CUDA_ARCH est OPTIONNEL : non défini → fatbinary portable (tout GPU).
+#        # export CUDA_ARCH=sm_89         # pin un seul arch (build + rapide)
 #
 #   2. Build :
 #        docker compose build
@@ -22,8 +23,8 @@ x-worker-base: &worker-base
     context: ../singraal
     dockerfile: Dockerfile
     args:
-      CUDA_ARCH: ${CUDA_ARCH:-sm_80}
-  image: singraal:v13-${CUDA_ARCH:-sm80}
+      CUDA_ARCH: ${CUDA_ARCH:-}
+  image: singraal:v13-${CUDA_ARCH:-fatbin}
   environment:
     TARGET_X: ${TARGET_X:?TARGET_X requis}
     TARGET_Y: ${TARGET_Y:?TARGET_Y requis}
@@ -50,8 +51,8 @@ services:
       context: ../singraal
       dockerfile: Dockerfile
       args:
-        CUDA_ARCH: ${CUDA_ARCH:-sm_80}
-    image: singraal:v13-${CUDA_ARCH:-sm80}
+        CUDA_ARCH: ${CUDA_ARCH:-}
+    image: singraal:v13-${CUDA_ARCH:-fatbin}
     environment:
       TARGET_X: ${TARGET_X:?TARGET_X requis}
       TARGET_Y: ${TARGET_Y:?TARGET_Y requis}
