@@ -103,6 +103,10 @@ struct Args {
     #[arg(long)]
     golden_test: bool,
 
+    /// Test du juge de paix : évaluer S₃(x_L, x_R, x_P) sur la vraie racine → doit donner 0.
+    #[arg(long)]
+    s3test: bool,
+
     /// Afficher les estimations sans lancer la recherche.
     #[arg(long)]
     estimate_only: bool,
@@ -726,7 +730,81 @@ fn run_golden_block_test(seed: u64, range_bits: u32, block_bits: u32) {
     eprintln!("[golden] GLV combo (i={gi}, j={gj}) : c₀₀ = S₃(β^{gi}·A, β^{gj}·B, x_P)");
     eprintln!("[golden] c₀₀ ≠ 0 : {}", !coeffs[0].is_zero());
 
-    let mat     = build_macaulay_bivariate_m2(&coeffs, &xblk, &p);
+    let mat = build_macaulay_bivariate_m2(&coeffs, &xblk, &p);
+
+    // ── Sondes diagnostiques avant LLL ───────────────────────────────────────
+    let mut max_bits: u64 = 0;
+    let mut zero_rows: Vec<usize> = Vec::new();
+    for (i, row) in mat.iter().enumerate() {
+        let all_zero = row.iter().all(|v| v.is_zero());
+        if all_zero { zero_rows.push(i); }
+        for val in row {
+            let b = val.bits();
+            if b > max_bits { max_bits = b; }
+        }
+    }
+    eprintln!("[debug-lll] dim={}×{}  max_coeff_bits={}  zero_rows={:?}",
+        mat.len(), mat[0].len(), max_bits, zero_rows);
+
+    // Vérifier la dépendance linéaire basique : lignes proportionnelles ?
+    let dim = mat.len();
+    let mut colinear_pairs: Vec<(usize,usize)> = Vec::new();
+    'outer: for i in 0..dim {
+        for j in (i+1)..dim {
+            // Vérifie si row[i] et row[j] sont proportionnelles
+            let nz_i: Vec<_> = mat[i].iter().enumerate().filter(|(_,v)| !v.is_zero()).collect();
+            let nz_j: Vec<_> = mat[j].iter().enumerate().filter(|(_,v)| !v.is_zero()).collect();
+            if nz_i.is_empty() || nz_j.is_empty() { continue; }
+            if nz_i.len() != nz_j.len() { continue; }
+            // ratio du premier terme non-nul
+            let (ki, vi) = nz_i[0]; let (kj, vj) = nz_j[0];
+            if ki != kj { continue; }
+            // ratio = vi/vj ; vérifie tous les termes
+            let prop = nz_i.iter().zip(nz_j.iter()).all(|((ai, av), (aj, bv))| {
+                ai == aj && vi * (*bv) == vj * (*av)
+            });
+            if prop { colinear_pairs.push((i, j));
+                      if colinear_pairs.len() >= 3 { break 'outer; } }
+        }
+    }
+    if !colinear_pairs.is_empty() {
+        eprintln!("[debug-lll] LIGNES COLINÉAIRES : {:?}", colinear_pairs);
+    } else {
+        eprintln!("[debug-lll] Aucune colinéarité triviale détectée");
+    }
+    // ── Test A : diagonale ────────────────────────────────────────────────────
+    eprintln!("[debug-lll] Diagonale (bits de mat[i][i]) :");
+    for i in 0..mat.len() {
+        eprintln!("  ligne {:2} : {:4} bits  (val mod 2^32 = {})",
+            i, mat[i][i].bits(),
+            &mat[i][i] % BigInt::from(1u64 << 32));
+    }
+
+    // ── Test B : dump matrice pour SageMath / vérif déterminant ──────────────
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create("/tmp/macaulay_matrix.txt").unwrap();
+        writeln!(f, "# 15x15 Macaulay m=2 pour S3 Semaev secp256k1").unwrap();
+        writeln!(f, "# block_bits={block_bits}  seed=0x{seed:x}  range_bits={range_bits}",
+            block_bits=block_bits, seed=seed, range_bits=range_bits).unwrap();
+        writeln!(f, "M = Matrix(ZZ, [").unwrap();
+        for (i, row) in mat.iter().enumerate() {
+            let row_str: Vec<String> = row.iter().map(|v| v.to_string()).collect();
+            let comma = if i < mat.len()-1 { "," } else { "" };
+            writeln!(f, "  [{}]{}", row_str.join(", "), comma).unwrap();
+        }
+        writeln!(f, "])").unwrap();
+        writeln!(f, "print('det =', M.det())").unwrap();
+        writeln!(f, "print('rank =', M.rank())").unwrap();
+        writeln!(f, "L = M.LLL()").unwrap();
+        writeln!(f, "norms = sorted([v.norm() for v in L.rows() if v != 0])").unwrap();
+        writeln!(f, "print('shortest norm =', norms[0] if norms else 'N/A')").unwrap();
+    }
+    eprintln!("[debug-lll] Matrice dumpée dans /tmp/macaulay_matrix.txt");
+    eprintln!("[debug-lll] Pour vérifier : sage /tmp/macaulay_matrix.txt");
+    eprintln!("[debug-lll]   ou : python3 -c \"exec(open('/tmp/macaulay_matrix.txt').read())\" (avec fpylll)");
+    // ─────────────────────────────────────────────────────────────────────────
+
     let reduced = lll_reduce_bigint(mat);
 
     let shortest = reduced.iter()
@@ -752,6 +830,112 @@ fn run_golden_block_test(seed: u64, range_bits: u32, block_bits: u32) {
     eprintln!("[golden] is_block_pair_viable API : {api_ok}");
 }
 
+// ─── Test du juge de paix : S₃(x_L, x_R, x_P) == 0 ─────────────────────────
+//
+// Protocole :
+//   k  = random_key(seed, range_bits)   — clé connue
+//   P  = k·G                            — cible
+//   half = range_bits / 2
+//   P_L = v_L · G          où v_L = k & ((1<<half)-1)
+//   P_R = v_R · 2^half·G   où v_R = k >> half
+//   → P_L + P_R = P  (split exact)
+//   S₃(x_L, x_R, x_P) = (x_L-x_R)²·x_P² − 2(x_L+x_R)(x_L·x_R+7)·x_P + (x_L·x_R−7)²
+//
+// Si S₃ = 0 : arithmétique modulaire OK.
+// Si S₃ ≠ 0 : overflow dans fp_mod (ex : (x*y-7)² calculé avant réduction).
+fn run_s3_direct_test(seed: u64, range_bits: u32) {
+    use coppersmith::{fe_to_bigint, s3_bivariate_coeffs, find_glv_coeffs};
+    use num_bigint::BigInt;
+    use num_traits::Zero;
+
+    // ── Sanité : G + 2G = 3G  →  S₃(x(G), x(2G), x(3G)) doit être 0 ─────────
+    {
+        let g1  = G;
+        let g2  = pt_dbl_pub(G);
+        let g3  = pt_add(g1, g2);
+        let p   = fe_to_bigint(FIELD_P);
+        let x1  = fe_to_bigint(g1.x);
+        let x2  = fe_to_bigint(g2.x);
+        let x3  = fe_to_bigint(g3.x);
+        let c   = s3_bivariate_coeffs(&x1, &x2, &x3, &p);
+        println!("[s3-sanity] G + 2G = 3G : S₃(x(G), x(2G), x(3G)) = {}", &c[0]);
+        if c[0].is_zero() {
+            println!("[s3-sanity] ✓ formule S₃ correcte");
+        } else {
+            println!("[s3-sanity] ✗ BUG dans la formule S₃ elle-même (nb bits={})", c[0].bits());
+        }
+    }
+    println!();
+
+    let k      = random_key(seed, range_bits);
+    let target = scalar_mul(G, k);
+    let half   = range_bits / 2;
+    let g_r    = scalar_mul(G, pow2_fe(half));
+
+    // v_L = k & ((1 << half) - 1)
+    let mut v_l = k;
+    let wl = (half / 64) as usize;
+    let bl = half % 64;
+    if wl < 4 { v_l[wl] &= if bl == 0 { 0 } else { (1u64 << bl) - 1 }; }
+    for i in (wl + 1)..4 { v_l[i] = 0; }
+
+    // v_R = k >> half
+    let mut v_r = [0u64; 4];
+    let sw = (half / 64) as usize;
+    let sb = (half % 64) as u32;
+    for i in 0..(4 - sw) {
+        v_r[i] = k[i + sw] >> sb;
+        if sb > 0 && i + sw + 1 < 4 {
+            v_r[i] |= k[i + sw + 1] << (64 - sb);
+        }
+    }
+
+    let pt_l = scalar_mul(G,   v_l);
+    let pt_r = scalar_mul(g_r, v_r);
+    let sum  = pt_add(pt_l, pt_r);
+
+    println!("[s3-test] k      = 0x{}", fe_to_hex(k));
+    println!("[s3-test] x_P    = 0x{}", fe_to_hex(target.x));
+    println!("[s3-test] x_L    = 0x{}", fe_to_hex(pt_l.x));
+    println!("[s3-test] x_R    = 0x{}", fe_to_hex(pt_r.x));
+
+    let split_ok = !sum.inf && sum.x == target.x && sum.y == target.y;
+    println!("[s3-test] split P_L + P_R == P : {}", if split_ok { "✓" } else { "✗ ERREUR split" });
+    if !split_ok {
+        eprintln!("[s3-test] ABORT — split incorrect, impossible de tester S₃");
+        return;
+    }
+
+    let p   = fe_to_bigint(FIELD_P);
+    let x_l = fe_to_bigint(pt_l.x);
+    let x_r = fe_to_bigint(pt_r.x);
+    let x_p = fe_to_bigint(target.x);
+
+    // Évaluation directe de S₃(x_L, x_R, x_P) — c00 de s3_bivariate_coeffs(A=x_L, B=x_R)
+    let coeffs = s3_bivariate_coeffs(&x_l, &x_r, &x_p, &p);
+    let c00 = &coeffs[0];
+
+    println!("[s3-test] S₃(x_L, x_R, x_P) mod p = {}", c00);
+    if c00.is_zero() {
+        println!("[s3-test] ✓ CORRECT — S₃ = 0 (arithmétique modulaire OK)");
+    } else {
+        println!("[s3-test] ✗ BUG — S₃ ≠ 0");
+        println!("[s3-test]   bits de la valeur = {}", c00.bits());
+        println!("[s3-test]   → vérifier fp_mod sur (x*y-7)² ou (x-y)²");
+    }
+
+    // Essayer les 9 combinaisons GLV (β^i·x_L, β^j·x_R) — l'une doit donner 0
+    println!();
+    println!("[s3-test] Recherche combinaison GLV (β^i·x_L, β^j·x_R) avec S₃=0 :");
+    let (gi, gj, coeffs_glv) = find_glv_coeffs(&x_l, &x_r, &x_p, &p);
+    println!("[s3-test]   β^{}·x_L, β^{}·x_R → S₃ = {}", gi, gj, &coeffs_glv[0]);
+    if coeffs_glv[0].is_zero() {
+        println!("[s3-test] ✓ Combinaison GLV correcte trouvée (i={gi}, j={gj})");
+    } else {
+        println!("[s3-test] ✗ Aucune combinaison GLV ne donne S₃=0 — bug dans split ou β");
+    }
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -766,6 +950,14 @@ fn main() {
     // ── Analyse LLL (optionnelle) ─────────────────────────────────────────────
     if args.lll {
         lll::print_lll_report(args.range_bits);
+    }
+
+    // ── Test juge de paix S₃ ────────────────────────────────────────────────
+    if args.s3test {
+        let seed_s = args.seed.trim_start_matches("0x");
+        let seed   = u64::from_str_radix(seed_s, 16).expect("--seed: hex u64");
+        run_s3_direct_test(seed, args.range_bits);
+        return;
     }
 
     // ── Golden Block Test ────────────────────────────────────────────────────

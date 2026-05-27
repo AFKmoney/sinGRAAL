@@ -1,4 +1,4 @@
-# sinGRAAL v12 — Cloud GPU Deployment Guide
+# sinGRAAL v13 — Cloud GPU Deployment Guide (Puzzle #135)
 
 Deploy sinGRAAL across cloud GPU providers in minutes using Docker.
 
@@ -188,18 +188,19 @@ docker compose up -d --scale worker=8
 
 ## Cost Estimates (Bitcoin Puzzle #135)
 
-sinGRAAL v12: C ≈ 1.10, E[ops] ≈ 1.10 × 2^67.5 ≈ 1.94 × 10^20 steps
+sinGRAAL v13: C ≈ 0.55 (6-aut + bidir + GLV4D Halton), E[ops] ≈ 0.55 × 2^67.5 / √12 ≈ 2^65.3 steps
 
-| Config | Gstep/s | Time | Est. Cost |
-|--------|---------|------|-----------|
-| 1 RTX 4090 | ~1.0 | ~2,050 years | — |
-| 8 RTX 4090 (single node) | ~8.0 | ~256 years | ~$30/day |
-| 32 RTX 4090 (vast.ai) | ~32 | ~64 years | ~$120/day |
-| 100 A100 (Lambda) | ~50 | ~40 years | ~$1,200/day |
-| 1,000 RTX 4090 (farm) | ~1,000 | ~2 years | ~$3,000/day |
-| 10,000 RTX 4090 | ~10,000 | ~75 days | ~$30,000/day |
+| Config | Gstep/s | Temps | Coût estimé |
+|--------|---------|-------|-------------|
+| 1× RTX 4090 | ~1.5 | ~600 ans | — |
+| 8× RTX 4090 (nœud unique) | ~12 | ~75 ans | ~$30/jour |
+| 32× RTX 4090 (vast.ai) | ~48 | ~19 ans | ~$120/jour |
+| 100× A100 (Lambda) | ~75 | ~12 ans | ~$1,200/jour |
+| 1 000× RTX 4090 (farm) | ~1 500 | ~220 jours | ~$3,000/jour |
+| 10 000× RTX 4090 | ~15 000 | ~22 jours | ~$30,000/jour |
 
-> Note: puzzle #135 reward ≈ 135 BTC. GPU farm economics only positive if BTC price rises enough or the pool gets lucky (expected value depends on probability of early solve).
+> Cible : puzzle #135 — `02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16`
+> Récompense ≈ 135 BTC. TARGET_X/TARGET_Y dérivés de cette clé publique compressée.
 
 ---
 
