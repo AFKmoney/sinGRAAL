@@ -48,6 +48,7 @@ mod secp;
 mod lll;
 mod coppersmith;
 mod lll_earlyabort;
+mod dispatcher;
 
 use clap::Parser;
 use secp::*;
@@ -123,6 +124,30 @@ struct Args {
     /// Graine hex u64 pour selftest.
     #[arg(long, default_value = "0x135")]
     seed: String,
+
+    /// Lancer le Dispatcher GLV toroïdal (PNC+LLL sur grille scalaire 2D).
+    #[arg(long)]
+    dispatch: bool,
+
+    /// Bits de la demi-dimension de la grille GLV (défaut : ceil(range_bits/2)+2).
+    #[arg(long)]
+    half_bits: Option<u32>,
+
+    /// Niveau Jochemsz-May pour la matrice de Macaulay (2=dim15, 3=dim28).
+    #[arg(long, default_value = "2")]
+    m_level: u32,
+
+    /// Benchmark du Dispatcher : N paires aléatoires, mesure PNC+LLL rejection rate.
+    #[arg(long)]
+    dispatch_bench: bool,
+
+    /// Nombre de paires pour --dispatch-bench.
+    #[arg(long, default_value = "20")]
+    dispatch_bench_n: u64,
+
+    /// Test Golden Block Dispatcher : vérifie que la tuile solution survit au filtre.
+    #[arg(long)]
+    golden_dispatch: bool,
 }
 
 // ─── Utilitaires scalaires ───────────────────────────────────────────────────
@@ -1002,6 +1027,15 @@ fn main() {
         if !args.estimate_only { println!(); }
     }
 
+    // ── Benchmark Dispatcher ─────────────────────────────────────────────────
+    if args.dispatch_bench {
+        let block_bits = args.block_bits.unwrap_or(5);
+        dispatcher::benchmark_dispatcher(
+            args.range_bits, block_bits, args.m_level, args.dispatch_bench_n
+        );
+        if args.estimate_only { return; }
+    }
+
     if args.estimate_only { return; }
 
     // ── Cible ─────────────────────────────────────────────────────────────────
@@ -1037,7 +1071,36 @@ fn main() {
     };
 
     // ── Dispatch 1D / 2D / Semaev ────────────────────────────────────────────
-    let result = if args.semaev {
+    // ── Golden Dispatch Test ──────────────────────────────────────────────────
+    if args.golden_dispatch {
+        let block_bits = args.block_bits.unwrap_or(5);
+        let seed_s = args.seed.trim_start_matches("0x");
+        let seed   = u64::from_str_radix(seed_s, 16).expect("--seed: hex u64");
+        let k  = random_key(seed, args.range_bits);
+        eprintln!("[golden-dispatch] k = 0x{}", fe_to_hex(k));
+        let passed = dispatcher::golden_block_test(k, args.range_bits, block_bits, args.m_level);
+        if passed { eprintln!("[golden-dispatch] ✓ PASS"); }
+        else       { eprintln!("[golden-dispatch] ✗ FAIL"); }
+        return;
+    }
+
+    let result = if args.dispatch {
+        let block_bits = args.block_bits.unwrap_or_else(|| {
+            let bb = ((args.range_bits + 3) / 4).max(3).min(22);
+            eprintln!("[auto] dispatcher block_bits = {bb}");
+            bb
+        });
+        let half_bits = args.half_bits.unwrap_or_else(|| {
+            let hb = (args.range_bits / 2 + 2).min(64);
+            eprintln!("[auto] dispatcher half_bits = {hb}");
+            hb
+        });
+        let mut cfg = dispatcher::DispatcherConfig::new(target, args.range_bits, block_bits);
+        cfg.half_bits = half_bits;
+        cfg.m_level   = args.m_level;
+        cfg.verbose   = true;
+        dispatcher::run_dispatcher(&cfg)
+    } else if args.semaev {
         let block_bits = args.block_bits.unwrap_or_else(|| {
             let bb = ((args.range_bits + 3) / 4).max(3).min(20);
             eprintln!("[auto] block_bits = {bb}");
@@ -1074,7 +1137,7 @@ fn main() {
 
         eprintln!("[giant1D] Recherche (max {giant_max} steps)...");
         giant_search_1d(target, &table, m, giant_max, args.range_bits)
-    };
+    };  // end result
 
     // ── Résultat ──────────────────────────────────────────────────────────────
     match result {
