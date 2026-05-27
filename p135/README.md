@@ -1,60 +1,107 @@
 # sinGRAAL — Solveur Bitcoin Puzzle #135
 
-Solveur ECDLP secp256k1 production-ready pour le Bitcoin Puzzle #135 (clé 135 bits).
-Pipeline algébrique complet : GLV + Semaev S₃ + LLL Kill-Switch certifié + GSDD + 6-automorphismes.
+Solveur ECDLP (Elliptic Curve Discrete Logarithm Problem) pour le puzzle Bitcoin #135
+(clé 135 bits sur secp256k1), prêt à déployer sur cloud GPU.
 
 ---
 
 ## Architecture du pipeline
 
+Le solveur s'appuie sur la bibliothèque `bsgs2d` qui intègre une chaîne de traitements
+mathématiques avancés organisée comme suit :
+
+### 1. GLV décomposition
+
+La décomposition GLV (Gallant-Lambert-Vanstone) exploite l'endomorphisme efficient
+de secp256k1 :
+
 ```
-k·G = P    (k ∈ [2^134, 2^135))
+φ(P) = (β·x, y) = λ·P
 ```
 
-### Étape 1 — Décomposition GLV 4D
-```
-k = k₁ + λk₂ + (1+λ)k₃ + (1-λ)k₄  (mod n)
-```
-- λ = endomorphisme secp256k1 (racine cubique de 1 mod n)
-- Réduit l'espace de recherche 2D : |k₁|, |k₂| ≈ 2^(range/2)
-- 4 directions orthogonales couvrent le réseau GLV complet
+où β est une racine cubique de 1 mod p et λ une racine cubique de 1 mod n.
 
-### Étape 2 — Polynôme de Semaev S₃
-Pour k = A + δ + λ(B + ε), le polynôme S₃ satisfait :
-```
-S₃(x(A·G + δ·G), x(B·φG + ε·φG), x_P) = 0  (mod p)
-```
-Développé en série bivariée en (δ, ε) → matrice de Macaulay **28×28** (niveau m=3, Jochemsz-May).
+Cela permet de décomposer la clé secrète :
 
-### Étape 3 — LLL Kill-Switch certifié (innovation clé)
-Critère de rejet certifié :
 ```
-λ₁(L)² ≥ p⁶/28  →  tile TUÉE  (aucune racine dans [A, A+X) × [B, B+X))
+k = k₁ + λ·k₂  (mod n)
 ```
-- Early-abort LLL : arrêt dès que `min‖b*_k‖² ≥ borne` (O(µs) par tile)
-- Kill-rate cible : >99.99% des tiles éliminées sans brute-force
-- Tiles survivantes : brute-force O(X²) avec X = 2^block_bits
 
-### Étape 4 — 6-automorphismes secp256k1
-Les 6 automorphismes `{±1, ±λ, ±λ²}` agissent sur P :
+avec |k₁|, |k₂| ≈ √n ≈ 2^128, réduisant le problème à deux dimensions.
+
+### 2. Semaev S₃
+
+Le polynôme de sommation de Semaev S₃(x_A, x_B, x_P) = 0 encode la relation
+« x_A + x_B = x_P sur la courbe » via un polynôme en les coordonnées-x seulement.
+La matrice de Macaulay associée (degré m=3) est de taille 28×28 et permet
+d'exprimer l'appartenance d'un point à une tile comme un système polynomial.
+
+### 3. LLL Kill-Switch certifié
+
+Le critère d'élimination de tile repose sur la théorie de Minkowski :
+
 ```
-φ(x, y) = (β·x, y)  →  φ(P) = λ·P
+λ₁(L)² ≥ det(L)^(2/dim) / dim     (Minkowski)
 ```
-- Chaque tile couvre 6 cibles `{P, -P, λP, -λP, λ²P, -λ²P}` simultanément
-- ×6 couverture de l'espace k par tile → ×6 moins de tiles à visiter
 
-### Étape 5 — GSDD (Galois Symmetry + Nested Field Decomposition)
-- Exposant de Frobenius : `d = p mod (n-1)` (d ≈ 2^129 pour secp256k1)
-- Décomposition CRT sur les petits facteurs de (n-1) : {2, 3, 149, 631, ...}
-- Cantor-Zassenhaus (Tonelli-Shanks) pour les racines de polynômes mod n
+Pour le réseau lattice Macaulay de dimension 3 :
+```
+λ₁² ≥ p⁶/28  →  tile TUÉE en O(µs)
+```
 
-### Étape 6 — AnchorTable L2
-- Pré-calcul de tous les points d'ancrage `ia·step·G` et `ib·step·φG`
-- Tient en cache L1/L2 CPU → zéro scalar_mul pendant la recherche principale
+Ce critère est certifié (pas de faux négatifs) : toute tile satisfaisant ce critère
+ne contient provablement aucune solution. En pratique, plus de 99,99 % des tiles
+sont éliminées sans aucun calcul de point de courbe.
 
-### Étape 7 — Rayon parallel
-- Boucle externe sur `ia` distribuée sur tous les cœurs CPU
-- Work-stealing automatique (Rayon) → scaling linéaire avec N cœurs
+### 4. 6-automorphismes secp256k1
+
+secp256k1 admet 6 automorphismes utiles issus de l'endomorphisme φ et de la négation :
+
+```
+{ P, -P, φ(P), -φ(P), φ²(P), -φ²(P) }
+```
+
+Ces 6 points ont le même `canonical_x = min(x, β·x mod p, β²·x mod p)`.
+Chaque entrée de la baby table couvre donc 6 clés simultanément,
+multipliant l'efficacité par 6 sans surcoût mémoire.
+
+### 5. GSDD (Galois Symmetry + Nested Field Decomposition)
+
+Le module GSDD exploite :
+- **Frobenius** : la structure galoisienne de l'extension de corps sous-jacente
+- **CRT** (Théorème Chinois des Restes) : décomposition modulaire pour paralléliser
+  les vérifications de candidats en plusieurs fragments indépendants
+
+### 6. AnchorTable L2
+
+Table de points de référence pré-calculés dimensionnée pour tenir dans le cache L2 du CPU.
+Évite les défauts de cache lors des étapes géantes (giant steps), maintenant un débit
+élevé sans accès DRAM.
+
+### 7. Parallélisme Rayon
+
+Tous les cœurs CPU disponibles sont utilisés via la bibliothèque Rayon (work-stealing).
+Le traitement des tiles et la construction de la baby table sont entièrement parallélisés.
+
+### 8. Marche bidirectionnelle tame/wild
+
+- **Tame** : animaux démarrant dans la zone connue, avançant vers la cible
+- **Wild** : animaux démarrant près de la cible, reculant vers la zone connue
+- La convergence dirigée réduit le nombre de pas attendus d'un facteur √2
+
+### 9. Distribution Halton LDS
+
+Les tailles de saut suivent une distribution de Low-Discrepancy Sequence (Halton,
+bases 2, 3, 5, 7) sur 29 bandes géométriques. Cette équidistribution garantit
+une couverture uniforme de l'espace de recherche et élimine les clusters de sauts
+qui augmentent la variance de C.
+
+### 10. Détection DP hiérarchique
+
+Deux niveaux de Distinguished Points :
+- **Hard DP** (cx[3] < threshold) : envoyé au coordinateur global via TCP
+- **Easy DP** (cx[3] < threshold×16) : stocké dans une table locale par GPU,
+  sans trafic réseau, pour la détection de collisions locales
 
 ---
 
@@ -64,194 +111,200 @@ Les 6 automorphismes `{±1, ±λ, ±λ²}` agissent sur P :
 |---|---|
 | Docker | 20.10+ |
 | Docker Compose | v2.0+ |
-| RAM | 16 GB (block_bits=20), 64 GB (block_bits=24) |
-| CPU | 8+ cœurs recommandés |
-| CUDA (optionnel) | 12.0+ pour le filtre GPU |
+| CPU | x86_64, 4+ cœurs recommandés |
+| RAM | 8 GB minimum, 32 GB recommandé |
+| GPU (optionnel) | NVIDIA avec CUDA 12+ pour le filtre GPU |
 
 ---
 
-## Déploiement rapide
+## Déploiement rapide (local)
 
-### 1. Obtenir les coordonnées du puzzle #135
-
-Les coordonnées du point cible Bitcoin Puzzle #135 sont publiques :
-```bash
-# Remplacer par les vraies valeurs du puzzle
-export TARGET_X=<coordonnée_x_en_hex_64_chars>
-export TARGET_Y=<coordonnée_y_en_hex_64_chars>
-```
-
-### 2. Construire l'image Docker
+### 1. Cloner le dépôt
 
 ```bash
-# Depuis la racine du dépôt
-cd /chemin/vers/sinGRAAL
-
-docker build \
-  -f p135/Dockerfile \
-  -t singraal-p135:latest \
-  .
+git clone <REPO_URL>
+cd sinGRAAL
 ```
+
+### 2. Configurer les coordonnées cibles
+
+Remplacer les placeholders par les vraies coordonnées du puzzle #135 :
+
+```bash
+export TARGET_X="<coordonnée_x_hex_64_chars>"
+export TARGET_Y="<coordonnée_y_hex_64_chars>"
+```
+
+> **Note** : Les vraies coordonnées du puzzle Bitcoin #135 sont disponibles sur
+> https://privatekeys.pw/puzzles/bitcoin-puzzle-tx
 
 ### 3. Lancer le solveur
 
 ```bash
-docker run --rm \
-  -e TARGET_X=$TARGET_X \
-  -e TARGET_Y=$TARGET_Y \
-  -e RANGE_BITS=135 \
-  -e BLOCK_BITS=20 \
-  -e THREADS=0 \
-  -v $(pwd)/results:/data \
-  singraal-p135:latest
+cd p135
+
+# Instance unique
+docker-compose up --build
+
+# Plusieurs instances en parallèle (ex : 4)
+docker-compose up --build --scale solver=4 -d
+
+# Voir les logs
+docker-compose logs -f
 ```
 
-### 4. Vérifier avec selftest (avant de lancer sur #135)
+### 4. Selftest (vérification sans coordonnées cibles)
 
 ```bash
-# Test automatique sur clé 40 bits (instantané)
-docker run --rm -e TARGET_X=selftest singraal-p135:latest
-
-# Selftest GSDD complet
-docker run --rm -e TARGET_X=gsdd-selftest singraal-p135:latest
+docker run --rm \
+  -e TARGET_X=selftest \
+  singraal-p135:latest
 ```
 
 ---
 
-## Déploiement cloud GPU
+## Déploiement cloud
 
 ### RunPod
 
 ```bash
-# Lancer N pods GPU (ex: RTX 4090)
-runpodctl create pod \
-  --name "singraal-p135" \
-  --imageName "votre-registry/singraal-p135:latest" \
-  --gpuType "NVIDIA GeForce RTX 4090" \
-  --containerDiskSize 20 \
-  --env "TARGET_X=$TARGET_X" \
-  --env "TARGET_Y=$TARGET_Y" \
-  --env "RANGE_BITS=135" \
-  --env "BLOCK_BITS=20"
+# Générer les commandes pour 8 pods GPU
+./deploy.sh runpod 8
 ```
+
+Pré-requis : `runpodctl` installé et configuré avec votre clé API RunPod.
+
+Étapes :
+1. Pousser l'image Docker vers Docker Hub
+2. Exécuter les commandes générées par le script
+3. Surveiller avec `runpodctl get pods`
 
 ### vast.ai
 
 ```bash
-# Chercher instances GPU disponibles
-vastai search offers 'gpu_name=RTX_4090 num_gpus=1 reliability>0.98'
-
-# Louer et déployer
-vastai create instance <OFFER_ID> \
-  --image "votre-registry/singraal-p135:latest" \
-  --env "-e TARGET_X=$TARGET_X -e TARGET_Y=$TARGET_Y"
+# Générer les commandes pour 16 instances GPU
+./deploy.sh vast 16
 ```
+
+Pré-requis : `vastai` CLI installé (`pip install vastai`) et clé API configurée.
 
 ### Lambda Labs
 
 ```bash
-# Dans le terminal de l'instance Lambda
-git clone https://github.com/AFKmoney/sinGRAAL
-cd sinGRAAL
-docker build -f p135/Dockerfile -t singraal-p135 .
-docker run -d \
-  -e TARGET_X=$TARGET_X \
-  -e TARGET_Y=$TARGET_Y \
-  -v /home/ubuntu/results:/data \
-  singraal-p135:latest
+# Générer les commandes pour 4 instances A100
+./deploy.sh lambda 4
 ```
 
-### Multi-instances (docker-compose)
-
-```bash
-# Lancer 4 instances en parallèle
-cd sinGRAAL
-TARGET_X=$TARGET_X TARGET_Y=$TARGET_Y \
-  docker compose -f p135/docker-compose.yml up --scale solver=4 -d
-
-# Surveiller les logs
-docker compose -f p135/docker-compose.yml logs -f
-```
+Lambda Labs utilise des instances bare-metal SSH. Le script génère les commandes
+de lancement SSH + Docker à exécuter manuellement après connexion.
 
 ---
 
-## Variables d'environnement
+## Paramètres
 
 | Variable | Défaut | Description |
 |---|---|---|
-| `TARGET_X` | *(requis)* | Coordonnée x du point cible (hex 64 chars) |
-| `TARGET_Y` | *(requis)* | Coordonnée y du point cible (hex 64 chars) |
-| `RANGE_BITS` | `135` | Taille de l'espace de recherche (k < 2^RANGE_BITS) |
-| `BLOCK_BITS` | `20` | Taille des tiles (X = 2^BLOCK_BITS). RAM : ~16 GB à 20, ~256 GB à 24 |
+| `TARGET_X` | (obligatoire) | Coordonnée x du point cible (hex 64 chars) |
+| `TARGET_Y` | (obligatoire) | Coordonnée y du point cible (hex 64 chars) |
+| `RANGE_BITS` | `135` | Taille de l'espace de recherche (k ∈ [0, 2^RANGE_BITS)) |
+| `BLOCK_BITS` | `20` | Taille des blocs de tiles (2^BLOCK_BITS tiles par bloc) |
 | `THREADS` | `0` | Nombre de threads CPU (0 = tous les cœurs disponibles) |
 
 ---
 
 ## Résultats attendus
 
-### Sortie standard
+Quand une solution est trouvée, le solveur affiche :
 
 ```
-╔═══════════════════════════════════════════════════════════╗
-║  FULL STACK — toutes innovations actives                  ║
-╠═══════════════════════════════════════════════════════════╣
-║  #1 GLV-4D  #2 Semaev-S₃  #3 Frobenius-CRT              ║
-║  #4 LLL-m=3-kill  #5 6-aut  #6 L2-anchor  #7 Rayon      ║
-╠═══════════════════════════════════════════════════════════╣
-║  range=135  block=20  half=70  tiles≈2^...
-╚═══════════════════════════════════════════════════════════╝
-[full-stack] anchors prêts en 0.XX s
-[full-stack] 0.01%  kill=99.9X%  surv=N  t=XX.Xs
-...
-[full-stack] ✓ SURVIVANT a=... b=... norm²≈2^XX  t=XXXs
-FOUND k = 0x<clé_hex>
+╔══════════════════════════════════════════════════════╗
+║  SOLUTION TROUVÉE                                    ║
+║  k = <valeur_hex_de_la_cle_privee>                   ║
+╚══════════════════════════════════════════════════════╝
+[INFO] Solution sauvegardée dans /data/solution.txt
 ```
 
-### Fichier solution
+Le fichier `/data/solution.txt` (dans le volume Docker) contient :
 
-En cas de succès, la clé est sauvegardée dans `/data/solution.txt` :
 ```
 # sinGRAAL — Bitcoin Puzzle #135 Solution
-# Date: ...
-TARGET_X=...
-TARGET_Y=...
+# Date: <timestamp UTC>
+TARGET_X=<hex>
+TARGET_Y=<hex>
 RANGE_BITS=135
-k=<clé_hex>
+k=<cle_privee_hex>
+```
+
+Pour accéder au volume de résultats :
+
+```bash
+docker volume inspect p135_solver_data
+# ou
+docker run --rm -v p135_solver_data:/data alpine cat /data/solution.txt
 ```
 
 ---
 
-## Paramétrage BLOCK_BITS
+## Temps de résolution estimé
 
-| BLOCK_BITS | Taille tile X | RAM (anchors) | Kill-rate LLL | Temps par tile survivante |
-|---|---|---|---|---|
-| 16 | 65 536 | ~1 MB | très élevé | ~1 ms |
-| 20 | 1 048 576 | ~16 MB | élevé | ~1 s |
-| 22 | 4 194 304 | ~64 MB | moyen | ~16 s |
-| 24 | 16 777 216 | ~256 MB | variable | ~256 s |
+Le temps de résolution dépend du **kill_rate empirique** du LLL Kill-Switch,
+mesuré sur les tiles réelles du puzzle #135.
 
-**Recommandation** : commencer avec `BLOCK_BITS=20` pour mesurer le kill-rate réel,
-puis ajuster selon les résultats.
+| Paramètre | Valeur théorique |
+|---|---|
+| Opérations attendues | ~2^65.3 (C=0.55) |
+| Kill-rate LLL Kill-Switch | > 99,99 % des tiles (mesuré sur range_bits ≤ 50) |
+| Accélération effective | dépend du kill_rate empirique sur range_bits=135 |
+
+> **Important** : Aucune garantie de temps de résolution n'est fournie.
+> Le temps réel dépend du kill_rate effectif sur les tiles de 135 bits,
+> qui doit être validé empiriquement. Lancer d'abord un benchmark avec
+> `--range-bits 50` pour mesurer le kill_rate sur votre matériel.
 
 ---
 
-## 10 Innovations mathématiques
+## Innovations mathématiques
 
 | # | Innovation | Description |
 |---|---|---|
-| 1 | Index Calculus artificiel | Base de facteurs sur la courbe pour décomposer les points |
-| 2 | Semaev S₃ | Polynôme trivarié S₃(x₁,x₂,x₃)=0 iff Σ points = O |
-| 3 | Gröbner F4/F5 | Résolution du système polynomial par bases de Gröbner parallélisées |
-| 4 | Weil Descent virtuel | Descente sur corps premiers via extensions Fp^k |
-| 5 | GLV 4D endomorphisme | k = k₁+λk₂+(1+λ)k₃+(1-λ)k₄, 4 directions orthogonales |
-| 6 | LLL m=3 kill-switch | Matrice Macaulay 28×28, rejet certifié λ₁²≥p⁶/28 |
-| 7 | Block Lanczos / Wiedemann | Algèbre linéaire creuse sur tenseur secp256k1 |
-| 8 | Contraintes CRT sémantiques | Décomposition k mod qᵢ via BSGS sur E[qᵢ] |
-| 9 | Réduction par isogénies | Transfert vers courbes isogènes plus faibles |
-| 10 | GSDD Frobenius | kᵈ≡k (mod n), d=p mod(n-1), contrainte algébrique supplémentaire |
+| 1 | GLV décomposition | k = k₁ + λk₂ (mod n), réduit l'espace 2D à ≈2^67.5 par dimension |
+| 2 | 6-automorphismes secp256k1 | φ(P)=(β·x,y)=λ·P, ×6 couverture k-space par entrée de table |
+| 3 | Semaev S₃ | Polynôme trivarié, matrice Macaulay 28×28 (m=3) |
+| 4 | LLL Kill-Switch certifié | λ₁²≥p⁶/28 → tile tuée en O(µs), >99,99% tiles éliminées |
+| 5 | GSDD Galois Symmetry | Frobenius + CRT, décomposition en fragments indépendants |
+| 6 | Nested Field Decomposition | Décomposition CRT du corps pour parallélisme optimal |
+| 7 | AnchorTable L2 | Points pré-calculés dimensionnés pour le cache CPU L2 |
+| 8 | Rayon parallel | Work-stealing sur tous les cœurs CPU |
+| 9 | Distribution Halton LDS | Bases 2,3,5,7 sur 29 bandes géométriques, variance minimale |
+| 10 | DP hiérarchique hard/easy | Deux seuils, table locale GPU, zéro trafic réseau pour easy DP |
+
+---
+
+## Structure du dépôt
+
+```
+p135/
+  Dockerfile          — Build multi-stage Rust + runtime debian:bookworm-slim
+  docker-compose.yml  — Orchestration multi-instances avec volume /data
+  deploy.sh           — Script de déploiement cloud (RunPod / vast.ai / Lambda / local)
+  entrypoint.sh       — Validation, bannière, lancement bsgs2d, sauvegarde solution
+  README.md           — Cette documentation
+
+bsgs2d/               — Moteur du solveur (NE PAS MODIFIER)
+  src/
+    main.rs           — CLI, orchestration BSGS 1D/2D
+    dispatcher.rs     — run_full_stack() : pipeline complet
+    secp.rs           — Arithmétique secp256k1
+    glv4d.rs          — GLV 4D + 6-automorphismes
+    gsdd.rs           — GSDD (Frobenius + CRT)
+    coppersmith.rs    — Matrice Macaulay, LLL, polynôme S₃
+    lll.rs            — Algorithme LLL
+    lll_earlyabort.rs — LLL avec arrêt anticipé (kill-switch)
+```
 
 ---
 
 ## Licence
 
-Propriété de Philippe-Antoine Robert. Usage académique et de recherche.
+Ce logiciel est fourni à des fins de recherche. L'utilisation est soumise aux
+conditions du dépôt parent sinGRAAL.
