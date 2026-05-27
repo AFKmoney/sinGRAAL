@@ -30,6 +30,7 @@ use num_rational::BigRational;
 use num_traits::{Zero, One, Signed, ToPrimitive};
 use num_integer::Integer;
 use crate::secp::{Fe, fp_mul, fp_sub, fp_add, fp_neg, fp_inv, FIELD_P, fe_lt, BETA, BETA2};
+use crate::lll_earlyabort::is_dead_fast;
 
 // ─── Conversion Fe ↔ BigInt ──────────────────────────────────────────────────
 
@@ -414,6 +415,11 @@ impl LatticePruner {
         if coeffs[0].is_zero() { return true; }
 
         let mat = build_macaulay_matrix(&coeffs, &x_big, &self.p, self.dim);
+
+        // PNC Kill Switch : GS partiel f64 + LLL f64 early-abort (~2µs)
+        // Élimine ~85% des matrices avant le LLL BigRational coûteux (~170ms)
+        if is_dead_fast(&mat) { return false; }
+
         let reduced = lll_reduce_bigint(mat);
 
         // Vecteur le plus court après LLL
@@ -464,6 +470,10 @@ impl LatticePruner {
         if coeffs[0].is_zero() { return true; }
 
         let mat = build_macaulay_bivariate_m2(&coeffs, &x_big, &self.p);
+
+        // PNC Kill Switch (dim=15, ~2µs vs ~170ms LLL complet)
+        if is_dead_fast(&mat) { return false; }
+
         let reduced = lll_reduce_bigint(mat);
 
         let shortest_norm_sq = reduced.iter()
@@ -877,6 +887,10 @@ impl LatticePruner {
         let (_i, _j, coeffs) = find_glv_coeffs(start_a, start_b, &self.target_x, &self.p);
         if coeffs[0].is_zero() { return true; }
         let mat = build_macaulay_bivariate_m3(&coeffs, &x_big, &self.p);
+
+        // PNC Kill Switch (dim=28, ~5µs vs ~2s LLL complet)
+        if is_dead_fast(&mat) { return false; }
+
         let reduced = lll_reduce_bigint(mat);
         let shortest_norm_sq = reduced.iter()
             .map(|row| norm_sq_bigint(row))
