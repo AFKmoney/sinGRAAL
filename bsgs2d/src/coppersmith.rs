@@ -459,8 +459,15 @@ impl LatticePruner {
     /// Matrice 15×15, bound p⁴/15. false = REJET prouvé.
     pub fn is_block_pair_viable(&self, start_a: &BigInt, start_b: &BigInt, block_bits: u32) -> bool {
         let x_big = BigInt::one() << block_bits as usize;
-        // Essayer les 9 combinaisons GLV pour trouver c₀₀=0 ou la moins mauvaise
-        let (_i, _j, coeffs) = find_glv_coeffs(start_a, start_b, &self.target_x, &self.p);
+        // Chercher le twist β^i, β^j qui annule c₀₀ sur les centres de blocs.
+        // Les blocs doivent être twistés AVANT d'entrer dans Macaulay — sinon c₀₀≠0
+        // et le filtre LLL tue le bloc solution même quand la clé est dedans.
+        let center_a = start_a + (&x_big >> 1);
+        let center_b = start_b + (&x_big >> 1);
+        let (ti, tj, _) = find_glv_coeffs(&center_a, &center_b, &self.target_x, &self.p);
+        let a_tw = beta_pow_bigint(start_a, ti);
+        let b_tw = beta_pow_bigint(start_b, tj);
+        let (_i, _j, coeffs) = find_glv_coeffs(&a_tw, &b_tw, &self.target_x, &self.p);
         if coeffs[0].is_zero() { return true; }
 
         let mat = build_macaulay_bivariate_m2(&coeffs, &x_big, &self.p);
@@ -503,17 +510,22 @@ impl LatticePruner {
     }
 }
 
-// ─── Coefficients bivariés de f₃(A+x, B+y, w) ───────────────────────────────
+// ─── Coefficients bivariés de S₃(A+x, B+y, w) ───────────────────────────────
 //
-// Formule correcte : f₃(u,v,w) = (u-v)²w² − 2[uv(u+v)+2b]w + (uv)²−4b(u+v)  (b=7)
+// Vraie formule Semaev pour y²=x³+b (a=0, b=7) :
+//   S₃(u,v,w) = (u-v)²w² - 2[uv(u+v)+2b]w + u²v²-4b(u+v)
 //
-// Dérivées partielles en (u,v,w) = (A,B,w) :
-//   c20 = ½ ∂²f₃/∂u² = (w−B)²
-//   c02 = ½ ∂²f₃/∂v² = (w−A)²
-//   c11 =   ∂²f₃/∂u∂v = −2w²−4(A+B)w+4AB
-//   c10 = ∂f₃/∂u = 2(A−B)w²−2B(2A+B)w+2AB²−4b
-//   c01 = ∂f₃/∂v = −2(A−B)w²−2A(A+2B)w+2A²B−4b
-//   c00 = f₃(A,B,w)
+// Dérivé de la condition P₁+P₂+P₃=O :
+//   (x₃+x₁+x₂)(x₁-x₂)² = (y₁-y₂)²
+//   Élimination de y₁y₂ via y_i²=x_i³+b → polynôme en x₁,x₂,x₃ seul.
+//
+// Coefficients de S₃(A+x, B+y, w) = Σ c_{ij} x^i y^j :
+//   c00 = (A-B)²w² - 2(AB(A+B)+14)w + A²B²-28(A+B)
+//   c10 = 2(A-B)w² - 2B(2A+B)w + 2AB²-28
+//   c01 = -2(A-B)w² - 2A(A+2B)w + 2A²B-28
+//   c20 = (w-B)²
+//   c02 = (w-A)²
+//   c11 = -2w² - 4(A+B)w + 4AB
 pub fn s3_bivariate_coeffs(
     a: &BigInt,
     b: &BigInt,
@@ -524,49 +536,43 @@ pub fn s3_bivariate_coeffs(
     let b28 = BigInt::from(28u32);   // 4b
     let w   = x_p;
     let w2  = fp_mod(&(w * w));
-    let ab  = fp_mod(&(a * b));
-    let apb = fp_mod(&(a + b));
-    let amb = fp_mod(&(a - b));
-    let a2  = fp_mod(&(a * a));
-    let b2  = fp_mod(&(b * b));
+    let ab  = fp_mod(&(a * b));       // A·B
+    let apb = fp_mod(&(a + b));       // A+B
+    let amb = fp_mod(&(a - b));       // A-B
+    let ab2 = fp_mod(&(&ab * b));     // A·B²
+    let a2b = fp_mod(&(&ab * a));     // A²·B
+    let ab_sq = fp_mod(&(&ab * &ab)); // (A·B)²
 
-    // c00 = (A-B)²w² − 2[AB(A+B)+2b]w + (AB)²−4b(A+B)
-    let d2     = fp_mod(&(&amb * &amb));
-    let abapb  = fp_mod(&(&ab * &apb));
-    let mid00  = fp_mod(&(&abapb + &b14));
-    let ab2    = fp_mod(&(&ab * &ab));
-    let c00    = fp_mod(
-        &(&d2 * &w2
-          - BigInt::from(2u32) * &mid00 * w
-          + &ab2
-          - &b28 * &apb),
-    );
+    // c00 = (A-B)²w² - 2(AB(A+B)+14)w + A²B²-28(A+B)
+    let d2  = fp_mod(&(&amb * &amb));
+    let t1  = fp_mod(&(&ab * &apb + 14));  // AB(A+B)+14
+    let c00 = fp_mod(&(&d2 * &w2 + &p + &p
+        - 2 * fp_mod(&(&t1 * w))
+        + &ab_sq + &p
+        - 28 * &apb));
 
-    // c10 = 2(A-B)w² − 2B(2A+B)w + 2AB²−4b
-    let t1  = fp_mod(&(BigInt::from(2u32) * &amb * &w2));
-    let t2  = fp_mod(&(BigInt::from(2u32) * b * fp_mod(&(BigInt::from(2u32) * a + b)) * w));
-    let t3  = fp_mod(&(BigInt::from(2u32) * a * &b2));
-    let c10 = fp_mod(&(&t1 - &t2 + &t3 - &b28));
+    // c10 = 2(A-B)w² - 2B(2A+B)w + 2AB²-28
+    let b_2apb = fp_mod(&(b * fp_mod(&(2 * a + b)))); // B(2A+B)
+    let c10 = fp_mod(&(2 * &amb * &w2 + &p + &p
+        - 2 * fp_mod(&(&b_2apb * w))
+        + 2 * &ab2 + &p - 28));
 
-    // c01 = −2(A-B)w² − 2A(A+2B)w + 2A²B−4b
-    let t4  = fp_mod(&(BigInt::from(2u32) * a * fp_mod(&(a + BigInt::from(2u32) * b)) * w));
-    let t5  = fp_mod(&(BigInt::from(2u32) * &a2 * b));
-    let c01 = fp_mod(&(-&t1 - &t4 + &t5 - &b28));
+    // c01 = -2(A-B)w² - 2A(A+2B)w + 2A²B-28
+    let a_ap2b = fp_mod(&(a * fp_mod(&(a + 2 * b)))); // A(A+2B)
+    let c01 = fp_mod(&(&p - 2 * &amb * &w2 + &p + &p
+        - 2 * fp_mod(&(&a_ap2b * w))
+        + 2 * &a2b + &p - 28));
 
-    // c20 = (w−B)²
-    let wmb = fp_mod(&(w - b));
-    let c20 = fp_mod(&(&wmb * &wmb));
+    // c20 = (w-B)² = w² - 2Bw + B²
+    let c20 = fp_mod(&(&w2 + &p - 2 * b * w + b * b));
 
-    // c02 = (w−A)²
-    let wma = fp_mod(&(w - a));
-    let c02 = fp_mod(&(&wma * &wma));
+    // c02 = (w-A)² = w² - 2Aw + A²
+    let c02 = fp_mod(&(&w2 + &p - 2 * a * w + a * a));
 
-    // c11 = −2w²−4(A+B)w+4AB
-    let c11 = fp_mod(
-        &(-BigInt::from(2u32) * &w2
-          - BigInt::from(4u32) * &apb * w
-          + BigInt::from(4u32) * &ab),
-    );
+    // c11 = -2w² - 4(A+B)w + 4AB
+    let c11 = fp_mod(&(&p - 2 * &w2 + &p
+        - 4 * &apb * w
+        + 4 * &ab));
 
     [fp_mod(&c00), fp_mod(&c10), fp_mod(&c01), fp_mod(&c20), fp_mod(&c11), fp_mod(&c02)]
 }

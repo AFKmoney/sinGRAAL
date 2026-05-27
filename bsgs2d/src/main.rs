@@ -631,7 +631,7 @@ fn run_semaev(target: Pt, range_bits: u32, block_bits: u32) -> Option<Fe> {
 //   Appel filtre :  is_block_pair_viable(A, B, block_bits)  → doit retourner TRUE
 fn run_golden_block_test(seed: u64, range_bits: u32, block_bits: u32) {
     use coppersmith::{fe_to_bigint, s3_bivariate_coeffs, find_glv_coeffs,
-                     build_macaulay_bivariate_m2,
+                     build_macaulay_bivariate_m2, beta_pow_bigint,
                      lll_reduce_bigint, norm_sq_bigint, LatticePruner};
     use num_bigint::BigInt;
     use num_traits::Zero;
@@ -679,7 +679,29 @@ fn run_golden_block_test(seed: u64, range_bits: u32, block_bits: u32) {
     let x_p = fe_to_bigint(target.x);
     let p   = fe_to_bigint(FIELD_P);
 
-    // Vérif S₃(x_L, x_R, x_P) ≡ 0 (mod p) — tester les 9 combinaisons GLV
+    // ── Test direct S₃(x_L, x_R, x_P) ────────────────────────────────────────
+    // Si split check == true, ce DOIT être 0 par théorème EC.
+    // Si ≠ 0, bug dans la formule S₃ ou dans la conversion Fe→BigInt.
+    {
+        let fmod = |a: BigInt| -> BigInt { ((&a % &p) + &p) % &p };
+        // Vraie formule : (x-y)²w² - 2[xy(x+y)+14]w + x²y²-28(x+y)
+        let d   = fmod(&x_l - &x_r);
+        let s   = fmod(&x_l + &x_r);
+        let lr  = fmod(&x_l * &x_r);
+        let w2  = fmod(&x_p * &x_p);
+        let lr2 = fmod(&lr * &lr);
+        let s3 = fmod(
+            fmod(&d * &d) * &w2
+            - 2 * fmod(fmod(&lr * &s + 14i64) * &x_p)
+            + &lr2 - 28 * &s
+        );
+        eprintln!("[golden] S₃(x_L, x_R, x_P) direct (racine exacte) = {} (DOIT ÊTRE 0)", &s3);
+        if !s3.is_zero() {
+            eprintln!("[golden] *** BUG : formule S₃ incorrecte ou conversion Fe→BigInt fausse ***");
+        }
+    }
+
+    // Trouver le twist β qui annule S₃(β^i·x_L, β^j·x_R, x_P) ≡ 0 (mod p)
     let (ei, ej, coeffs_exact) = find_glv_coeffs(&x_l, &x_r, &x_p, &p);
     eprintln!("[golden] S₃(β^{}·x_L, β^{}·x_R, x_P) mod p = {}  (doit être 0)",
         ei, ej, &coeffs_exact[0]);
@@ -687,19 +709,23 @@ fn run_golden_block_test(seed: u64, range_bits: u32, block_bits: u32) {
         eprintln!("[golden] AVERTISSEMENT : aucune combinaison GLV ne donne c₀₀=0 — vérifier split");
     }
 
-    // Block boundaries (sur x_L et x_R bruts — les β^k sont appliqués dans find_glv_coeffs)
+    // Appliquer le twist β correct AVANT de calculer les bases de blocs.
+    // x_l_tw et x_r_tw sont les "vraies" coordonnées algébriques sur la courbe
+    // que Semaev attend — sans ce twist, c₀₀ ≠ 0 sur les blocs et le filtre LLL tue la solution.
+    let x_l_tw = beta_pow_bigint(&x_l, ei);
+    let x_r_tw = beta_pow_bigint(&x_r, ej);
+
     let xblk = BigInt::from(1u64) << block_bits as usize;
-    let a_base = &x_l - (&x_l % &xblk);
-    let b_base = &x_r - (&x_r % &xblk);
-    let delta0 = &x_l - &a_base;
-    let eps0   = &x_r - &b_base;
+    let a_base = &x_l_tw - (&x_l_tw % &xblk);
+    let b_base = &x_r_tw - (&x_r_tw % &xblk);
+    let delta0 = &x_l_tw - &a_base;
+    let eps0   = &x_r_tw - &b_base;
 
     eprintln!("[golden] block_bits={block_bits}  X={}", &xblk);
     eprintln!("[golden] δ₀ = {delta0}  (doit être < {xblk})");
     eprintln!("[golden] ε₀ = {eps0}  (doit être < {xblk})");
 
-    // Calculer manuellement norme LLL vs borne pour le bloc solution
-    // Utiliser find_glv_coeffs sur les bases de blocs (β^i·A, β^j·B)
+    // Coefficients bivariés sur les bases de blocs twistées — c₀₀ doit maintenant ≈ 0
     let (gi, gj, coeffs) = find_glv_coeffs(&a_base, &b_base, &x_p, &p);
     eprintln!("[golden] GLV combo (i={gi}, j={gj}) : c₀₀ = S₃(β^{gi}·A, β^{gj}·B, x_P)");
     eprintln!("[golden] c₀₀ ≠ 0 : {}", !coeffs[0].is_zero());
