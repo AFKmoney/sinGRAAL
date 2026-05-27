@@ -50,6 +50,7 @@ mod coppersmith;
 mod lll_earlyabort;
 mod dispatcher;
 mod glv4d;
+mod gsdd;
 
 use clap::Parser;
 use secp::*;
@@ -136,7 +137,7 @@ struct Args {
     half_bits: Option<u32>,
 
     /// Niveau Jochemsz-May pour la matrice de Macaulay (2=dim15, 3=dim28).
-    #[arg(long, default_value = "2")]
+    #[arg(long, default_value = "3")]
     m_level: u32,
 
     /// Benchmark du Dispatcher : N paires aléatoires, mesure PNC+LLL rejection rate.
@@ -166,6 +167,14 @@ struct Args {
     /// Nombre de threads Rayon (défaut : tous les cœurs disponibles).
     #[arg(long, default_value = "0")]
     threads: usize,
+
+    /// Lancer le pipeline GSDD complet (Galois Symmetry + Nested Field Decomposition).
+    #[arg(long)]
+    gsdd: bool,
+
+    /// Selftest GSDD : valide GLV, S₃, Frobenius, Cantor-Zassenhaus, LLL m=3.
+    #[arg(long)]
+    gsdd_selftest: bool,
 }
 
 // ─── Utilitaires scalaires ───────────────────────────────────────────────────
@@ -1005,6 +1014,15 @@ fn main() {
         bb
     });
 
+    // ── GSDD Selftest ─────────────────────────────────────────────────────────
+    if args.gsdd_selftest {
+        let seed_s = args.seed.trim_start_matches("0x");
+        let seed   = u64::from_str_radix(seed_s, 16).expect("--seed: hex u64");
+        let block_bits = args.block_bits.unwrap_or(8);
+        gsdd::selftest_gsdd(args.range_bits, block_bits, seed);
+        return;
+    }
+
     // ── Analyse LLL (optionnelle) ─────────────────────────────────────────────
     if args.lll {
         lll::print_lll_report(args.range_bits);
@@ -1164,7 +1182,18 @@ fn main() {
         return;
     }
 
-    let result = if args.optimized || args.parallel || args.dispatch {
+    let result = if args.gsdd {
+        let block_bits = args.block_bits.unwrap_or_else(|| {
+            let bb = ((args.range_bits + 3) / 4).max(3).min(20);
+            eprintln!("[auto] gsdd block_bits = {bb}");
+            bb
+        });
+        eprintln!("[main] Mode GSDD — Galois Symmetry + Nested Field Decomposition (m=3)");
+        let r = gsdd::gsdd_attack(target, args.range_bits, block_bits, true);
+        eprintln!("[gsdd] terminé en {:.2}s  candidates={}  kill_rate={:.2}%",
+            r.t_elapsed, r.n_candidates, r.kill_rate * 100.0);
+        r.k
+    } else if args.optimized || args.parallel || args.dispatch {
         let block_bits = args.block_bits.unwrap_or_else(|| {
             let bb = ((args.range_bits + 3) / 4).max(3).min(22);
             eprintln!("[auto] dispatcher block_bits = {bb}");

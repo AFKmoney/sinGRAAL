@@ -906,7 +906,7 @@ pub fn selftest_dispatcher(range_bits: u32, block_bits: u32) -> bool {
     eprintln!("[selftest] k = 0x{:016x}", k_fe[0]);
     eprintln!("[selftest] Golden Block Test (block_bits={block_bits})...");
 
-    let passed = golden_block_test(k_fe, range_bits, block_bits, 2);
+    let passed = golden_block_test(k_fe, range_bits, block_bits, 3);
     eprintln!("[selftest] résultat : {}", if passed { "✓ PASS" } else { "✗ FAIL" });
     passed
 }
