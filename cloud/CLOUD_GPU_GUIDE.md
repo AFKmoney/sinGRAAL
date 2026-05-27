@@ -4,18 +4,34 @@ Deploy sinGRAAL across cloud GPU providers in minutes using Docker.
 
 ---
 
-## GPU Architecture Selection
+## GPU Architecture — Automatic Detection (zero config)
 
-Build the Docker image with the correct `CUDA_ARCH` for your GPU:
+**You no longer need to pick `CUDA_ARCH`.** With `CUDA_ARCH` unset (the default),
+`build.rs` compiles a **portable multi-architecture fatbinary** covering every
+common datacenter and consumer GPU, plus embedded PTX for forward-compat JIT.
+The CUDA driver selects the matching cubin at load time, so a single image runs
+unchanged on any of these:
 
-| GPU | CUDA_ARCH | Cloud Providers |
-|-----|-----------|-----------------|
-| H100 | `sm_90` | RunPod, Lambda Labs, CoreWeave |
-| A100 | `sm_80` | RunPod, Lambda Labs, vast.ai, AWS p4d |
-| RTX 4090 | `sm_89` | RunPod, vast.ai, Jarvis Labs |
-| RTX 3090 / 3080 Ti | `sm_86` | vast.ai, RunPod |
-| RTX 2080 Ti | `sm_75` | vast.ai (budget) |
-| V100 | `sm_70` | AWS p3, Lambda Labs |
+| GPU | compute_cap | Covered by fatbinary |
+|-----|-------------|----------------------|
+| H100 | 9.0 (`sm_90`) | ✅ |
+| A100 | 8.0 (`sm_80`) | ✅ |
+| RTX 4090 / L4 / L40 | 8.9 (`sm_89`) | ✅ |
+| RTX 3090 / 3080 Ti | 8.6 (`sm_86`) | ✅ |
+| RTX 2080 Ti / T4 | 7.5 (`sm_75`) | ✅ |
+| V100 | 7.0 (`sm_70`) | ✅ |
+| newer (Blackwell, …) | ≥ 9.0 | ✅ via PTX JIT |
+
+At runtime the solver also auto-detects every visible GPU (name + VRAM via
+`nvidia-smi`) and, if `NUM_ANIMALS` is unset, auto-calibrates the animal count
+to the card's memory. **No flags required — just provide the target.**
+
+Optional: to shrink the image / speed up the build, pin one arch:
+```bash
+docker build --build-arg CUDA_ARCH=sm_89 .   # single-arch (e.g. RTX 4090)
+```
+If you build *on the target GPU machine* with `CUDA_ARCH` unset, `build.rs`
+detects the local card's compute capability and builds natively for it.
 
 ---
 
@@ -25,14 +41,15 @@ Build the Docker image with the correct `CUDA_ARCH` for your GPU:
 
 1. **Build and push your Docker image** (do this once from your laptop):
    ```bash
-   cd kangaroo
-   docker build -t your-dockerhub/singraal:v12-4090 --build-arg CUDA_ARCH=sm_89 .
-   docker push your-dockerhub/singraal:v12-4090
+   cd singraal
+   # CUDA_ARCH omitted → portable fatbinary (runs on any GPU below)
+   docker build -t your-dockerhub/singraal:v13 .
+   docker push your-dockerhub/singraal:v13
    ```
 
 2. **Create a RunPod template**:
    - Go to RunPod → Templates → New Template
-   - Container image: `your-dockerhub/singraal:v12-4090`
+   - Container image: `your-dockerhub/singraal:v13`
    - Container start command: leave blank (uses `entrypoint.sh`)
    - Environment variables:
      ```
@@ -71,7 +88,7 @@ ALL_GPUS=1
 ### Instance Setup
 
 1. Search for instances: filter by GPU (RTX 4090 recommended), CUDA 12.x+
-2. Select instance → "Edit instance" → Docker image: `your-dockerhub/singraal:v12-4090`
+2. Select instance → "Edit instance" → Docker image: `your-dockerhub/singraal:v13`
 3. Set environment variables in the "Environment" tab:
    ```bash
    TARGET_X=...
@@ -94,7 +111,7 @@ vastai search offers --storage 10 --gpu-name RTX_4090 --order dph_total
 # Launch 10 worker instances
 for i in $(seq 1 10); do
   vastai create instance <offer_id> \
-    --image your-dockerhub/singraal:v12-4090 \
+    --image your-dockerhub/singraal:v13 \
     --env '-e TARGET_X=... -e TARGET_Y=... -e COORDINATOR=<ip>:5135 -e ALL_GPUS=1' \
     --disk 10
 done
@@ -125,17 +142,17 @@ curl -s -L "https://nvidia.github.io/libnvidia-container/$distribution/libnvidia
 sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
 sudo systemctl restart docker
 
-# Build (A100 = sm_80, H100 = sm_90)
+# Build — fatbinary runs on any GPU (or pin with --build-arg CUDA_ARCH=sm_80)
 git clone https://github.com/afkmoney/singraal
-cd singraal/kangaroo
-docker build -t singraal:v12 --build-arg CUDA_ARCH=sm_80 .
+cd singraal
+docker build -t singraal:v13 .
 
 # Run standalone (all A100s)
 docker run --gpus all \
   -e TARGET_X=<hex> -e TARGET_Y=<hex> \
   -e ALL_GPUS=1 \
   -v /data/singraal:/data \
-  singraal:v12
+  singraal:v13
 ```
 
 ### Multi-node pool on Lambda (1 coordinator + N workers)
@@ -145,7 +162,7 @@ docker run --gpus all \
 docker run --gpus all -d --restart always -p 5135:5135 \
   -e SERVE=1 -e TARGET_X=<hex> -e TARGET_Y=<hex> \
   -v /data/singraal:/data \
-  singraal:v12
+  singraal:v13
 ```
 
 **On each worker node** (replace `COORD_IP` with coordinator's private IP):
@@ -155,7 +172,7 @@ docker run --gpus all -d --restart always \
   -e COORDINATOR=<COORD_IP>:5135 \
   -e ALL_GPUS=1 \
   -v /data/singraal:/data \
-  singraal:v12
+  singraal:v13
 ```
 
 ---
@@ -168,7 +185,8 @@ For machines with 4+ GPUs, use the included `docker-compose.yml`:
 cd cloud
 export TARGET_X=<hex64>
 export TARGET_Y=<hex64>
-export CUDA_ARCH=sm_89   # RTX 4090
+# CUDA_ARCH optional — leave unset for a portable fatbinary, or pin one arch:
+# export CUDA_ARCH=sm_89   # RTX 4090
 
 # Build once
 docker compose build
@@ -212,7 +230,7 @@ Always mount `/data` as a volume — the coordinator saves the DP table every 60
 docker run --gpus all \
   -v /host/path/to/data:/data \
   -e TARGET_X=... \
-  singraal:v12
+  singraal:v13
 ```
 
 On restart, it resumes automatically from the checkpoint.

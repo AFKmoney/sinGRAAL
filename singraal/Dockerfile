@@ -19,8 +19,12 @@ WORKDIR /singraal
 COPY . .
 
 # --- build (release, Toom-6 CUDA kernel) ---
-# Override CUDA_ARCH at build time: docker build --build-arg CUDA_ARCH=sm_86 .
-ARG CUDA_ARCH=sm_80
+# Default (CUDA_ARCH unset): build.rs emits a PORTABLE MULTI-ARCH FATBINARY
+# covering sm_70/75/80/86/89/90 + PTX, so one image runs on any cloud GPU
+# (T4, V100, A100, A10, RTX 30xx/40xx, L4/L40, H100) with zero recompilation.
+# To target a single arch (faster compile, smaller binary):
+#   docker build --build-arg CUDA_ARCH=sm_89 .
+ARG CUDA_ARCH=""
 ENV CUDA_ARCH=${CUDA_ARCH}
 
 RUN cargo build --release --features cuda 2>&1
