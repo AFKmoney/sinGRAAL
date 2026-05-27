@@ -43,7 +43,7 @@ use crate::coppersmith::{
     find_glv_coeffs,
     build_macaulay_bivariate_m2,
     build_macaulay_bivariate_m3,
-    lll_reduce_bigint, norm_sq_bigint,
+    lll_reduce_bigint, lll_reduce_bigint_killcheck, norm_sq_bigint,
     lll_all_short_vectors, lll_extract_all_deltas,
     s3_bivariate_coeffs,
 };
@@ -448,47 +448,46 @@ pub fn run_dispatcher(cfg: &DispatcherConfig) -> Option<Fe> {
             // c₀₀ = 0 → hit exact à l'ancre (très rare, pas de rejet)
             let is_hit = coeffs[0].is_zero();
 
-            let killed = if !is_hit {
-                let mat = match cfg.m_level {
-                    3 => build_macaulay_bivariate_m3(&coeffs, &x_big, &p),
-                    _ => build_macaulay_bivariate_m2(&coeffs, &x_big, &p),
-                };
-                is_dead_fast(&mat)
-            } else {
-                false
-            };
-
-            let pnc_us = t_pnc.elapsed().as_secs_f64() * 1e6;
-            stats.t_pnc_us = (stats.t_pnc_us * ia as f64 + pnc_us) / (ia as f64 + 1.0);
-
-            if killed {
-                stats.tiles_killed += 1;
-                b_pt = pt_add(b_pt, step_phig);
-                b_scalar = b_scalar.wrapping_add(step);
-                continue;
-            }
-
-            // ── LLL complet (survivant PNC) ───────────────────────────────
-            let t_lll = Instant::now();
+            // PNC + LLL fusionnés : kill certifié (early-abort sur min ||b*_k||²),
+            // sinon réduction complète puis test du vecteur le plus court.
             let mat = match cfg.m_level {
                 3 => build_macaulay_bivariate_m3(&coeffs, &x_big, &p),
                 _ => build_macaulay_bivariate_m2(&coeffs, &x_big, &p),
             };
 
-            let reduced = lll_reduce_bigint(mat);
-            let shortest = reduced.iter()
-                .map(|row| norm_sq_bigint(row))
-                .filter(|n| !n.is_zero())
-                .min()
-                .unwrap_or_else(BigInt::zero);
+            let killcheck = if is_hit { Some(mat) }
+                            else { lll_reduce_bigint_killcheck(mat, &bound_sq) };
 
-            let lll_us = t_lll.elapsed().as_secs_f64() * 1e6;
+            let lll_us = t_pnc.elapsed().as_secs_f64() * 1e6;
+            stats.t_pnc_us = (stats.t_pnc_us * ia as f64 + lll_us) / (ia as f64 + 1.0);
+
+            let shortest = match &killcheck {
+                None => {
+                    // KILL certifié : λ₁² ≥ bound_sq → aucune racine dans la tuile.
+                    stats.tiles_killed += 1;
+                    b_pt = pt_add(b_pt, step_phig);
+                    b_scalar = b_scalar.wrapping_add(step);
+                    continue;
+                }
+                Some(reduced) => reduced.iter()
+                    .map(|row| norm_sq_bigint(row))
+                    .filter(|n| !n.is_zero())
+                    .min()
+                    .unwrap_or_else(BigInt::zero),
+            };
+
             stats.t_lll_us = (stats.t_lll_us * stats.tiles_lll_done as f64 + lll_us)
                            / (stats.tiles_lll_done as f64 + 1.0);
             stats.tiles_lll_done += 1;
 
             let survived = is_hit || shortest < bound_sq;
-            if survived {
+            if !survived {
+                stats.tiles_killed += 1;
+                b_pt = pt_add(b_pt, step_phig);
+                b_scalar = b_scalar.wrapping_add(step);
+                continue;
+            }
+            {
                 stats.tiles_survived += 1;
                 if cfg.verbose {
                     eprintln!("[dispatcher] ✓ SURVIVANT ia={ia} ib={ib} (a={a_scalar} b={b_scalar})  \
@@ -854,13 +853,16 @@ pub fn golden_block_test(k_true: Fe, _range_bits: u32, block_bits: u32, m_level:
         3 => build_macaulay_bivariate_m3(&coeffs, &x_big, &p),
         _ => build_macaulay_bivariate_m2(&coeffs, &x_big, &p),
     };
-    let dead = is_dead_fast(&mat);
-    eprintln!("[golden_test] PNC → {}", if dead { "KILL ✗ (ERREUR: bloc solution tué!)" } else { "SURVIE ✓" });
-
-    // Note: is_dead_fast basé sur les normes GS de la matrice d'entrée est toujours
-    // déclenché pour les matrices de Macaulay (normes d'entrée >> borne HG).
-    // On ignore ce résultat et on passe directement au LLL complet pour le test.
-    let _ = dead;
+    let bound_sq_kc = match m_level {
+        2 => { let p2 = &p * &p; p2.clone() * &p2 / 15i64 }
+        3 => { let p3 = &p * &p * &p; p3.clone() * &p3 / 28i64 }
+        _ => { &p * &p / 4i64 }
+    };
+    let kc = lll_reduce_bigint_killcheck(mat, &bound_sq_kc);
+    let dead = kc.is_none();
+    eprintln!("[golden_test] PNC kill certifié → {}",
+        if dead { "KILL ✗ (ERREUR: bloc solution tué — λ₁²≥borne, impossible si racine!)" }
+        else    { "SURVIE ✓ (λ₁² < borne, racine possible)" });
 
     // LLL complet
     let mat2 = match m_level {
@@ -1046,13 +1048,16 @@ fn measure_kill_rate(block_bits: u32, m_level: u32, n_samples: u64) -> (f64, f64
             _ => build_macaulay_bivariate_m2(&coeffs, &x_big, &p),
         };
 
-        // Vrai test : LLL BigRational exact + comparaison borne HG.
-        // (is_dead_fast est inutilisable ici : il tue TOUTES les matrices de
-        //  Macaulay car leurs normes GS initiales >> borne avant réduction.)
-        let reduced = lll_reduce_bigint(mat);
-        let min_ns  = reduced.iter().map(|r| norm_sq_bigint(r))
-            .filter(|n| !n.is_zero()).min().unwrap_or_else(BigInt::zero);
-        let dead = min_ns >= bound_sq;
+        // Kill certifié (early-abort sur min ||b*_k||²) + test final sur les
+        // vecteurs de la base réduite. dead ⟺ aucun vecteur < borne HG.
+        let dead = match lll_reduce_bigint_killcheck(mat, &bound_sq) {
+            None => true,  // KILL certifié : λ₁² ≥ bound_sq
+            Some(reduced) => {
+                let min_ns = reduced.iter().map(|r| norm_sq_bigint(r))
+                    .filter(|n| !n.is_zero()).min().unwrap_or_else(BigInt::zero);
+                min_ns >= bound_sq
+            }
+        };
         if dead { killed += 1; }
     }
 
@@ -1073,29 +1078,45 @@ pub fn auto_tune_block_bits(
     eprintln!("[auto-tune] Calibration block_bits pour range_bits={range_bits}  m={m_level}");
 
     let lo = 4u32;
-    // Probe well past the naïve cap so we can see exactly where the
-    // Howgrave-Graham bound breaks (kill_rate collapses) for this m_level.
     let hi = range_bits.min(56);
-    let mut best_bb = lo;
+
+    // INVERSION DE LOGIQUE :
+    //   Le kill_rate MONTE avec block_bits (X plus grand → réseau plus dense →
+    //   λ₁ plus grande → franchit la borne HG pour les tuiles sans racine).
+    //   À petit X la borne min‖b*‖ est lâche → kill_rate ≈ 0.
+    //   On cherche donc le PLUS PETIT block_bits où kill_rate ≥ seuil
+    //   (= plancher d'opération), car il MINIMISE le coût de brute/extraction
+    //   de la tuile survivante (X² ou extraction δ) tout en prunant le reste.
+    //   On continue le balayage vers le haut au lieu de s'arrêter au 1ᵉʳ échec.
+    let mut best_bb = 0u32;   // 0 = aucun palier ne franchit le seuil
     let mut best_kr = 0.0f64;
     let mut best_us = 0.0f64;
+    let mut found_floor = false;
 
-    // Balayage croissant : s'arrêter dès que kill_rate descend sous le seuil
     let mut bb = lo;
     while bb <= hi {
         let (kr, us) = measure_kill_rate(bb, m_level, n_samples);
-        eprintln!("[auto-tune]   block_bits={bb:2}  kill_rate={:.4}%  {:.0}µs/tile",
-            kr * 100.0, us);
+        eprintln!("[auto-tune]   block_bits={bb:2}  kill_rate={:.4}%  {:.0}µs/tile{}",
+            kr * 100.0, us,
+            if !found_floor && kr >= kill_threshold { "  ← plancher" } else { "" });
 
-        if kr >= kill_threshold {
+        if kr >= kill_threshold && !found_floor {
+            // Premier palier qui franchit le seuil = block_bits optimal (le + petit).
             best_bb = bb;
             best_kr = kr;
             best_us = us;
-        } else {
-            // Dès que le kill_rate descend sous le seuil, s'arrêter
+            found_floor = true;
+            // On s'arrête : block_bits plus grand ⇒ kill_rate ≥ seuil aussi mais
+            // brute/extraction plus coûteuse. Le plancher est l'optimum.
             break;
         }
-        bb += 2;  // pas de 2 pour accélérer la calibration
+        bb += 2;
+    }
+
+    if !found_floor {
+        eprintln!("[auto-tune] ⚠ aucun block_bits ≤ {hi} n'atteint kill_rate≥{:.1}% \
+                   (m={m_level}) — augmenter m_level ou hi.", kill_threshold * 100.0);
+        best_bb = hi;  // rapport indicatif
     }
 
     // Estimation du nombre de tiles survivantes et du temps total

@@ -384,6 +384,141 @@ pub fn norm_sq_bigint(v: &[BigInt]) -> BigInt {
     v.iter().map(|x| x * x).sum()
 }
 
+// ─── LLL BigRational avec KILL CERTIFIÉ (early-abort) ────────────────────────
+//
+// Identique à lll_reduce_bigint mais avec un kill-switch MATHÉMATIQUEMENT
+// CERTIFIÉ basé sur le théorème :
+//
+//   Pour TOUTE base de réseau, λ₁(L) ≥ min_k ||b*_k||
+//   (car tout v = Σ aᵢbᵢ vérifie ||v|| ≥ |a_j|·||b*_j|| ≥ min_k ||b*_k||,
+//    j = plus grand indice avec a_j ≠ 0).
+//
+// Donc si à un instant quelconque  min_k ||b*_k||² ≥ bound_sq,
+// alors λ₁² ≥ bound_sq → AUCUN vecteur court → KILL (jamais de faux négatif :
+// une tuile dont λ₁² < bound_sq ne sera JAMAIS tuée, sa solution survit).
+//
+// Pourquoi des swaps réels avant de décider (vs is_dead_fast) :
+//   min_k ||b*_k|| est une borne INFÉRIEURE de λ₁, lâche sur la base brute
+//   (les b*_k de Macaulay sont à l'échelle p^m). Chaque swap LLL « remonte »
+//   la norme GS minimale vers λ₁. On vérifie donc le critère APRÈS chaque swap :
+//   dès que min ||b*_k||² franchit bound_sq → kill anticipé (avant la fin du LLL).
+//   Les tuiles sans racine (λ₁ grand) sont tuées tôt ; celles avec racine
+//   (λ₁² < bound_sq) ne franchissent jamais le seuil → vont au bout → survie.
+//
+// Retour :
+//   None      → KILL certifié (λ₁² ≥ bound_sq prouvé)
+//   Some(b)   → base LLL-réduite (survivante ; l'appelant extrait les vecteurs courts)
+pub fn lll_reduce_bigint_killcheck(
+    mut b: Vec<Vec<BigInt>>,
+    bound_sq: &BigInt,
+) -> Option<Vec<Vec<BigInt>>> {
+    let n   = b.len();
+    let dim = b[0].len();
+    if n == 0 { return Some(b); }
+    if n == 1 {
+        let ns = norm_sq_bigint(&b[0]);
+        return if ns >= *bound_sq { None } else { Some(b) };
+    }
+
+    let bound_rat = BigRational::from(bound_sq.clone());
+
+    // ── Initialisation GS exacte ─────────────────────────────────────────────
+    let mut bstar:   Vec<Vec<BigRational>> = Vec::with_capacity(n);
+    let mut mu:      Vec<Vec<BigRational>> = vec![vec![BigRational::zero(); n]; n];
+    let mut norm_sq: Vec<BigRational>      = vec![BigRational::zero(); n];
+
+    for i in 0..n {
+        let mut bs = to_rat(&b[i]);
+        for j in 0..i {
+            if norm_sq[j].is_zero() { continue; }
+            let m = dot_rat(&to_rat(&b[i]), &bstar[j]) / &norm_sq[j];
+            mu[i][j] = m.clone();
+            for l in 0..dim { bs[l] -= &m * &bstar[j][l]; }
+        }
+        norm_sq[i] = dot_rat(&bs, &bs);
+        bstar.push(bs);
+    }
+
+    // min_k ||b*_k||² courant (ignore les 0, qui signalent une dépendance).
+    let min_gs_sq = |ns: &[BigRational]| -> Option<BigRational> {
+        ns.iter().filter(|x| !x.is_zero()).min().cloned()
+    };
+
+    let delta = BigRational::new(BigInt::from(3u32), BigInt::from(4u32));
+    let mut k = 1usize;
+    let mut iters = 0usize;
+    let mut swaps = 0usize;
+
+    while k < n {
+        iters += 1;
+        if iters > 300_000 { break; }
+
+        // Réduction de taille (ne modifie pas norm_sq).
+        for j in (0..k).rev() {
+            let m = rat_round(&mu[k][j]);
+            if m.is_zero() { continue; }
+            let mq = BigRational::from(m.clone());
+            let bj = b[j].clone();
+            for l in 0..dim { b[k][l] -= &m * &bj[l]; }
+            mu[k][j] -= &mq;
+            for i in 0..j { let u = &mu[k][i] - &mq * &mu[j][i]; mu[k][i] = u; }
+        }
+
+        // Lovász
+        let rhs = (&delta - &mu[k][k-1] * &mu[k][k-1]) * &norm_sq[k-1];
+        if norm_sq[k] >= rhs {
+            k += 1;
+        } else {
+            swaps += 1;
+            b.swap(k, k - 1);
+
+            let lam  = mu[k][k-1].clone();
+            let b0   = norm_sq[k-1].clone();
+            let b1   = norm_sq[k].clone();
+            let nb0  = &b1 + &lam * &lam * &b0;
+            let nb1  = &b0 * &b1 / &nb0;
+
+            for i in k+1..n {
+                let a  = mu[i][k-1].clone();
+                let bv = mu[i][k].clone();
+                mu[i][k-1] = (&bv * &b1 + &lam * &a * &b0) / &nb0;
+                mu[i][k]   = &a - &lam * &bv;
+            }
+            for j in 0..k-1 {
+                let tmp = mu[k][j].clone();
+                mu[k][j]   = mu[k-1][j].clone();
+                mu[k-1][j] = tmp;
+            }
+            mu[k][k-1]   = &lam * &b0 / &nb0;
+            norm_sq[k-1] = nb0;
+            norm_sq[k]   = nb1;
+
+            let old_bk  = bstar[k].clone();
+            let old_bkm = bstar[k-1].clone();
+            for l in 0..dim {
+                bstar[k-1][l] = &old_bk[l] + &lam * &old_bkm[l];
+            }
+            let nb0_v = norm_sq[k-1].clone();
+            for l in 0..dim {
+                bstar[k][l] = (&b1 * &old_bkm[l] - &lam * &b0 * &old_bk[l]) / &nb0_v;
+            }
+
+            if k > 1 { k -= 1; }
+
+            // ── KILL CERTIFIÉ : min_k ||b*_k||² ≥ bound_sq ⟹ λ₁² ≥ bound_sq ──
+            // Vérifié après chaque swap : dès que la norme GS minimale franchit
+            // le seuil, aucun vecteur ne peut être court → kill anticipé.
+            if let Some(m) = min_gs_sq(&norm_sq) {
+                if m >= bound_rat {
+                    return None;
+                }
+            }
+        }
+    }
+
+    Some(b)
+}
+
 // ─── LLL multi-vecteurs : tous les vecteurs courts ───────────────────────────
 //
 // Au lieu de ne garder que le minimum, retourne TOUS les vecteurs de la base
