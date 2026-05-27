@@ -1156,7 +1156,7 @@ fn main() {
 
     // ── Auto-tune block_bits ──────────────────────────────────────────────────
     if args.auto_tune {
-        let n_samples = 50u64;
+        let n_samples = args.dispatch_bench_n;
         let result = dispatcher::auto_tune_block_bits(
             args.range_bits, args.m_level, n_samples, 0.999
         );

@@ -1046,19 +1046,13 @@ fn measure_kill_rate(block_bits: u32, m_level: u32, n_samples: u64) -> (f64, f64
             _ => build_macaulay_bivariate_m2(&coeffs, &x_big, &p),
         };
 
-        // PNC + LLL
-        let dead = if is_dead_fast(&mat) {
-            true
-        } else {
-            let mat2 = match m_level {
-                3 => build_macaulay_bivariate_m3(&coeffs, &x_big, &p),
-                _ => build_macaulay_bivariate_m2(&coeffs, &x_big, &p),
-            };
-            let reduced = lll_reduce_bigint(mat2);
-            let min_ns  = reduced.iter().map(|r| norm_sq_bigint(r))
-                .filter(|n| !n.is_zero()).min().unwrap_or_else(BigInt::zero);
-            min_ns >= bound_sq
-        };
+        // Vrai test : LLL BigRational exact + comparaison borne HG.
+        // (is_dead_fast est inutilisable ici : il tue TOUTES les matrices de
+        //  Macaulay car leurs normes GS initiales >> borne avant réduction.)
+        let reduced = lll_reduce_bigint(mat);
+        let min_ns  = reduced.iter().map(|r| norm_sq_bigint(r))
+            .filter(|n| !n.is_zero()).min().unwrap_or_else(BigInt::zero);
+        let dead = min_ns >= bound_sq;
         if dead { killed += 1; }
     }
 
@@ -1079,7 +1073,9 @@ pub fn auto_tune_block_bits(
     eprintln!("[auto-tune] Calibration block_bits pour range_bits={range_bits}  m={m_level}");
 
     let lo = 4u32;
-    let hi = range_bits.min(22);
+    // Probe well past the naïve cap so we can see exactly where the
+    // Howgrave-Graham bound breaks (kill_rate collapses) for this m_level.
+    let hi = range_bits.min(56);
     let mut best_bb = lo;
     let mut best_kr = 0.0f64;
     let mut best_us = 0.0f64;
