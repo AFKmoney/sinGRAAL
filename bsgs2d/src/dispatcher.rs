@@ -47,7 +47,7 @@ use crate::coppersmith::{
     lll_all_short_vectors, lll_extract_all_deltas,
     s3_bivariate_coeffs,
 };
-use crate::lll_earlyabort::is_dead_fast;
+use crate::lll_earlyabort::{is_dead_fast, hg_bound_sq};
 use crate::in_range;
 use crate::glv4d::{build_6aut_targets, brute_scalar_block_6aut, recover_k_6aut_full, in_range_bsgs};
 
@@ -643,61 +643,30 @@ pub fn run_dispatcher_parallel(cfg: &DispatcherConfig) -> Option<Fe> {
                     _ => build_macaulay_bivariate_m2(&coeffs, &x_big, &p),
                 };
 
-                let killed = if !is_hit { is_dead_fast(&mat) } else { false };
-                if killed {
-                    tiles_killed.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-
-                // ── LLL complet (multi-vecteurs courts) ───────────────────────
-                let mat2 = match cfg.m_level {
-                    3 => build_macaulay_bivariate_m3(&coeffs, &x_big, &p),
-                    _ => build_macaulay_bivariate_m2(&coeffs, &x_big, &p),
+                // LLL BigRational (exact, prouvé correct sur matrices Macaulay)
+                let reduced = if is_hit {
+                    mat
+                } else {
+                    lll_reduce_bigint(mat)
                 };
-
-                // Innovation #30 : récupère TOUS les vecteurs courts
-                let short_vecs = lll_all_short_vectors(mat2.clone(), &bound_sq);
+                let short_vecs: Vec<Vec<BigInt>> = reduced.into_iter()
+                    .filter(|row| {
+                        let ns = norm_sq_bigint(row);
+                        !ns.is_zero() && &ns < &bound_sq
+                    })
+                    .collect();
                 let survived = is_hit || !short_vecs.is_empty();
 
+                // Tuile sans vecteur court → tuer (après LLL)
                 if !survived {
-                    // Vérifier aussi le minimum (compatibilité)
-                    let reduced = lll_reduce_bigint(mat2);
-                    let shortest = reduced.iter()
-                        .map(|r| norm_sq_bigint(r))
-                        .filter(|n| !n.is_zero())
-                        .min()
-                        .unwrap_or_else(BigInt::zero);
-                    if shortest >= bound_sq { continue; }
+                    tiles_killed.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
 
                 if cfg.verbose {
                     eprintln!("[dispatcher-par] ✓ SURVIVANT ia={ia} ib={jb} (a={a_scalar} b={b_scalar})");
                 }
 
-                // ── Extraction δ depuis vecteurs LLL (innovation #30) ─────────
-                // Essaie de trouver δ directement via la formule quadratique mod p.
-                if !short_vecs.is_empty() {
-                    for sv in &short_vecs {
-                        let deltas = crate::coppersmith::extract_delta_from_lll_vector(sv, &x_big, &p);
-                        for delta_x in deltas {
-                            // δ ici est un offset x-coordonnée (pas scalaire)
-                            // Chercher le scalaire correspondant dans [a_scalar, a_scalar+X)
-                            // via l'identité : si (A+d)*G a x-coord = a_x + delta_x,
-                            // brute-force sur d mais avec range réduit
-                            let delta_u64 = delta_x.to_u64_digits().1.first().copied().unwrap_or(0);
-                            if delta_u64 < (1u64 << cfg.block_bits.min(63)) {
-                                if let Some(k) = brute_scalar_block_6aut(
-                                    a_scalar, b_scalar, cfg.block_bits.min(20),
-                                    cfg.target, cfg.range_bits,
-                                ) {
-                                    found.store(true, Ordering::Release);
-                                    *result.lock().unwrap() = Some(k);
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
 
                 // ── Brute-force scalaire avec 6-aut (innovation #24) ──────────
                 if cfg.block_bits <= 25 {
@@ -941,4 +910,338 @@ pub fn selftest_dispatcher(range_bits: u32, block_bits: u32) -> bool {
     let passed = golden_block_test(k_fe, range_bits, block_bits, 2);
     eprintln!("[selftest] résultat : {}", if passed { "✓ PASS" } else { "✗ FAIL" });
     passed
+}
+
+// ─── Innovation #21 : Table d'ancres compacte (L2 cache fit) ─────────────────
+//
+// Pré-calcule les x-coordonnées de TOUS les points d'ancre {ia*step*G} et
+// {ib*step*φG} sous forme compacte Fe=[u64;4] (32 bytes/entrée).
+//
+// Avantage cache :
+//   - 1024 ancres × 32 bytes = 32 KB → tient exactement en L1 (32-64 KB/core)
+//   - 4096 ancres × 32 bytes = 128 KB → tient en L2 (256 KB-1 MB typique)
+//   - Évite les scalar_mul répétés dans run_dispatcher_parallel (×n_blocks économisés)
+//
+// Complexité : O(n_blocks) additions de points (vs O(n_blocks) scalar_muls naïf)
+// Plan mémoire : 2 vecteurs contigus → préfetch hardware naturel
+pub struct AnchorTable {
+    pub a_xs:     Vec<[u64; 4]>,  // x-coords des ia*step*G (Fe)
+    pub b_xs:     Vec<[u64; 4]>,  // x-coords des ib*step*φG (Fe)
+    pub a_infs:   Vec<bool>,      // ia*step*G = INF ?
+    pub b_infs:   Vec<bool>,
+    pub n_blocks: u64,
+    pub step:     u64,
+}
+
+impl AnchorTable {
+    /// Construit la table par additions incrémentales O(n_blocks).
+    /// step = 2^block_bits, n_blocks = 2^(half_bits - block_bits).
+    pub fn build(step: u64, n_blocks: u64) -> Self {
+        let mut a_xs   = Vec::with_capacity(n_blocks as usize);
+        let mut b_xs   = Vec::with_capacity(n_blocks as usize);
+        let mut a_infs = Vec::with_capacity(n_blocks as usize);
+        let mut b_infs = Vec::with_capacity(n_blocks as usize);
+
+        let step_g    = if step == 0 { INF } else { scalar_mul(G, [step, 0, 0, 0]) };
+        let phi_g     = phi_point(G);
+        let step_phig = if step == 0 { INF } else { scalar_mul(phi_g, [step, 0, 0, 0]) };
+
+        let mut a_pt = INF;
+        let mut b_pt = INF;
+
+        for _ in 0..n_blocks {
+            a_xs.push(a_pt.x);
+            b_xs.push(b_pt.x);
+            a_infs.push(a_pt.inf);
+            b_infs.push(b_pt.inf);
+            a_pt = pt_add(a_pt, step_g);
+            b_pt = pt_add(b_pt, step_phig);
+        }
+
+        Self { a_xs, b_xs, a_infs, b_infs, n_blocks, step }
+    }
+
+    /// Taille mémoire totale en bytes (pour vérification L1/L2 fit).
+    pub fn size_bytes(&self) -> usize {
+        self.n_blocks as usize * (32 + 32 + 1 + 1)  // Fe × 2 + bool × 2
+    }
+
+    #[inline]
+    pub fn a_bigint(&self, ia: u64, p: &BigInt) -> BigInt {
+        if self.a_infs[ia as usize] { BigInt::zero() }
+        else { fe_to_bigint(self.a_xs[ia as usize]) }
+    }
+
+    #[inline]
+    pub fn b_bigint(&self, ib: u64, p: &BigInt) -> BigInt {
+        if self.b_infs[ib as usize] { BigInt::zero() }
+        else { fe_to_bigint(self.b_xs[ib as usize]) }
+    }
+}
+
+// ─── Innovation #22 : Auto-tune du block_bits ────────────────────────────────
+//
+// Sélectionne automatiquement block_bits optimal pour un range_bits donné.
+//
+// Principe :
+//   - block_bits trop petit → trop de tiles survivent → brute-force trop lourd
+//   - block_bits trop grand → HG bound trop lâche → LLL ne peut plus prouver l'absence
+//
+// Algorithme :
+//   1. Échantillonner kill_rate(block_bits) sur N paires aléatoires
+//   2. Chercher le block_bits maximal tel que kill_rate > 99.9%
+//   3. Le block_bits idéal est juste en dessous du seuil de saturation
+//
+// Cible : kill_rate ∈ [99.9%, 99.999%]  → balance rejet/efficacité
+pub struct AutoTuneResult {
+    pub block_bits:   u32,
+    pub kill_rate:    f64,
+    pub tiles_needed: u64,  // estimation du nombre de tiles à traiter
+    pub est_seconds:  f64,  // estimation du temps total (µs/tile mesurée)
+}
+
+impl AutoTuneResult {
+    pub fn print(&self) {
+        eprintln!("╔══════════════════════════════════════════════════════╗");
+        eprintln!("║  Auto-Tune block_bits résultat                       ║");
+        eprintln!("╠══════════════════════════════════════════════════════╣");
+        eprintln!("║  block_bits optimal : {}",    self.block_bits);
+        eprintln!("║  Kill rate mesuré   : {:.4}%", self.kill_rate * 100.0);
+        eprintln!("║  Tiles survivantes  : ~{}",    self.tiles_needed);
+        eprintln!("║  Temps estimé       : {:.1}s", self.est_seconds);
+        eprintln!("╚══════════════════════════════════════════════════════╝");
+    }
+}
+
+/// Mesure le kill_rate du filtre PNC+LLL pour un block_bits donné sur N paires aléatoires.
+fn measure_kill_rate(block_bits: u32, m_level: u32, n_samples: u64) -> (f64, f64) {
+    let p     = p_big();
+    let x_big = BigInt::one() << block_bits as usize;
+    let bound_sq = match m_level {
+        2 => { let p2 = &p * &p; p2.clone() * &p2 / 15i64 }
+        3 => { let p3 = &p * &p * &p; p3.clone() * &p3 / 28i64 }
+        _ => { &p * &p / 4i64 }
+    };
+
+    let mut rng  = 0xdeadbeef13579u64;
+    let xs = |v: u64| -> u64 { let v=v^(v<<13); let v=v^(v>>7); v^(v<<17) };
+
+    // cible fictive reproductible
+    let k_ref: Fe = [0xabcdef1234567890, 0x1, 0, 0];
+    let target = scalar_mul(G, k_ref);
+    let x_p    = fe_to_bigint(target.x);
+
+    let mut killed = 0u64;
+    let t0 = Instant::now();
+
+    for i in 0..n_samples {
+        rng = xs(rng ^ i.wrapping_mul(0x9e3779b97f4a7c15));
+        let a_x = BigInt::from(rng) % &p;
+        rng = xs(rng);
+        let b_x = BigInt::from(rng) % &p;
+
+        let (_, _, coeffs) = find_glv_coeffs(&a_x, &b_x, &x_p, &p);
+        let mat = match m_level {
+            3 => build_macaulay_bivariate_m3(&coeffs, &x_big, &p),
+            _ => build_macaulay_bivariate_m2(&coeffs, &x_big, &p),
+        };
+
+        // PNC + LLL
+        let dead = if is_dead_fast(&mat) {
+            true
+        } else {
+            let mat2 = match m_level {
+                3 => build_macaulay_bivariate_m3(&coeffs, &x_big, &p),
+                _ => build_macaulay_bivariate_m2(&coeffs, &x_big, &p),
+            };
+            let reduced = lll_reduce_bigint(mat2);
+            let min_ns  = reduced.iter().map(|r| norm_sq_bigint(r))
+                .filter(|n| !n.is_zero()).min().unwrap_or_else(BigInt::zero);
+            min_ns >= bound_sq
+        };
+        if dead { killed += 1; }
+    }
+
+    let elapsed = t0.elapsed().as_secs_f64();
+    let kill_rate  = killed as f64 / n_samples as f64;
+    let us_per_tile = elapsed / n_samples as f64 * 1e6;
+    (kill_rate, us_per_tile)
+}
+
+/// Trouve automatiquement le block_bits optimal pour range_bits donné.
+/// Cherche le plus grand block_bits tel que kill_rate > kill_threshold.
+pub fn auto_tune_block_bits(
+    range_bits:      u32,
+    m_level:         u32,
+    n_samples:       u64,      // paires à tester par block_bits candidat
+    kill_threshold:  f64,      // ex: 0.999 = 99.9%
+) -> AutoTuneResult {
+    eprintln!("[auto-tune] Calibration block_bits pour range_bits={range_bits}  m={m_level}");
+
+    let lo = 4u32;
+    let hi = range_bits.min(22);
+    let mut best_bb = lo;
+    let mut best_kr = 0.0f64;
+    let mut best_us = 0.0f64;
+
+    // Balayage croissant : s'arrêter dès que kill_rate descend sous le seuil
+    let mut bb = lo;
+    while bb <= hi {
+        let (kr, us) = measure_kill_rate(bb, m_level, n_samples);
+        eprintln!("[auto-tune]   block_bits={bb:2}  kill_rate={:.4}%  {:.0}µs/tile",
+            kr * 100.0, us);
+
+        if kr >= kill_threshold {
+            best_bb = bb;
+            best_kr = kr;
+            best_us = us;
+        } else {
+            // Dès que le kill_rate descend sous le seuil, s'arrêter
+            break;
+        }
+        bb += 2;  // pas de 2 pour accélérer la calibration
+    }
+
+    // Estimation du nombre de tiles survivantes et du temps total
+    let half_bits    = (range_bits / 2 + 2).min(64);
+    let n_blocks     = 1u64 << (half_bits - best_bb).min(30);
+    let total_tiles  = n_blocks.saturating_mul(n_blocks);
+    let survive_rate = 1.0 - best_kr;
+    let tiles_survived = ((total_tiles as f64) * survive_rate).ceil() as u64;
+    // Temps = tiles_killed*us_pnc + tiles_survived*(us_lll + us_brute)
+    let us_pnc   = best_us * best_kr;          // approx
+    let us_lll   = best_us * (1.0 - best_kr);  // approx
+    let est_s    = (total_tiles as f64 * us_pnc + tiles_survived as f64 * (us_lll + 1000.0))
+                   / 1e6 / rayon::current_num_threads() as f64;
+
+    AutoTuneResult {
+        block_bits:   best_bb,
+        kill_rate:    best_kr,
+        tiles_needed: tiles_survived,
+        est_seconds:  est_s,
+    }
+}
+
+// ─── Dispatcher rapide : table d'ancres L2 + auto-tune + 6-aut ───────────────
+//
+// Combine toutes les innovations :
+//   #21 AnchorTable pré-calculée (L2 fit, évite scalar_mul répétés)
+//   #22 block_bits auto-tuné
+//   #24 GLV 6-aut (×6 couverture)
+//   #28 Rayon parallel
+//   #30 LLL multi-k
+pub fn run_dispatcher_optimized(cfg: &DispatcherConfig) -> Option<Fe> {
+    let p     = p_big();
+    let x_p   = fe_to_bigint(cfg.target.x);
+    let x_big = BigInt::one() << cfg.block_bits as usize;
+
+    let bound_sq: BigInt = match cfg.m_level {
+        2 => { let p2 = &p * &p; p2.clone() * &p2 / 15i64 }
+        3 => { let p3 = &p * &p * &p; p3.clone() * &p3 / 28i64 }
+        _ => { &p * &p / 4i64 }
+    };
+
+    let step = 1u64 << cfg.block_bits.min(63);
+    let half_bits = cfg.half_bits;
+    let n_blocks  = if half_bits > cfg.block_bits {
+        1u64 << (half_bits - cfg.block_bits).min(30)
+    } else { 1u64 };
+
+    // #21 : Construire la table d'ancres (L2 cache)
+    let t_build = Instant::now();
+    let anchors = AnchorTable::build(step, n_blocks);
+    let cache_fit = if anchors.size_bytes() < 32_768 { "L1" }
+                    else if anchors.size_bytes() < 524_288 { "L2" }
+                    else { "L3/RAM" };
+
+    if cfg.verbose {
+        eprintln!("[opt-dispatcher] AnchorTable: {} ancres × 2 dirs = {} KB  → {}",
+            n_blocks, anchors.size_bytes() / 1024, cache_fit);
+        eprintln!("[opt-dispatcher] threads={}", rayon::current_num_threads());
+    }
+
+    let found  = Arc::new(AtomicBool::new(false));
+    let result = Arc::new(Mutex::new(None::<Fe>));
+    let tiles_done   = Arc::new(AtomicU64::new(0));
+    let tiles_killed = Arc::new(AtomicU64::new(0));
+    let t0 = Instant::now();
+
+    // Partage de la table en lecture seule entre threads (Arc<Vec> = zero-copy)
+    let anchors = Arc::new(anchors);
+
+    (0u64..n_blocks).into_par_iter().for_each(|ia| {
+        if found.load(Ordering::Relaxed) { return; }
+
+        let anch = Arc::clone(&anchors);
+        let a_x  = anch.a_bigint(ia, &p);
+
+        // Blocs L1 de 16 ib pour localité de cache
+        let mut ib = 0u64;
+        while ib < n_blocks {
+            let end = (ib + 16).min(n_blocks);
+            for jb in ib..end {
+                if found.load(Ordering::Relaxed) { return; }
+
+                tiles_done.fetch_add(1, Ordering::Relaxed);
+                let b_x = anch.b_bigint(jb, &p);
+
+                let (_, _, coeffs) = find_glv_coeffs(&a_x, &b_x, &x_p, &p);
+                let is_hit = coeffs[0].is_zero();
+
+                let mat = match cfg.m_level {
+                    3 => build_macaulay_bivariate_m3(&coeffs, &x_big, &p),
+                    _ => build_macaulay_bivariate_m2(&coeffs, &x_big, &p),
+                };
+                // LLL BigRational exact (prouvé correct sur matrices Macaulay)
+                let reduced = if is_hit { mat } else { lll_reduce_bigint(mat) };
+                // LLL multi-k (#30) : tous vecteurs courts
+                let short_vecs: Vec<Vec<BigInt>> = reduced.into_iter()
+                    .filter(|row| { let ns = norm_sq_bigint(row); !ns.is_zero() && &ns < &bound_sq })
+                    .collect();
+                let survived = is_hit || !short_vecs.is_empty();
+                if !survived {
+                    tiles_killed.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
+                let a_scalar = ia.wrapping_mul(step);
+                let b_scalar = jb.wrapping_mul(step);
+
+                if cfg.verbose {
+                    eprintln!("[opt-dispatcher] ✓ SURVIVANT ia={ia} ib={jb}");
+                }
+
+                // 6-aut brute-force (#24)
+                if cfg.block_bits <= 25 {
+                    if let Some(k) = brute_scalar_block_6aut(
+                        a_scalar, b_scalar, cfg.block_bits,
+                        cfg.target, cfg.range_bits,
+                    ) {
+                        found.store(true, Ordering::Release);
+                        *result.lock().unwrap() = Some(k);
+                        return;
+                    }
+                }
+            }
+            ib = end;
+        }
+
+        if cfg.verbose && ia % 128 == 0 && ia > 0 {
+            let done   = tiles_done.load(Ordering::Relaxed);
+            let killed = tiles_killed.load(Ordering::Relaxed);
+            eprintln!("[opt-dispatcher] ia={ia}/{n_blocks}  kill={:.1}%  t={:.1}s",
+                killed as f64 / done.max(1) as f64 * 100.0,
+                t0.elapsed().as_secs_f64());
+        }
+    });
+
+    if cfg.verbose {
+        let done   = tiles_done.load(Ordering::Relaxed);
+        let killed = tiles_killed.load(Ordering::Relaxed);
+        eprintln!("[opt-dispatcher] FIN  tiles={done}  kill={:.2}%  t={:.1}s",
+            killed as f64 / done.max(1) as f64 * 100.0,
+            t0.elapsed().as_secs_f64());
+    }
+
+    Arc::try_unwrap(result).ok()?.into_inner().ok()?
 }

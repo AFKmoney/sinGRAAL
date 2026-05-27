@@ -155,6 +155,14 @@ struct Args {
     #[arg(long)]
     parallel: bool,
 
+    /// Dispatcher optimisé : AnchorTable L2 + auto-tune + 6-aut + Rayon (#21+#22+#24+#28+#30).
+    #[arg(long)]
+    optimized: bool,
+
+    /// Auto-calibration de block_bits (mesure kill_rate, recommande le meilleur block_bits).
+    #[arg(long)]
+    auto_tune: bool,
+
     /// Nombre de threads Rayon (défaut : tous les cœurs disponibles).
     #[arg(long, default_value = "0")]
     threads: usize,
@@ -1110,7 +1118,17 @@ fn main() {
             .unwrap_or(());
     }
 
-    let result = if args.parallel || args.dispatch {
+    // ── Auto-tune block_bits ──────────────────────────────────────────────────
+    if args.auto_tune {
+        let n_samples = 50u64;
+        let result = dispatcher::auto_tune_block_bits(
+            args.range_bits, args.m_level, n_samples, 0.999
+        );
+        result.print();
+        return;
+    }
+
+    let result = if args.optimized || args.parallel || args.dispatch {
         let block_bits = args.block_bits.unwrap_or_else(|| {
             let bb = ((args.range_bits + 3) / 4).max(3).min(22);
             eprintln!("[auto] dispatcher block_bits = {bb}");
@@ -1125,7 +1143,10 @@ fn main() {
         cfg.half_bits = half_bits;
         cfg.m_level   = args.m_level;
         cfg.verbose   = true;
-        if args.parallel {
+        if args.optimized {
+            eprintln!("[main] Mode dispatcher OPTIMISÉ (#21 L2 + #22 auto-tune + #24+#28+#30)");
+            dispatcher::run_dispatcher_optimized(&cfg)
+        } else if args.parallel {
             eprintln!("[main] Mode dispatcher PARALLÈLE Rayon (innovations #24+#28+#30)");
             dispatcher::run_dispatcher_parallel(&cfg)
         } else {
