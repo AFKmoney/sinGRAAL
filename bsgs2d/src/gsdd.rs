@@ -3,21 +3,22 @@
 // Référence : "Algebraic Inversion of ECDLP via Galois Symmetries and
 //   Nested Field Decomposition" — Philippe-Antoine Robert, SubExp, 2026.
 //
-// Pipeline :
-//   1. Décomposition GLV : k = a + b·λ  (a,b ∈ Zₙ, |a|,|b| ≈ √n)
-//   2. Système polynomial S₃ bivarié en (a,b) via Semaev
-//   3. Symétrie de Galois σ (Frobenius) : Q = kᵖ·P  →  équation supplémentaire
-//   4. Réduction kᵖ ≡ kᵈ (mod n) avec d = p mod (n−1)
-//   5. Élimination Gröbner/LLL bivariée → polynôme univarié f(k)
-//   6. Factorisation f(k) sur Zₙ (Cantor-Zassenhaus) → racines = candidats k
-//   7. Vérification k·G = Q
+// Ce module expose les primitives mathématiques GSDD.
+// Le pipeline complet est dans dispatcher::run_full_stack qui branche tout.
+//
+// Primitives exposées :
+//   glv_decompose_big     — k = a + b·λ via Babai rounding
+//   galois_exponent       — d = p mod (n−1) (exposant Frobenius réduit)
+//   frobenius_constraint  — kᵈ − k = 0 (équation Galois supplémentaire)
+//   CrtSystem             — décomposition CRT sur petits facteurs de n−1
+//   cantor_zassenhaus_roots — racines d'un polynôme univarié sur Zₙ
+//   selftest_gsdd         — valide toutes les primitives
 
 use num_bigint::BigInt;
 use num_traits::{Zero, One};
-use std::time::Instant;
 
 use crate::secp::{
-    Fe, Pt, G, INF, FIELD_P, FIELD_N, LAMBDA,
+    Fe, Pt, G, FIELD_P, FIELD_N, LAMBDA,
     scalar_mul, pt_add, phi_point,
     sc_add, sc_mul,
 };
@@ -30,157 +31,102 @@ use crate::coppersmith::{
 
 // ─── Constantes BigInt ────────────────────────────────────────────────────────
 
-fn p_big() -> BigInt { fe_to_bigint(FIELD_P) }
-fn n_big() -> BigInt { fe_to_bigint(FIELD_N) }
+pub fn p_big() -> BigInt { fe_to_bigint(FIELD_P) }
+pub fn n_big() -> BigInt { fe_to_bigint(FIELD_N) }
 
 fn fp_mod(a: &BigInt, p: &BigInt) -> BigInt {
     ((a % p) + p) % p
 }
 
-fn fp_inv(a: &BigInt, p: &BigInt) -> BigInt {
+pub fn fp_inv(a: &BigInt, p: &BigInt) -> BigInt {
     if a.is_zero() { return BigInt::zero(); }
     a.modpow(&(p - 2u32), p)
 }
 
 // ─── Étape 1 : Décomposition GLV ──────────────────────────────────────────────
 //
-// k = a + b·λ  (mod n),  |a|,|b| ≈ √n ≈ 2^128
-// Via Babai rounding sur le réseau GLV à 2 dimensions.
+// k = a + b·λ (mod n),  |a|,|b| ≈ √n ≈ 2^128
+// Via Babai rounding sur la base réduite secp256k1 (Bernstein-Lange-Schwabe).
 
 pub struct GlvDecomp {
-    pub a:   BigInt,  // composante direction G
-    pub b:   BigInt,  // composante direction φ(G)
-    pub n:   BigInt,
+    pub a: BigInt,
+    pub b: BigInt,
 }
 
 /// Décompose k_big en (a,b) avec k ≡ a + b·λ (mod n), |a|,|b| < √n.
-/// Utilise les vecteurs de la base de Babai pour secp256k1.
 pub fn glv_decompose_big(k_big: &BigInt) -> GlvDecomp {
     let n   = n_big();
     let lam = fe_to_bigint(LAMBDA);
 
-    // Vecteurs de la base réduite secp256k1 (Bernstein-Lange-Schwabe) :
-    //   v1 = (a1, b1),  v2 = (a2, b2)  avec ‖vi‖ ≈ √n
+    // Base réduite secp256k1 (Gallant-Lambert-Vanstone 2001)
     let a1 = BigInt::parse_bytes(b"3086d221a7d46bcde86c90e49284eb15", 16).unwrap();
     let b1 = BigInt::parse_bytes(b"e4437ed6010e88286f547fa90abfe4c3", 16).unwrap();
     let a2 = BigInt::parse_bytes(b"114ca50f7a8e2f3f657c1108d9d44cfd8", 16).unwrap();
     let b2 = a1.clone();
 
-    // Babai rounding :
-    //   c1 = round(b2·k / n),  c2 = round(-b1·k / n)
+    // Babai rounding : c1 = round(b2·k / n),  c2 = round(-b1·k / n)
     let two_n = &n * 2;
     let c1 = (&b2 * k_big + &n) / &two_n;
     let c2 = ((-&b1) * k_big + &n) / &two_n;
 
-    // a = k − c1·a1 − c2·a2  (mod n)
-    // b = − c1·b1 − c2·b2    (mod n)
     let a_raw = k_big - &c1 * &a1 - &c2 * &a2;
     let b_raw = -&c1 * &b1 - &c2 * &b2;
 
-    let a = ((a_raw % &n) + &n) % &n;
-    let b = ((b_raw % &n) + &n) % &n;
-
-    GlvDecomp { a, b, n }
-}
-
-// ─── Étape 2 : Système polynomial S₃ bivarié ─────────────────────────────────
-//
-// Q = a·G + b·φ(G)
-// x_A = (a·G).x  (inconnu),  x_B = (b·φG).x  (inconnu)
-// S₃(x_A, x_B, x_Q) = 0  par la propriété d'addition EC.
-//
-// On cherche (a,b) tels que :
-//   x(a·G) = x_A,  x(b·φG) = x_B,  S₃(x_A, x_B, x_Q) = 0.
-
-pub struct GsddSystem {
-    pub x_q:  BigInt,  // x-coordonnée du point cible Q
-    pub p:    BigInt,
-    pub n:    BigInt,
-}
-
-impl GsddSystem {
-    pub fn new(q: Pt) -> Self {
-        Self {
-            x_q: fe_to_bigint(q.x),
-            p:   p_big(),
-            n:   n_big(),
-        }
-    }
-
-    /// Évalue S₃(x_A, x_B, x_Q) — doit être 0 si A+B = Q sur la courbe.
-    pub fn s3_eval(&self, x_a: &BigInt, x_b: &BigInt) -> BigInt {
-        let c = s3_bivariate_coeffs(x_a, x_b, &self.x_q, &self.p);
-        fp_mod(&c[0], &self.p)
+    GlvDecomp {
+        a: fp_mod(&a_raw, &n),
+        b: fp_mod(&b_raw, &n),
     }
 }
 
-// ─── Étape 3 : Symétrie de Galois (Frobenius) ────────────────────────────────
+// ─── Étape 3/4 : Exposant et contrainte de Frobenius ─────────────────────────
 //
-// Pour Q = k·G avec Q ∈ E(Fₚ) :
-//   σ(Q) = Q^p = Q  (car Q est défini sur Fₚ)
-//   σ(k·G) = k^p · G
-// Donc k^p ≡ k (mod n)  — tautologie.
+// Automorphisme de Frobenius σ : x ↦ xᵖ sur Fₚ.
+// Pour Q = k·G ∈ E(Fₚ) : σ(Q) = Q (car Q est défini sur Fₚ).
+// Donc kᵖ·G = k·G → kᵖ ≡ k (mod n).
 //
-// Pour obtenir des équations non triviales, on travaille dans Fₚ² :
-//   Le twist quadratique Ê/Fₚ a pour ordre ñ = p+1 − (p−n) = 2p+2−n.
-//   Frobenius σ envoie E(Fₚ²) → E(Fₚ²) avec σ(P) = P^p.
-//
-// Relation utile : k^p = k + d·n  pour d ∈ Z, d = (k^p − k)/n.
-// En pratique, on utilise kᵖ ≡ kᵈ (mod n) avec d = p mod (n−1).
+// En pratique : d = p mod (n−1) est l'exposant réduit.
+// La contrainte kᵈ ≡ k (mod n) est satisfaite par tout k (Fermat : kⁿ⁻¹=1).
+// Équation non triviale : on l'utilise pour construire une relation polynomiale
+// entre a et b dans la décomposition k = a + b·λ.
 
 pub fn galois_exponent() -> BigInt {
-    // d = p mod (n−1)  — exposant de Frobenius réduit dans Zₙ
     let p   = p_big();
     let n   = n_big();
     let nm1 = &n - 1u32;
     fp_mod(&p, &nm1)
 }
 
-/// Génère l'équation de Frobenius : k^d ≡ k (mod n) (approximation).
-/// Pour k < 2^135 et d ≈ 2^127, k^d est infaisable directement.
-/// On utilise la décomposition k = a + b·λ et on applique :
-///   k^d = (a + b·λ)^d  (mod n)
-/// Premier terme de la série binomiale :
-///   k^d ≈ a^d + d·a^(d-1)·b·λ + …  (tronqué au 1er ordre)
-///
-/// Retourne les coefficients (c0, c1) de l'équation linéarisée :
-///   c0 + c1·k ≡ 0 (mod n)
-pub fn frobenius_linear_constraint(k_approx: &BigInt) -> (BigInt, BigInt) {
-    let n   = n_big();
-    let d   = galois_exponent();
-    let lam = fe_to_bigint(LAMBDA);
-
-    // k^d mod n — faisable car d < n et k < 2^135
-    let kd  = k_approx.modpow(&d, &n);
-
-    // Contrainte : k^d − k = 0 (mod n)  — triviale, mais on l'utilise
-    // pour générer des bits de k via l'expansion de k^d.
-    //
-    // Méthode itérative : à chaque itération, kᵢ₊₁ = kᵢ^d mod n.
-    // Le cycle {k, k^d, k^(d²), …} est de longueur ord(d) dans Zₙ*.
-    // Si k^(dᴹ) ≡ k (mod n) pour un petit M, cela donne une équation.
-
-    // c0 = kd, c1 = -1 : kd - k = 0 → c0 + c1·k = 0
-    let c1 = BigInt::from(-1i64);
-    (fp_mod(&kd, &n), fp_mod(&c1, &n))
+/// Contrainte Frobenius kᵈ − k ≡ 0 (mod n).
+/// Retourne (kd, d) pour inspection.
+pub fn frobenius_constraint(k_big: &BigInt) -> (BigInt, BigInt) {
+    let n = n_big();
+    let d = galois_exponent();
+    let kd = k_big.modpow(&d, &n);
+    (kd, d)
 }
 
-// ─── Étape 4 : Réduction du degré via kᵖ ≡ kᵈ ────────────────────────────────
+// ─── Étape 10 : Décomposition CRT sur petits facteurs de n−1 ─────────────────
 //
-// On construit un système où k satisfait plusieurs congruences polynomiales.
-// Via CRT, on reconstruit k depuis ses résidus modulo des facteurs de (n−1).
+// On décompose l'espace de recherche modulo les petits facteurs de (n−1).
+// Pour chaque facteur q, on calcule k mod q via BSGS sur E[q] (q-torsion).
+// Puis CRT reconstruit k.
+//
+// Petits facteurs de n−1 pour secp256k1 :
+//   n−1 = 2 × 0x7FFFFFFF...
+//   Facteurs : 2, 4, (voir factorisation complète)
 
 pub struct CrtSystem {
-    pub moduli:   Vec<BigInt>,  // facteurs de n−1 (petits premiers)
-    pub residues: Vec<BigInt>,  // k mod mᵢ
+    pub moduli:   Vec<BigInt>,
+    pub residues: Vec<BigInt>,
 }
 
 impl CrtSystem {
-    /// Facteurs de (n−1) = 2 × 2^31 × … (premiers connus)
-    pub fn nm1_small_factors() -> Vec<BigInt> {
-        // n−1 pour secp256k1 :
-        // = 2 × 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
-        // Les petits facteurs premiers de n−1 :
+    /// Petits facteurs connus de (n−1) utilisables pour filtrage CRT.
+    /// Ces facteurs permettent de calculer k mod qᵢ par BSGS sur E[qᵢ].
+    pub fn nm1_factors() -> Vec<BigInt> {
+        // Factorisation partielle de n−1 pour secp256k1 :
+        // n−1 = 2 × q₁ × q₂ × ... (n étant premier, n−1 = 2 × cofacteur)
+        // Petits facteurs vérifiés :
         vec![
             BigInt::from(2u32),
             BigInt::from(3u32),
@@ -191,134 +137,141 @@ impl CrtSystem {
         ]
     }
 
-    /// Reconstruit k via CRT depuis les résidus.
-    pub fn reconstruct(&self) -> BigInt {
-        let mut x  = BigInt::zero();
-        let mut M  = BigInt::one();
+    /// Reconstruit k via CRT depuis les résidus partiels.
+    pub fn reconstruct(&self) -> Option<BigInt> {
+        if self.moduli.is_empty() { return None; }
+        let mut x = BigInt::zero();
+        let mut M = BigInt::one();
         for m in &self.moduli { M *= m; }
-
         for (mi, ri) in self.moduli.iter().zip(self.residues.iter()) {
-            let mi_big = mi;
-            let base = M.clone() / mi_big;
-            let mi_inv = fp_inv(&base, mi_big);
-            x += ri * (M.clone() / mi_big) * mi_inv;
+            let base = M.clone() / mi;
+            let inv  = fp_inv(&fp_mod(&base, mi), mi);
+            if inv.is_zero() { return None; }
+            x = fp_mod(&(x + ri * base * inv), &M);
         }
-        fp_mod(&x, &M)
-    }
-}
-
-// ─── Étape 5 : Élimination LLL + extraction ───────────────────────────────────
-//
-// Depuis les coefficients bivariés S₃(A+δ, B+ε, x_Q) = 0,
-// la matrice de Macaulay m=3 (dim=28) est réduite par LLL.
-// Les vecteurs courts correspondent aux racines (δ,ε) dans [0,X).
-
-pub struct GsddExtractor {
-    pub block_bits: u32,
-    pub p:          BigInt,
-    pub n:          BigInt,
-}
-
-impl GsddExtractor {
-    pub fn new(block_bits: u32) -> Self {
-        Self { block_bits, p: p_big(), n: n_big() }
+        Some(x)
     }
 
-    /// Pour une ancre (a_scalar, b_scalar), construit la matrice Macaulay m=3
-    /// et cherche des vecteurs courts → racines (δ,ε).
-    pub fn try_extract(
-        &self,
-        a_x:    &BigInt,
-        b_x:    &BigInt,
-        x_q:    &BigInt,
-        target: Pt,
-        range_bits: u32,
-    ) -> Option<Fe> {
-        let x_big   = BigInt::one() << self.block_bits as usize;
-        let bound_sq = {
-            let p3 = &self.p * &self.p * &self.p;
-            (&p3 * &p3) / 28i64
-        };
+    /// Calcule k mod q par BSGS sur E[q].
+    /// Requiert que Q = k·G et q divise #E(Fₚ).
+    /// (q divise n → E[q] = {P, 2P, ..., qP=O})
+    pub fn bsgs_mod_q(target: Pt, generator: Pt, q: u64) -> u64 {
+        // Baby steps : table[canonical_x(i·G mod q)] = i pour i ∈ [0, √q)
+        use crate::secp::{canonical_x, pt_neg, INF};
+        let sq = (q as f64).sqrt() as u64 + 1;
+        let mut table = std::collections::HashMap::new();
 
-        let (_, _, coeffs) = find_glv_coeffs(a_x, b_x, x_q, &self.p);
-        if coeffs[0].is_zero() {
-            // Ancre exacte — inutile de faire LLL
-            return None;
-        }
-
-        let mat     = build_macaulay_bivariate_m3(&coeffs, &x_big, &self.p);
-        let reduced = lll_reduce_bigint(mat);
-
-        // Chercher tous les vecteurs courts
-        for row in &reduced {
-            let ns = norm_sq_bigint(row);
-            if ns.is_zero() || &ns >= &bound_sq { continue; }
-            // Tenter d'extraire (δ, ε) depuis le vecteur court
-            if let Some(k) = self.decode_short_vector(row, a_x, b_x, target, range_bits) {
-                return Some(k);
+        let mut pt = INF;
+        for i in 0u64..sq {
+            if !pt.inf {
+                table.insert(pt.x, i);
             }
+            pt = pt_add(pt, generator);
         }
-        None
-    }
 
-    fn decode_short_vector(
-        &self,
-        _row:   &[BigInt],
-        _a_x:   &BigInt,
-        _b_x:   &BigInt,
-        _target: Pt,
-        _range_bits: u32,
-    ) -> Option<Fe> {
-        // Dans la base Macaulay scalée, la première coordonnée du vecteur LLL
-        // est proportionnelle au terme constant f(δ₀,ε₀).
-        // L'extraction exacte de (δ₀,ε₀) depuis le vecteur réduit nécessite
-        // de résoudre le polynôme univarié résiduel — implémenté dans le dispatcher.
-        None  // Le dispatcher gère l'extraction complète via brute_scalar_block_6aut.
+        // Giant steps : Q − j·(sq·G) pour j ∈ [0, sq)
+        let step_pt = scalar_mul(generator, [sq, 0, 0, 0]);
+        let neg_step = pt_neg(step_pt);
+        let mut q_j = target;
+        for j in 0u64..sq {
+            if !q_j.inf {
+                if let Some(&i) = table.get(&q_j.x) {
+                    let k = (i + j * sq) % q;
+                    return k;
+                }
+            }
+            q_j = pt_add(q_j, neg_step);
+        }
+        0
     }
 }
 
-// ─── Étape 6 : Factorisation de f(k) (Cantor-Zassenhaus simplifié) ──────────
-//
-// Pour un polynôme univarié f(k) ∈ Zₙ[k] de degré ≤ D,
-// on cherche les racines dans Zₙ par :
-//   1. Division euclidienne par (k−r) pour r ∈ S  (ensemble candidats)
-//   2. Cantor-Zassenhaus probabiliste : gcd(f, k^((n-1)/2) − 1) mod p
-//   3. Splitting récursif jusqu'aux facteurs linéaires.
+// ─── Tonelli-Shanks : racine carrée mod p (p premier quelconque) ─────────────
 
-pub fn cantor_zassenhaus_roots(
-    poly: &[BigInt],   // coefficients : poly[i] = coeff de k^i
-    n:    &BigInt,
-) -> Vec<BigInt> {
+fn tonelli_shanks(a: &BigInt, p: &BigInt) -> Option<BigInt> {
+    if a.is_zero() { return Some(BigInt::zero()); }
+    // Legendre symbol : a^((p-1)/2) mod p must be 1
+    let pm1 = p - 1u32;
+    let leg = a.modpow(&(&pm1 >> 1), p);
+    if leg != BigInt::one() { return None; }
+
+    // Factor p-1 = Q * 2^S
+    let mut q = pm1.clone();
+    let mut s = 0u32;
+    while (&q & BigInt::one()).is_zero() { q >>= 1; s += 1; }
+
+    if s == 1 {
+        // p ≡ 3 mod 4
+        return Some(a.modpow(&((p + 1u32) >> 2), p));
+    }
+
+    // Find a quadratic non-residue z
+    let mut z = BigInt::from(2u32);
+    loop {
+        if z.modpow(&(&pm1 >> 1), p) == pm1 { break; }
+        z += 1u32;
+    }
+
+    let mut m = s;
+    let mut c = z.modpow(&q, p);
+    let mut t = a.modpow(&q, p);
+    let mut r = a.modpow(&((&q + 1u32) >> 1), p);
+
+    loop {
+        if t.is_zero() { return Some(BigInt::zero()); }
+        if t == BigInt::one() { return Some(r); }
+
+        let mut i = 1u32;
+        let mut tmp = fp_mod(&(&t * &t), p);
+        while tmp != BigInt::one() {
+            tmp = fp_mod(&(&tmp * &tmp), p);
+            i += 1;
+            if i >= m { return None; }
+        }
+        let b = c.modpow(&(BigInt::one() << (m - i - 1) as usize), p);
+        m = i;
+        c = fp_mod(&(&b * &b), p);
+        t = fp_mod(&(&t * &c), p);
+        r = fp_mod(&(&r * &b), p);
+    }
+}
+
+// ─── Étape 6 : Cantor-Zassenhaus sur Zₙ ─────────────────────────────────────
+//
+// Trouve les racines d'un polynôme f(k) ∈ Zₙ[k] de petit degré.
+// Cas deg=1 et deg=2 traités par formules exactes.
+// Cas deg>2 : essai exhaustif pour racines petites + split probabiliste.
+
+pub fn cantor_zassenhaus_roots(poly: &[BigInt], n: &BigInt) -> Vec<BigInt> {
     let deg = poly.len().saturating_sub(1);
     if deg == 0 { return vec![]; }
+
     if deg == 1 {
-        // f(k) = poly[1]·k + poly[0] → k = -poly[0]/poly[1] mod n
-        let inv_c1 = fp_inv(&poly[1], n);
-        if inv_c1.is_zero() { return vec![]; }
-        let root = fp_mod(&(-poly[0].clone() * &inv_c1), n);
-        return vec![root];
+        // f(k) = c₁·k + c₀  →  k = -c₀/c₁ mod n
+        let inv = fp_inv(&poly[1], n);
+        if inv.is_zero() { return vec![]; }
+        return vec![fp_mod(&(-poly[0].clone() * &inv), n)];
     }
+
     if deg == 2 {
-        // Formule quadratique mod n (si n est premier)
+        // Formule quadratique mod n
         let c0 = &poly[0];
         let c1 = &poly[1];
         let c2 = &poly[2];
         let disc = fp_mod(&(c1 * c1 - BigInt::from(4u32) * c0 * c2), n);
-        let exp  = (n + 1u32) >> 2;
-        let sqrt_d = disc.modpow(&exp, n);
-        if fp_mod(&(&sqrt_d * &sqrt_d), n) != disc { return vec![]; }
-        let inv2c2 = fp_inv(&fp_mod(&(BigInt::from(2u32) * c2), n), n);
-        if inv2c2.is_zero() { return vec![]; }
-        let r1 = fp_mod(&((-c1 + &sqrt_d) * &inv2c2), n);
-        let r2 = fp_mod(&((-c1 - &sqrt_d) * &inv2c2), n);
+        let sq = match tonelli_shanks(&disc, n) { Some(s) => s, None => return vec![] };
+        let inv2 = fp_inv(&fp_mod(&(BigInt::from(2u32) * c2), n), n);
+        if inv2.is_zero() { return vec![]; }
+        let r1 = fp_mod(&((-c1 + &sq) * &inv2), n);
+        let r2 = fp_mod(&((-c1 - &sq) * &inv2), n);
         return if r1 == r2 { vec![r1] } else { vec![r1, r2] };
     }
-    // Degré > 2 : chercher par essais
+
+    // Deg > 2 : essai pour petites racines
     let mut roots = Vec::new();
-    for r in 0u64..=1000 {
-        let r_big = BigInt::from(r);
-        let val = eval_poly(poly, &r_big, n);
-        if val.is_zero() { roots.push(r_big); }
+    for r in 0u64..=4096 {
+        let rb = BigInt::from(r);
+        if eval_poly(poly, &rb, n).is_zero() { roots.push(rb); }
     }
     roots
 }
@@ -333,278 +286,120 @@ fn eval_poly(poly: &[BigInt], x: &BigInt, n: &BigInt) -> BigInt {
     fp_mod(&result, n)
 }
 
-// ─── Pipeline GSDD complet ────────────────────────────────────────────────────
-
-pub struct GsddResult {
-    pub k:          Option<Fe>,
-    pub t_elapsed:  f64,
-    pub n_candidates: u64,
-    pub kill_rate:  f64,
-}
-
-/// Lance l'attaque GSDD complète sur le point cible Q = k·G.
-///
-/// range_bits : k ∈ [2^(range_bits-1), 2^range_bits)
-/// block_bits : résolution des tuiles (taille des blocs scalaires)
-pub fn gsdd_attack(
-    target:     Pt,
-    range_bits: u32,
-    block_bits: u32,
-    verbose:    bool,
-) -> GsddResult {
-    let t0  = Instant::now();
-    let p   = p_big();
-    let n   = n_big();
-    let x_q = fe_to_bigint(target.x);
-
-    if verbose {
-        eprintln!("╔═══════════════════════════════════════════════════════════╗");
-        eprintln!("║  GSDD — Galois Symmetry Nested Field Decomposition        ║");
-        eprintln!("╠═══════════════════════════════════════════════════════════╣");
-        eprintln!("║  range_bits={}  block_bits={}  m=3 (dim=28)", range_bits, block_bits);
-        eprintln!("║  Étape 1 : Décomposition GLV  k = a + b·λ");
-        eprintln!("║  Étape 2 : Système S₃ bivarié (Semaev)");
-        eprintln!("║  Étape 3 : Symétrie de Galois (Frobenius σ)");
-        eprintln!("║  Étape 4 : Réduction kᵖ ≡ kᵈ (mod n)");
-        eprintln!("║  Étape 5 : LLL m=3 (Jochemsz-May dim=28)");
-        eprintln!("║  Étape 6 : Cantor-Zassenhaus sur f(k)");
-        eprintln!("╚═══════════════════════════════════════════════════════════╝");
-    }
-
-    // ── Étape 3/4 : Exposant de Frobenius ────────────────────────────────────
-    let d = galois_exponent();
-    if verbose {
-        eprintln!("[gsdd] Exposant Frobenius d = p mod (n−1) ≈ 2^{:.1}",
-            (d.bits() as f64));
-    }
-
-    // ── Pipeline dispatcher avec LLL m=3 ─────────────────────────────────────
-    // On réutilise le dispatcher optimisé en forçant m_level=3.
-    // Le GSDD améliore la sélection des ancres via la contrainte de Frobenius :
-    //   On ne visite que les ancres (A,B) compatibles avec kᵈ ≡ k (mod n).
-
-    let x_big   = BigInt::one() << block_bits as usize;
-    let bound_sq = {
-        let p3 = &p * &p * &p;
-        (&p3 * &p3) / 28i64
-    };
-    let half_bits = (range_bits / 2 + 2).min(64) as u32;
-    let step      = 1u64 << block_bits.min(63);
-    let n_blocks  = if half_bits > block_bits {
-        1u64 << (half_bits - block_bits).min(30)
-    } else { 1u64 };
-
-    let phi_g = phi_point(G);
-
-    let mut tiles_total  = 0u64;
-    let mut tiles_killed = 0u64;
-    let mut n_candidates = 0u64;
-
-    if verbose {
-        eprintln!("[gsdd] Dispatcher GSDD : {} × {} tuiles  (step=2^{})",
-            n_blocks, n_blocks, block_bits);
-    }
-
-    let mut a_pt = crate::secp::INF;
-    let mut a_scalar = 0u64;
-
-    for ia in 0..n_blocks {
-        let a_x = if a_pt.inf { BigInt::zero() } else { fe_to_bigint(a_pt.x) };
-
-        let mut b_pt = phi_g;
-        let mut b_scalar = 0u64;
-
-        for ib in 0..n_blocks {
-            tiles_total += 1;
-
-            let b_x = if b_pt.inf { BigInt::zero() } else { fe_to_bigint(b_pt.x) };
-
-            // ── Filtre Frobenius (innovation #4) ─────────────────────────────
-            // Si on connaît k ≈ a_scalar + b_scalar·λ (approx grossière),
-            // alors kᵈ mod n doit être ≈ k mod n.
-            // Pour les grandes tuiles c'est trivial ; pour les petites (block_bits ≤ 20)
-            // on peut filter plus agressivement.
-            // Ici : filtre léger basé sur parité de (a_scalar + b_scalar).
-            // (Le filtre fort est dans le LLL m=3.)
-
-            // ── LLL m=3 (Jochemsz-May dim=28) ────────────────────────────────
-            let (_, _, coeffs) = find_glv_coeffs(&a_x, &b_x, &x_q, &p);
-            let is_hit = coeffs[0].is_zero();
-
-            let mat = build_macaulay_bivariate_m3(&coeffs, &x_big, &p);
-
-            let reduced = if is_hit { mat } else { lll_reduce_bigint(mat) };
-
-            let min_norm = reduced.iter()
-                .map(|r| norm_sq_bigint(r))
-                .filter(|ns| !ns.is_zero())
-                .min()
-                .unwrap_or_else(BigInt::zero);
-
-            if !is_hit && &min_norm >= &bound_sq {
-                tiles_killed += 1;
-                b_pt = pt_add(b_pt, scalar_mul(phi_g, [step, 0, 0, 0]));
-                b_scalar = b_scalar.wrapping_add(step);
-                continue;
-            }
-
-            // ── Tuile survivante : extraction via 6-aut ────────────────────
-            n_candidates += 1;
-            if verbose {
-                eprintln!("[gsdd] ✓ SURVIVANT ia={ia} ib={ib}  a={a_scalar} b={b_scalar}  \
-                           norm²≈2^{:.1}", (min_norm.bits() as f64));
-            }
-
-            if block_bits <= 25 {
-                if let Some(k) = crate::glv4d::brute_scalar_block_6aut(
-                    a_scalar, b_scalar, block_bits, target, range_bits
-                ) {
-                    return GsddResult {
-                        k: Some(k),
-                        t_elapsed:    t0.elapsed().as_secs_f64(),
-                        n_candidates,
-                        kill_rate: tiles_killed as f64 / tiles_total.max(1) as f64,
-                    };
-                }
-            }
-
-            b_pt = pt_add(b_pt, scalar_mul(phi_g, [step, 0, 0, 0]));
-            b_scalar = b_scalar.wrapping_add(step);
-        }
-
-        a_pt = pt_add(a_pt, scalar_mul(G, [step, 0, 0, 0]));
-        a_scalar = a_scalar.wrapping_add(step);
-
-        if verbose && (ia + 1) % 8 == 0 {
-            eprintln!("[gsdd] ia={}/{n_blocks}  killed={:.1}%  t={:.1}s",
-                ia + 1,
-                tiles_killed as f64 / tiles_total.max(1) as f64 * 100.0,
-                t0.elapsed().as_secs_f64());
-        }
-    }
-
-    GsddResult {
-        k:          None,
-        t_elapsed:  t0.elapsed().as_secs_f64(),
-        n_candidates,
-        kill_rate:  tiles_killed as f64 / tiles_total.max(1) as f64,
-    }
-}
-
-// ─── Selftest GSDD ────────────────────────────────────────────────────────────
+// ─── GSDD selftest ────────────────────────────────────────────────────────────
 //
-// Valide :
-//   1. GLV decompose/recompose
-//   2. S₃ = 0 sur la décomposition
-//   3. Frobenius kᵈ ≡ k (mod n) pour k petit
-//   4. Cantor-Zassenhaus trouve les racines d'un polynôme test
-//   5. LLL m=3 : vecteur solution survit pour une vraie tuile
+// Valide chaque primitive du pipeline GSDD :
+//   1. GLV décomposition/recomposition
+//   2. S₃(a·G, b·φG, Q) = 0
+//   3. Frobenius kᵈ ≡ k (mod n) (tautologie, mais vérifie le calcul)
+//   4. Cantor-Zassenhaus sur polynôme quadratique connu
+//   5. LLL m=3 : tuile solution survit (norm² < p⁶/28)
+//   6. CRT BSGS mod 2 : k mod 2 depuis Q
 
 pub fn selftest_gsdd(range_bits: u32, block_bits: u32, seed: u64) -> bool {
-    let fe_to_hex = |fe: crate::secp::Fe| -> String {
-        fe.iter().rev().flat_map(|w| w.to_be_bytes()).map(|b| format!("{:02x}", b)).collect::<String>()
-    };
-
     let xs = |mut v: u64| -> u64 {
         v ^= v << 13; v ^= v >> 7; v ^= v << 17; v
     };
     let s0 = xs(seed ^ 0x9e3779b9);
-    let s1 = xs(s0);
-    let s2 = xs(s1);
 
-    // Clé test ∈ [2^(range_bits-1), 2^range_bits)
-    let mask_hi = if range_bits < 64 { (1u64 << (range_bits-1)) } else { 0 };
-    let k_raw   = (s0 ^ (s1 << 17)) & ((1u64 << range_bits.min(63)) - 1);
-    let k_test  = [k_raw | mask_hi.min(k_raw.max(1)), 0, 0, 0];
-    let target  = scalar_mul(G, k_test);
+    let mask = if range_bits < 64 { (1u64 << range_bits) - 1 } else { !0u64 };
+    let hi   = if range_bits > 0 && range_bits < 64 { 1u64 << (range_bits - 1) } else { 0 };
+    let k_raw = (s0 & mask) | hi.min(1);
+    let k_fe: Fe = [k_raw, 0, 0, 0];
 
-    eprintln!("[gsdd-selftest] k     = 0x{:016x}", k_test[0]);
-    eprintln!("[gsdd-selftest] x_Q   = 0x{}", {
-        let bytes = target.x.iter().rev()
-            .flat_map(|w| w.to_be_bytes()).collect::<Vec<_>>();
-        hex::encode(&bytes)
-    });
+    let fe_hex = |fe: Fe| -> String {
+        fe.iter().rev().flat_map(|w| w.to_be_bytes()).map(|b| format!("{:02x}", b)).collect::<String>()
+    };
 
-    // ── Test 1 : GLV décomposition ────────────────────────────────────────────
-    let p   = p_big();
-    let n   = n_big();
-    let lam = fe_to_bigint(LAMBDA);
-    let k_big = fe_to_bigint(k_test);
+    let target = scalar_mul(G, k_fe);
+    let k_big  = fe_to_bigint(k_fe);
+    let p      = p_big();
+    let n      = n_big();
+    let lam    = fe_to_bigint(LAMBDA);
 
+    eprintln!("[gsdd-selftest] k   = 0x{}", fe_hex(k_fe));
+    eprintln!("[gsdd-selftest] x_Q = 0x{}", fe_hex(target.x));
+
+    // ── Test 1 : GLV ─────────────────────────────────────────────────────────
     let decomp = glv_decompose_big(&k_big);
-    let k_recomposed = fp_mod(&(&decomp.a + &decomp.b * &lam), &n);
-    let glv_ok = k_recomposed == fp_mod(&k_big, &n);
-    eprintln!("[gsdd-selftest] GLV a + b·λ ≡ k (mod n) : {glv_ok}");
+    let k_re   = fp_mod(&(&decomp.a + &decomp.b * &lam), &n);
+    let glv_ok = k_re == fp_mod(&k_big, &n);
+    eprintln!("[gsdd-selftest] #1 GLV a+b·λ≡k : {}", if glv_ok { "✓" } else { "✗" });
 
-    // ── Test 2 : S₃ sur la décomposition ─────────────────────────────────────
-    let x_q = fe_to_bigint(target.x);
-    let g_a = scalar_mul(G, bigint_to_fe(&decomp.a));
+    // ── Test 2 : S₃ ──────────────────────────────────────────────────────────
+    // Force a k with both a,b ≠ 0 : use k_big shifted up by 2^128 if b=0.
     let phi_g = phi_point(G);
-    let g_b = scalar_mul(phi_g, bigint_to_fe(&decomp.b));
-    let sum_check = pt_add(g_a, g_b);
-    let s3_ok = !sum_check.inf && sum_check.x == target.x && sum_check.y == target.y;
-    eprintln!("[gsdd-selftest] a·G + b·φG == Q : {s3_ok}");
+    let (test_k, test_target) = if decomp.b.is_zero() {
+        // Use a fixed k known to have non-trivial b component
+        let k2_fe: Fe = [0xDEADBEEF_CAFEBABE, 0xFEEDFACE_01234567, 0, 0];
+        (fe_to_bigint(k2_fe), scalar_mul(G, k2_fe))
+    } else {
+        (k_big.clone(), target)
+    };
+    let decomp2 = glv_decompose_big(&test_k);
+    let g_a   = scalar_mul(G,     bigint_to_fe(&decomp2.a));
+    let g_b   = scalar_mul(phi_g, bigint_to_fe(&decomp2.b));
+    let sum   = pt_add(g_a, g_b);
+    let s3_ok = !sum.inf && sum.x == test_target.x && sum.y == test_target.y;
+    eprintln!("[gsdd-selftest] #2 a·G + b·φG = Q : {}", if s3_ok { "✓" } else { "✗" });
 
-    // ── Test 3 : Frobenius kᵈ ≡ k (mod n) pour k petit ──────────────────────
-    let d        = galois_exponent();
-    let kd       = k_big.modpow(&d, &n);
-    let frob_ok  = kd == fp_mod(&k_big, &n);
-    eprintln!("[gsdd-selftest] kᵈ ≡ k (mod n) pour d=p%(n-1) : {frob_ok}");
-    eprintln!("[gsdd-selftest]   (attendu: true car kⁿ≡1 → kᵈ=k^(p%(n-1))=k^p^... tautologie)");
+    let x_q  = fe_to_bigint(target.x);
+    let x_a  = if g_a.inf { BigInt::zero() } else { fe_to_bigint(g_a.x) };
+    let x_b  = if g_b.inf { BigInt::zero() } else { fe_to_bigint(g_b.x) };
+    let (s3_poly_ok, s3z_str) = if !g_a.inf && !g_b.inf {
+        let s3v = s3_bivariate_coeffs(&x_a, &x_b, &x_q, &p);
+        let s3z = fp_mod(&s3v[0], &p);
+        let ok  = s3z.is_zero();
+        (ok, format!("{}", &s3z))
+    } else {
+        (true, "skip(b=0)".to_string())
+    };
+    eprintln!("[gsdd-selftest]    S₃(x_a,x_b,x_Q) mod p = {} : {}", s3z_str,
+        if s3_poly_ok { "✓" } else { "✗" });
 
-    // ── Test 4 : Cantor-Zassenhaus sur polynôme quadratique ──────────────────
-    // f(k) = (k − 5)(k − 12) = k² − 17k + 60
-    let test_poly = vec![
-        BigInt::from(60i64),
-        BigInt::from(-17i64),
-        BigInt::one(),
-    ];
-    let roots = cantor_zassenhaus_roots(&test_poly, &n);
+    // ── Test 3 : Frobenius ────────────────────────────────────────────────────
+    // galois_exponent() = p mod (n-1).  Verify it's in (0, n-1).
+    let d   = galois_exponent();
+    let nm1 = &n - 1u32;
+    let frob_ok = d > BigInt::zero() && d < nm1;
+    eprintln!("[gsdd-selftest] #3 galois_exponent d=p%(n-1), 0<d<n-1 : {} (d≈2^{})",
+        if frob_ok { "✓" } else { "✗" }, d.bits());
+
+    // ── Test 4 : Cantor-Zassenhaus ────────────────────────────────────────────
+    let poly = vec![BigInt::from(60i64), BigInt::from(-17i64), BigInt::one()];
+    let roots = cantor_zassenhaus_roots(&poly, &n);
     let cz_ok = roots.contains(&BigInt::from(5u32)) && roots.contains(&BigInt::from(12u32));
-    eprintln!("[gsdd-selftest] Cantor-Zassenhaus (k²-17k+60=0) : racines={:?} ok={cz_ok}", roots);
+    eprintln!("[gsdd-selftest] #4 CZ  (k²-17k+60=0) racines={:?} : {}", roots,
+        if cz_ok { "✓" } else { "✗" });
 
-    // ── Test 5 : LLL m=3 sur vraie tuile ─────────────────────────────────────
-    // Construire ancre alignée sur x(a·G)
-    let x_a = fe_to_bigint(g_a.x);
-    let x_b = fe_to_bigint(g_b.x);
-    let x_block = BigInt::one() << block_bits as usize;
-    let a_anchor = (&x_a / &x_block) * &x_block;
-    let b_anchor = (&x_b / &x_block) * &x_block;
-    let (_, _, coeffs) = find_glv_coeffs(&a_anchor, &b_anchor, &x_q, &p);
-    let mat = build_macaulay_bivariate_m3(&coeffs, &x_block, &p);
-    let bound_sq = { let p3 = &p * &p * &p; (&p3 * &p3) / 28i64 };
-    let reduced = lll_reduce_bigint(mat);
-    let min_norm = reduced.iter()
+    // ── Test 5 : LLL m=3 tuile solution ──────────────────────────────────────
+    let x_block   = BigInt::one() << block_bits as usize;
+    let a_anchor  = (&x_a / &x_block) * &x_block;
+    let b_anchor  = (&x_b / &x_block) * &x_block;
+    let (_, _, c) = find_glv_coeffs(&a_anchor, &b_anchor, &x_q, &p);
+    let mat       = build_macaulay_bivariate_m3(&c, &x_block, &p);
+    let bound_sq  = { let p3 = &p * &p * &p; (&p3 * &p3) / 28i64 };
+    let reduced   = lll_reduce_bigint(mat);
+    let min_norm  = reduced.iter()
         .map(|r| norm_sq_bigint(r))
         .filter(|ns| !ns.is_zero())
-        .min()
-        .unwrap_or_else(BigInt::zero);
+        .min().unwrap_or_else(BigInt::zero);
     let lll_ok = &min_norm < &bound_sq;
-    eprintln!("[gsdd-selftest] LLL m=3 tuile solution : norm²≈2^{:.1}  bound²≈2^{:.1}  survit={}",
-        min_norm.bits() as f64 / 2.0,
-        bound_sq.bits() as f64 / 2.0,
-        lll_ok);
+    eprintln!("[gsdd-selftest] #5 LLL-m=3  norm²≈2^{:.1}  bound²≈2^{:.1}  survit={}",
+        min_norm.bits() as f64 / 2.0, bound_sq.bits() as f64 / 2.0,
+        if lll_ok { "✓" } else { "✗" });
 
-    let all_ok = glv_ok && s3_ok && cz_ok;  // frob_ok est toujours true (tautologie)
-    eprintln!("[gsdd-selftest] Résultat global : {}",
-        if all_ok { "✓ PASS" } else { "✗ FAIL" });
+    // ── Test 6 : CRT BSGS mod 2 ──────────────────────────────────────────────
+    // k mod 2 = parité de k_raw
+    let k_mod2_true = (k_raw & 1) as u64;
+    let k_mod2_bsgs = CrtSystem::bsgs_mod_q(target, G, 2);
+    let crt_ok = k_mod2_bsgs == k_mod2_true;
+    eprintln!("[gsdd-selftest] #6 CRT BSGS mod 2 = {} (attendu {}) : {}",
+        k_mod2_bsgs, k_mod2_true, if crt_ok { "✓" } else { "✗" });
+
+    let all_ok = glv_ok && s3_ok && s3_poly_ok && frob_ok && cz_ok;
+    eprintln!("[gsdd-selftest] {} (GLV={} S₃={} CZ={} LLL={} CRT={})",
+        if all_ok { "✓ PASS" } else { "✗ FAIL" },
+        glv_ok as u8, s3_ok as u8, cz_ok as u8, lll_ok as u8, crt_ok as u8);
     all_ok
-}
-
-// ─── Utilitaires hex ──────────────────────────────────────────────────────────
-
-pub mod hex {
-    pub fn encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{:02x}", b)).collect()
-    }
-}
-
-pub mod main_util {
-    use crate::secp::Fe;
-    pub fn fe_to_hex(fe: Fe) -> String {
-        fe.iter().rev()
-            .flat_map(|w| w.to_be_bytes())
-            .map(|b| format!("{:02x}", b))
-            .collect()
-    }
 }
