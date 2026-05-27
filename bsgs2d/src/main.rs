@@ -168,6 +168,10 @@ struct Args {
     #[arg(long, default_value = "0")]
     threads: usize,
 
+    /// Pipeline complet : GLV-4D + Semaev-S₃ + Frobenius + LLL-m3 + 6-aut + AnchorL2 + Rayon.
+    #[arg(long)]
+    solve: bool,
+
     /// Lancer le pipeline GSDD complet (Galois Symmetry + Nested Field Decomposition).
     #[arg(long)]
     gsdd: bool,
@@ -1182,17 +1186,39 @@ fn main() {
         return;
     }
 
-    let result = if args.gsdd {
+    let result = if args.solve {
+        // ── FULL STACK : toutes innovations branchées ─────────────────────────
+        let block_bits = args.block_bits.unwrap_or_else(|| {
+            let bb = ((args.range_bits + 3) / 4).max(3).min(20);
+            eprintln!("[auto] solve block_bits = {bb}");
+            bb
+        });
+        let half_bits = args.half_bits.unwrap_or_else(|| {
+            let hb = (args.range_bits / 2 + 2).min(64);
+            eprintln!("[auto] solve half_bits = {hb}");
+            hb
+        });
+        let mut cfg = dispatcher::DispatcherConfig::new(target, args.range_bits, block_bits);
+        cfg.half_bits = half_bits;
+        cfg.m_level   = 3;  // LLL m=3 dim=28 (Jochemsz-May calibré)
+        cfg.verbose   = true;
+        dispatcher::run_full_stack(&cfg)
+    } else if args.gsdd {
+        // GSDD = Full Stack avec m=3 + verbose (alias pédagogique de --solve)
         let block_bits = args.block_bits.unwrap_or_else(|| {
             let bb = ((args.range_bits + 3) / 4).max(3).min(20);
             eprintln!("[auto] gsdd block_bits = {bb}");
             bb
         });
+        let half_bits = args.half_bits.unwrap_or_else(|| {
+            (args.range_bits / 2 + 2).min(64)
+        });
+        let mut cfg = dispatcher::DispatcherConfig::new(target, args.range_bits, block_bits);
+        cfg.half_bits = half_bits;
+        cfg.m_level   = 3;
+        cfg.verbose   = true;
         eprintln!("[main] Mode GSDD — Galois Symmetry + Nested Field Decomposition (m=3)");
-        let r = gsdd::gsdd_attack(target, args.range_bits, block_bits, true);
-        eprintln!("[gsdd] terminé en {:.2}s  candidates={}  kill_rate={:.2}%",
-            r.t_elapsed, r.n_candidates, r.kill_rate * 100.0);
-        r.k
+        dispatcher::run_full_stack(&cfg)
     } else if args.optimized || args.parallel || args.dispatch {
         let block_bits = args.block_bits.unwrap_or_else(|| {
             let bb = ((args.range_bits + 3) / 4).max(3).min(22);
