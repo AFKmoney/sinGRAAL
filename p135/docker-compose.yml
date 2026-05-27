@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+  solver:
+    build:
+      context: ..
+      dockerfile: p135/Dockerfile
+    image: singraal-p135:latest
+    environment:
+      # NOTE: Remplacer par les vraies coordonnées du puzzle Bitcoin #135
+      TARGET_X: ${TARGET_X:-PUZZLE135_X}
+      TARGET_Y: ${TARGET_Y:-PUZZLE135_Y}
+      RANGE_BITS: ${RANGE_BITS:-135}
+      BLOCK_BITS: ${BLOCK_BITS:-20}
+      THREADS: ${THREADS:-0}
+    volumes:
+      - solver_data:/data
+    restart: unless-stopped
+    # Pour utiliser un GPU NVIDIA : décommenter les lignes suivantes
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  solver_data:
+    driver: local
