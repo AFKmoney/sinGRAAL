@@ -47,11 +47,16 @@
 mod secp;
 mod lll;
 mod coppersmith;
+mod lll_earlyabort;
+mod dispatcher;
+mod glv4d;
+mod gsdd;
 
 use clap::Parser;
 use secp::*;
 use std::collections::HashMap;
 use std::time::Instant;
+use rayon;
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -103,6 +108,10 @@ struct Args {
     #[arg(long)]
     golden_test: bool,
 
+    /// Benchmarker le Kill Switch PNC (GS partiel + LLL f64 early-abort).
+    #[arg(long)]
+    pnc_bench: bool,
+
     /// Test du juge de paix : évaluer S₃(x_L, x_R, x_P) sur la vraie racine → doit donner 0.
     #[arg(long)]
     s3test: bool,
@@ -118,6 +127,58 @@ struct Args {
     /// Graine hex u64 pour selftest.
     #[arg(long, default_value = "0x135")]
     seed: String,
+
+    /// Lancer le Dispatcher GLV toroïdal (PNC+LLL sur grille scalaire 2D).
+    #[arg(long)]
+    dispatch: bool,
+
+    /// Bits de la demi-dimension de la grille GLV (défaut : ceil(range_bits/2)+2).
+    #[arg(long)]
+    half_bits: Option<u32>,
+
+    /// Niveau Jochemsz-May pour la matrice de Macaulay (2=dim15, 3=dim28).
+    #[arg(long, default_value = "3")]
+    m_level: u32,
+
+    /// Benchmark du Dispatcher : N paires aléatoires, mesure PNC+LLL rejection rate.
+    #[arg(long)]
+    dispatch_bench: bool,
+
+    /// Nombre de paires pour --dispatch-bench.
+    #[arg(long, default_value = "20")]
+    dispatch_bench_n: u64,
+
+    /// Test Golden Block Dispatcher : vérifie que la tuile solution survit au filtre.
+    #[arg(long)]
+    golden_dispatch: bool,
+
+    /// Dispatcher parallèle Rayon (innovations #24 GLV 6-aut + #28 batch + #30 multi-k LLL).
+    #[arg(long)]
+    parallel: bool,
+
+    /// Dispatcher optimisé : AnchorTable L2 + auto-tune + 6-aut + Rayon (#21+#22+#24+#28+#30).
+    #[arg(long)]
+    optimized: bool,
+
+    /// Auto-calibration de block_bits (mesure kill_rate, recommande le meilleur block_bits).
+    #[arg(long)]
+    auto_tune: bool,
+
+    /// Nombre de threads Rayon (défaut : tous les cœurs disponibles).
+    #[arg(long, default_value = "0")]
+    threads: usize,
+
+    /// Pipeline complet : GLV-4D + Semaev-S₃ + Frobenius + LLL-m3 + 6-aut + AnchorL2 + Rayon.
+    #[arg(long)]
+    solve: bool,
+
+    /// Lancer le pipeline GSDD complet (Galois Symmetry + Nested Field Decomposition).
+    #[arg(long)]
+    gsdd: bool,
+
+    /// Selftest GSDD : valide GLV, S₃, Frobenius, Cantor-Zassenhaus, LLL m=3.
+    #[arg(long)]
+    gsdd_selftest: bool,
 }
 
 // ─── Utilitaires scalaires ───────────────────────────────────────────────────
@@ -185,16 +246,52 @@ fn recover_k_2d(
 }
 
 // ─── Baby table 1D ───────────────────────────────────────────────────────────
-
+//
+// Version rapide : Jacobien + batch-inversion (Montgomery trick).
+// Réduit le nombre d'inversions de M à M/W (W = 1024).
+// ~24× plus rapide que la version naïve (affine + 1 inv/step).
 fn build_baby_table_1d(m: u64) -> HashMap<[u64; 4], u64> {
+    use secp::{ptj_from_affine, ptj_add_affine, ptj_batch_to_affine, PtJ};
+    const W: u64 = 1024;
     let mut table = HashMap::with_capacity(m as usize);
-    let mut pt = G;
-    for b in 1..=m {
-        if !pt.inf {
-            let cx = canonical_x(pt.x);
-            table.entry(cx).or_insert(b);
+    // Precompute step_W = W*G (used to advance batch starts)
+    let step_g = if m < W { G } else { scalar_mul(G, [W, 0, 0, 0]) };
+    let mut batch_start_pt = INF; // 0*G = INF (will be advanced to 1*G at first step)
+    // batch_start_pt begins at (batch_idx * W) * G, but we start the first batch at 1*G
+    // so initial batch_start = 0*G = INF; first point in batch = 1*G = INF + G
+    let mut batch_scalar: u64 = 1; // scalar of first point in current batch
+
+    loop {
+        if batch_scalar > m { break; }
+        let batch_end = (batch_scalar + W - 1).min(m);
+        let count = (batch_end - batch_scalar + 1) as usize;
+
+        // Fill batch in Jacobian using mixed J+A additions from batch_start_pt
+        let mut jpts: Vec<PtJ> = Vec::with_capacity(count);
+        // batch_start_pt is (batch_scalar - 1)*G. First point = batch_scalar*G.
+        // Use Jacobian+Affine addition (no inversion needed).
+        let mut cur = ptj_add_affine(ptj_from_affine(batch_start_pt), G);
+        jpts.push(cur);
+        for _ in 1..count {
+            cur = ptj_add_affine(cur, G);
+            jpts.push(cur);
         }
-        pt = pt_add(pt, G);
+
+        // Batch convert to affine (1 inversion per batch)
+        let affine_pts = ptj_batch_to_affine(&jpts);
+
+        // Insert into table
+        for (i, aff) in affine_pts.iter().enumerate() {
+            let b = batch_scalar + i as u64;
+            if !aff.inf {
+                let cx = canonical_x(aff.x);
+                table.entry(cx).or_insert(b);
+            }
+        }
+
+        // Advance batch_start_pt by W steps
+        batch_scalar += W;
+        batch_start_pt = pt_add(batch_start_pt, step_g);
     }
     table
 }
@@ -921,6 +1018,15 @@ fn main() {
         bb
     });
 
+    // ── GSDD Selftest ─────────────────────────────────────────────────────────
+    if args.gsdd_selftest {
+        let seed_s = args.seed.trim_start_matches("0x");
+        let seed   = u64::from_str_radix(seed_s, 16).expect("--seed: hex u64");
+        let block_bits = args.block_bits.unwrap_or(8);
+        gsdd::selftest_gsdd(args.range_bits, block_bits, seed);
+        return;
+    }
+
     // ── Analyse LLL (optionnelle) ─────────────────────────────────────────────
     if args.lll {
         lll::print_lll_report(args.range_bits);
@@ -941,6 +1047,14 @@ fn main() {
         let seed   = u64::from_str_radix(seed_s, 16).expect("--seed: hex u64");
         run_golden_block_test(seed, args.range_bits, block_bits);
         return;
+    }
+
+    // ── Benchmark filtre PNC (Kill Switch Cohen 2.6.7 exact) ───────────────
+    if args.pnc_bench {
+        let block_bits = args.block_bits.unwrap_or(5);
+        eprintln!("[pnc-bench] Kill Switch PNC  block_bits={block_bits}");
+        let stats = lll_earlyabort::benchmark_killswitch(15, 1000);
+        stats.print();
     }
 
     // ── Benchmark filtre Coppersmith univarié ────────────────────────────────
@@ -983,6 +1097,29 @@ fn main() {
         println!();
     }
 
+    // ── Benchmark Kill Switch PNC ─────────────────────────────────────────────
+    if args.pnc_bench {
+        let block_bits = args.block_bits.unwrap_or(5);
+        eprintln!("[pnc-bench] Kill Switch PNC — GS partiel f64 + LLL f64 early-abort");
+        eprintln!("[pnc-bench] dim=15 (m=2 bivarié)  block_bits={block_bits}");
+        eprintln!("[pnc-bench] Borne HG : log2(p⁴/15) = {:.1}", lll_earlyabort::hg_bound_log2(15));
+        let stats = lll_earlyabort::benchmark_killswitch(15, 200);
+        stats.print();
+        eprintln!("[pnc-bench] Interprétation :");
+        eprintln!("  > 80% → Kill Switch efficace (économie majeure de LLL BigRational)");
+        eprintln!("  ~0%   → matrices toutes viables (Kill Switch conservateur)");
+        if !args.estimate_only { println!(); }
+    }
+
+    // ── Benchmark Dispatcher ─────────────────────────────────────────────────
+    if args.dispatch_bench {
+        let block_bits = args.block_bits.unwrap_or(5);
+        dispatcher::benchmark_dispatcher(
+            args.range_bits, block_bits, args.m_level, args.dispatch_bench_n
+        );
+        if args.estimate_only { return; }
+    }
+
     if args.estimate_only { return; }
 
     // ── Cible ─────────────────────────────────────────────────────────────────
@@ -1018,7 +1155,95 @@ fn main() {
     };
 
     // ── Dispatch 1D / 2D / Semaev ────────────────────────────────────────────
-    let result = if args.semaev {
+    // ── Golden Dispatch Test ──────────────────────────────────────────────────
+    if args.golden_dispatch {
+        let block_bits = args.block_bits.unwrap_or(5);
+        let seed_s = args.seed.trim_start_matches("0x");
+        let seed   = u64::from_str_radix(seed_s, 16).expect("--seed: hex u64");
+        let k  = random_key(seed, args.range_bits);
+        eprintln!("[golden-dispatch] k = 0x{}", fe_to_hex(k));
+        let passed = dispatcher::golden_block_test(k, args.range_bits, block_bits, args.m_level);
+        if passed { eprintln!("[golden-dispatch] ✓ PASS"); }
+        else       { eprintln!("[golden-dispatch] ✗ FAIL"); }
+        return;
+    }
+
+    // Configurer Rayon avant tout dispatch parallèle
+    if args.threads > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(args.threads)
+            .build_global()
+            .unwrap_or(());
+    }
+
+    // ── Auto-tune block_bits ──────────────────────────────────────────────────
+    if args.auto_tune {
+        let n_samples = args.dispatch_bench_n;
+        let result = dispatcher::auto_tune_block_bits(
+            args.range_bits, args.m_level, n_samples, 0.999
+        );
+        result.print();
+        return;
+    }
+
+    let result = if args.solve {
+        // ── FULL STACK : toutes innovations branchées ─────────────────────────
+        let block_bits = args.block_bits.unwrap_or_else(|| {
+            let bb = ((args.range_bits + 3) / 4).max(3).min(20);
+            eprintln!("[auto] solve block_bits = {bb}");
+            bb
+        });
+        let half_bits = args.half_bits.unwrap_or_else(|| {
+            let hb = (args.range_bits / 2 + 2).min(64);
+            eprintln!("[auto] solve half_bits = {hb}");
+            hb
+        });
+        let mut cfg = dispatcher::DispatcherConfig::new(target, args.range_bits, block_bits);
+        cfg.half_bits = half_bits;
+        cfg.m_level   = 3;  // LLL m=3 dim=28 (Jochemsz-May calibré)
+        cfg.verbose   = true;
+        dispatcher::run_full_stack(&cfg)
+    } else if args.gsdd {
+        // GSDD = Full Stack avec m=3 + verbose (alias pédagogique de --solve)
+        let block_bits = args.block_bits.unwrap_or_else(|| {
+            let bb = ((args.range_bits + 3) / 4).max(3).min(20);
+            eprintln!("[auto] gsdd block_bits = {bb}");
+            bb
+        });
+        let half_bits = args.half_bits.unwrap_or_else(|| {
+            (args.range_bits / 2 + 2).min(64)
+        });
+        let mut cfg = dispatcher::DispatcherConfig::new(target, args.range_bits, block_bits);
+        cfg.half_bits = half_bits;
+        cfg.m_level   = 3;
+        cfg.verbose   = true;
+        eprintln!("[main] Mode GSDD — Galois Symmetry + Nested Field Decomposition (m=3)");
+        dispatcher::run_full_stack(&cfg)
+    } else if args.optimized || args.parallel || args.dispatch {
+        let block_bits = args.block_bits.unwrap_or_else(|| {
+            let bb = ((args.range_bits + 3) / 4).max(3).min(22);
+            eprintln!("[auto] dispatcher block_bits = {bb}");
+            bb
+        });
+        let half_bits = args.half_bits.unwrap_or_else(|| {
+            let hb = (args.range_bits / 2 + 2).min(64);
+            eprintln!("[auto] dispatcher half_bits = {hb}");
+            hb
+        });
+        let mut cfg = dispatcher::DispatcherConfig::new(target, args.range_bits, block_bits);
+        cfg.half_bits = half_bits;
+        cfg.m_level   = args.m_level;
+        cfg.verbose   = true;
+        if args.optimized {
+            eprintln!("[main] Mode dispatcher OPTIMISÉ (#21 L2 + #22 auto-tune + #24+#28+#30)");
+            dispatcher::run_dispatcher_optimized(&cfg)
+        } else if args.parallel {
+            eprintln!("[main] Mode dispatcher PARALLÈLE Rayon (innovations #24+#28+#30)");
+            dispatcher::run_dispatcher_parallel(&cfg)
+        } else {
+            dispatcher::run_dispatcher(&cfg)
+        }
+    } else if args.semaev {
         let block_bits = args.block_bits.unwrap_or_else(|| {
             let bb = ((args.range_bits + 3) / 4).max(3).min(20);
             eprintln!("[auto] block_bits = {bb}");
@@ -1055,7 +1280,7 @@ fn main() {
 
         eprintln!("[giant1D] Recherche (max {giant_max} steps)...");
         giant_search_1d(target, &table, m, giant_max, args.range_bits)
-    };
+    };  // end result
 
     // ── Résultat ──────────────────────────────────────────────────────────────
     match result {

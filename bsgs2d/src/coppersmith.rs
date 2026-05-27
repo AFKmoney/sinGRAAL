@@ -30,6 +30,7 @@ use num_rational::BigRational;
 use num_traits::{Zero, One, Signed, ToPrimitive};
 use num_integer::Integer;
 use crate::secp::{Fe, fp_mul, fp_sub, fp_add, fp_neg, fp_inv, FIELD_P, fe_lt, BETA, BETA2};
+use crate::lll_earlyabort::is_dead_fast;
 
 // ─── Conversion Fe ↔ BigInt ──────────────────────────────────────────────────
 
@@ -383,6 +384,249 @@ pub fn norm_sq_bigint(v: &[BigInt]) -> BigInt {
     v.iter().map(|x| x * x).sum()
 }
 
+// ─── LLL BigRational avec KILL CERTIFIÉ (early-abort) ────────────────────────
+//
+// Identique à lll_reduce_bigint mais avec un kill-switch MATHÉMATIQUEMENT
+// CERTIFIÉ basé sur le théorème :
+//
+//   Pour TOUTE base de réseau, λ₁(L) ≥ min_k ||b*_k||
+//   (car tout v = Σ aᵢbᵢ vérifie ||v|| ≥ |a_j|·||b*_j|| ≥ min_k ||b*_k||,
+//    j = plus grand indice avec a_j ≠ 0).
+//
+// Donc si à un instant quelconque  min_k ||b*_k||² ≥ bound_sq,
+// alors λ₁² ≥ bound_sq → AUCUN vecteur court → KILL (jamais de faux négatif :
+// une tuile dont λ₁² < bound_sq ne sera JAMAIS tuée, sa solution survit).
+//
+// Pourquoi des swaps réels avant de décider (vs is_dead_fast) :
+//   min_k ||b*_k|| est une borne INFÉRIEURE de λ₁, lâche sur la base brute
+//   (les b*_k de Macaulay sont à l'échelle p^m). Chaque swap LLL « remonte »
+//   la norme GS minimale vers λ₁. On vérifie donc le critère APRÈS chaque swap :
+//   dès que min ||b*_k||² franchit bound_sq → kill anticipé (avant la fin du LLL).
+//   Les tuiles sans racine (λ₁ grand) sont tuées tôt ; celles avec racine
+//   (λ₁² < bound_sq) ne franchissent jamais le seuil → vont au bout → survie.
+//
+// Retour :
+//   None      → KILL certifié (λ₁² ≥ bound_sq prouvé)
+//   Some(b)   → base LLL-réduite (survivante ; l'appelant extrait les vecteurs courts)
+pub fn lll_reduce_bigint_killcheck(
+    mut b: Vec<Vec<BigInt>>,
+    bound_sq: &BigInt,
+) -> Option<Vec<Vec<BigInt>>> {
+    let n   = b.len();
+    let dim = b[0].len();
+    if n == 0 { return Some(b); }
+    if n == 1 {
+        let ns = norm_sq_bigint(&b[0]);
+        return if ns >= *bound_sq { None } else { Some(b) };
+    }
+
+    let bound_rat = BigRational::from(bound_sq.clone());
+
+    // ── Initialisation GS exacte ─────────────────────────────────────────────
+    let mut bstar:   Vec<Vec<BigRational>> = Vec::with_capacity(n);
+    let mut mu:      Vec<Vec<BigRational>> = vec![vec![BigRational::zero(); n]; n];
+    let mut norm_sq: Vec<BigRational>      = vec![BigRational::zero(); n];
+
+    for i in 0..n {
+        let mut bs = to_rat(&b[i]);
+        for j in 0..i {
+            if norm_sq[j].is_zero() { continue; }
+            let m = dot_rat(&to_rat(&b[i]), &bstar[j]) / &norm_sq[j];
+            mu[i][j] = m.clone();
+            for l in 0..dim { bs[l] -= &m * &bstar[j][l]; }
+        }
+        norm_sq[i] = dot_rat(&bs, &bs);
+        bstar.push(bs);
+    }
+
+    // min_k ||b*_k||² courant (ignore les 0, qui signalent une dépendance).
+    let min_gs_sq = |ns: &[BigRational]| -> Option<BigRational> {
+        ns.iter().filter(|x| !x.is_zero()).min().cloned()
+    };
+
+    let delta = BigRational::new(BigInt::from(3u32), BigInt::from(4u32));
+    let mut k = 1usize;
+    let mut iters = 0usize;
+    let mut swaps = 0usize;
+
+    while k < n {
+        iters += 1;
+        if iters > 300_000 { break; }
+
+        // Réduction de taille (ne modifie pas norm_sq).
+        for j in (0..k).rev() {
+            let m = rat_round(&mu[k][j]);
+            if m.is_zero() { continue; }
+            let mq = BigRational::from(m.clone());
+            let bj = b[j].clone();
+            for l in 0..dim { b[k][l] -= &m * &bj[l]; }
+            mu[k][j] -= &mq;
+            for i in 0..j { let u = &mu[k][i] - &mq * &mu[j][i]; mu[k][i] = u; }
+        }
+
+        // Lovász
+        let rhs = (&delta - &mu[k][k-1] * &mu[k][k-1]) * &norm_sq[k-1];
+        if norm_sq[k] >= rhs {
+            k += 1;
+        } else {
+            swaps += 1;
+            b.swap(k, k - 1);
+
+            let lam  = mu[k][k-1].clone();
+            let b0   = norm_sq[k-1].clone();
+            let b1   = norm_sq[k].clone();
+            let nb0  = &b1 + &lam * &lam * &b0;
+            let nb1  = &b0 * &b1 / &nb0;
+
+            for i in k+1..n {
+                let a  = mu[i][k-1].clone();
+                let bv = mu[i][k].clone();
+                mu[i][k-1] = (&bv * &b1 + &lam * &a * &b0) / &nb0;
+                mu[i][k]   = &a - &lam * &bv;
+            }
+            for j in 0..k-1 {
+                let tmp = mu[k][j].clone();
+                mu[k][j]   = mu[k-1][j].clone();
+                mu[k-1][j] = tmp;
+            }
+            mu[k][k-1]   = &lam * &b0 / &nb0;
+            norm_sq[k-1] = nb0;
+            norm_sq[k]   = nb1;
+
+            let old_bk  = bstar[k].clone();
+            let old_bkm = bstar[k-1].clone();
+            for l in 0..dim {
+                bstar[k-1][l] = &old_bk[l] + &lam * &old_bkm[l];
+            }
+            let nb0_v = norm_sq[k-1].clone();
+            for l in 0..dim {
+                bstar[k][l] = (&b1 * &old_bkm[l] - &lam * &b0 * &old_bk[l]) / &nb0_v;
+            }
+
+            if k > 1 { k -= 1; }
+
+            // ── KILL CERTIFIÉ : min_k ||b*_k||² ≥ bound_sq ⟹ λ₁² ≥ bound_sq ──
+            // Vérifié après chaque swap : dès que la norme GS minimale franchit
+            // le seuil, aucun vecteur ne peut être court → kill anticipé.
+            if let Some(m) = min_gs_sq(&norm_sq) {
+                if m >= bound_rat {
+                    return None;
+                }
+            }
+        }
+    }
+
+    Some(b)
+}
+
+// ─── LLL multi-vecteurs : tous les vecteurs courts ───────────────────────────
+//
+// Au lieu de ne garder que le minimum, retourne TOUS les vecteurs de la base
+// réduite dont la norme² < bound_sq.
+// Avantage : plusieurs vecteurs courts → plusieurs candidats δ → moins de faux-négatifs.
+// Coût additionnel : négligeable (O(n) comparaisons après la réduction LLL).
+pub fn lll_all_short_vectors(mat: Vec<Vec<BigInt>>, bound_sq: &BigInt) -> Vec<Vec<BigInt>> {
+    let reduced = lll_reduce_bigint(mat);
+    reduced.into_iter()
+        .filter(|row| {
+            let ns = norm_sq_bigint(row);
+            !ns.is_zero() && &ns < bound_sq
+        })
+        .collect()
+}
+
+// ─── Extraction directe de δ depuis un vecteur LLL court ─────────────────────
+//
+// Un vecteur court v = (v₀, v₁, v₂, ...) représente un polynôme en δ/X :
+//   h(δ) = v₀ + v₁·(δ/X) + v₂·(δ/X)² + ...
+//   ≡ 0 (mod p) si δ = δ_vrai
+//
+// On cherche δ ∈ [0, X) solution de h(δ) = 0 mod p.
+// Pour les 3 premiers coefficients (degré ≤ 2) : formule quadratique mod p.
+//
+// Retourne les valeurs de δ trouvées (peut être vide si aucune racine dans [0, X)).
+pub fn extract_delta_from_lll_vector(
+    v: &[BigInt],
+    x_big: &BigInt,  // X = 2^block_bits
+    p: &BigInt,
+) -> Vec<BigInt> {
+    if v.len() < 2 { return vec![]; }
+
+    // Polynôme h(δ) = v₀·X² + v₁·X·δ + v₂·δ²  (en multipliant par X² pour éliminer fractions)
+    // → c₂·δ² + c₁·δ + c₀ = 0 mod p
+    let c0 = fp_mod_ext(&(&v[0] * x_big * x_big), p);
+    let c1 = fp_mod_ext(&(&v[1] * x_big), p);
+    let c2 = if v.len() >= 3 { fp_mod_ext(&v[2], p) } else { BigInt::zero() };
+
+    let mut roots = vec![];
+
+    if c2.is_zero() {
+        // Linéaire : c₁·δ + c₀ = 0 → δ = -c₀/c₁
+        if !c1.is_zero() {
+            let inv_c1 = fp_inv_ext(&c1, p);
+            let delta = fp_mod_ext(&(-&c0 * &inv_c1), p);
+            if &delta < x_big {
+                roots.push(delta);
+            }
+        }
+    } else {
+        // Quadratique : discriminant Δ = c₁² - 4·c₀·c₂
+        let disc = fp_mod_ext(&(&c1 * &c1 - 4 * &c0 * &c2), p);
+        // sqrt mod p : p ≡ 3 (mod 4) → sqrt = disc^((p+1)/4)
+        let pm1o4 = (p + 1u32) >> 2;
+        let sqrtd = disc.modpow(&pm1o4, p);
+        let check = fp_mod_ext(&(&sqrtd * &sqrtd), p);
+        if check == disc {
+            let inv_2c2 = fp_inv_ext(&fp_mod_ext(&(2 * &c2), p), p);
+            let r1 = fp_mod_ext(&((-&c1 + &sqrtd) * &inv_2c2), p);
+            let r2 = fp_mod_ext(&((-&c1 - &sqrtd) * &inv_2c2), p);
+            for r in [r1, r2] {
+                if &r < x_big { roots.push(r); }
+            }
+        }
+        // Cas discriminant = 0 : racine double
+        if disc.is_zero() {
+            let inv_2c2 = fp_inv_ext(&fp_mod_ext(&(2 * &c2), p), p);
+            let r = fp_mod_ext(&(-&c1 * &inv_2c2), p);
+            if &r < x_big { roots.push(r); }
+        }
+    }
+
+    roots
+}
+
+fn fp_mod_ext(a: &BigInt, p: &BigInt) -> BigInt {
+    ((a % p) + p) % p
+}
+
+fn fp_inv_ext(a: &BigInt, p: &BigInt) -> BigInt {
+    if a.is_zero() { return BigInt::zero(); }
+    a.modpow(&(p - 2u32), p)
+}
+
+// ─── LLL réduit + extraction de tous les δ candidats ─────────────────────────
+//
+// Combine lll_all_short_vectors + extract_delta_from_lll_vector.
+// Pour une matrice Macaulay bivariate, retourne tous les δ plausibles.
+// Chaque δ correspond à un décalage x-coordonnée depuis l'ancre A.
+pub fn lll_extract_all_deltas(
+    mat: Vec<Vec<BigInt>>,
+    bound_sq: &BigInt,
+    x_big: &BigInt,
+    p: &BigInt,
+) -> Vec<BigInt> {
+    let short_vecs = lll_all_short_vectors(mat, bound_sq);
+    let mut deltas = vec![];
+    for v in &short_vecs {
+        let mut new_deltas = extract_delta_from_lll_vector(v, x_big, p);
+        deltas.append(&mut new_deltas);
+    }
+    // Dédupliquer
+    deltas.sort();
+    deltas.dedup();
+    deltas
+}
+
 // ─── Filtre de Coppersmith principal ─────────────────────────────────────────
 
 pub struct LatticePruner {
@@ -414,6 +658,11 @@ impl LatticePruner {
         if coeffs[0].is_zero() { return true; }
 
         let mat = build_macaulay_matrix(&coeffs, &x_big, &self.p, self.dim);
+
+        // PNC Kill Switch : GS partiel f64 + LLL f64 early-abort (~2µs)
+        // Élimine ~85% des matrices avant le LLL BigRational coûteux (~170ms)
+        if is_dead_fast(&mat) { return false; }
+
         let reduced = lll_reduce_bigint(mat);
 
         // Vecteur le plus court après LLL
@@ -464,6 +713,10 @@ impl LatticePruner {
         if coeffs[0].is_zero() { return true; }
 
         let mat = build_macaulay_bivariate_m2(&coeffs, &x_big, &self.p);
+
+        // PNC Kill Switch (dim=15, ~2µs vs ~170ms LLL complet)
+        if is_dead_fast(&mat) { return false; }
+
         let reduced = lll_reduce_bigint(mat);
 
         let shortest_norm_sq = reduced.iter()
@@ -730,4 +983,178 @@ pub fn build_macaulay_bivariate_m2(coeffs: &[BigInt; 6], x_big: &BigInt, p: &Big
     mat[14][14] = &p2 * &x2y;
 
     mat
+}
+
+// ─── Helpers for m=3 bivariate (monomial indexing) ───────────────────────────
+
+fn mono_to_col(a: usize, b: usize) -> usize {
+    let d = a + b;
+    d * (d + 1) / 2 + b
+}
+
+fn col_to_mono(col: usize) -> (usize, usize) {
+    let mut d = 0usize;
+    while (d + 1) * (d + 2) / 2 <= col {
+        d += 1;
+    }
+    let b = col - d * (d + 1) / 2;
+    (d - b, b)
+}
+
+/// Multiply two polynomials (coefficient vectors indexed by col), keeping total degree ≤ max_deg.
+fn poly_mul_trunc(a: &[BigInt], b: &[BigInt], max_deg: usize) -> Vec<BigInt> {
+    let ncols = (max_deg + 1) * (max_deg + 2) / 2;
+    let mut result = vec![BigInt::zero(); ncols];
+    for ai in 0..a.len() {
+        if a[ai].is_zero() { continue; }
+        let (ax, ay) = col_to_mono(ai);
+        for bi in 0..b.len() {
+            if b[bi].is_zero() { continue; }
+            let (bx, by) = col_to_mono(bi);
+            let cx = ax + bx;
+            let cy = ay + by;
+            if cx + cy <= max_deg {
+                let ci = mono_to_col(cx, cy);
+                result[ci] += &a[ai] * &b[bi];
+            }
+        }
+    }
+    result
+}
+
+// ─── Matrice Jochemsz-May m=3 bivariée (28×28) ───────────────────────────────
+//
+// Monomômes (cols) ordonnés par degré total croissant, 28 = C(8,2) :
+//   deg 0: (0,0)
+//   deg 1: (1,0) (0,1)
+//   deg 2: (2,0) (1,1) (0,2)
+//   deg 3: (3,0) (2,1) (1,2) (0,3)
+//   deg 4: (4,0) (3,1) (2,2) (1,3) (0,4)
+//   deg 5: (5,0) (4,1) (3,2) (2,3) (1,4) (0,5)
+//   deg 6: (6,0) (5,1) (4,2) (3,3) (2,4) (1,5) (0,6)
+//
+// Colonne (a,b) scalée par X^(a+b) (X=Y=2^block_bits).
+//
+// 28 lignes :
+//   Ligne 0       : f³ scalé
+//   Lignes 1-6    : p · x^sa·y^sb · f²,  (sa,sb) avec sa+sb ≤ 2  (6 lignes)
+//   Lignes 7-21   : p² · x^sa·y^sb · f,  (sa,sb) avec sa+sb ≤ 4  (15 lignes)
+//   Lignes 22-27  : p³ · diagonale (pour les 6 colonnes restantes)
+//
+// Borne HG m=3 : survie ⟺ norm_min² < p⁶/28
+pub fn build_macaulay_bivariate_m3(coeffs: &[BigInt; 6], x_big: &BigInt, p: &BigInt) -> Vec<Vec<BigInt>> {
+    let dim = 28usize;
+    let max_deg = 6usize;
+    let mut mat = vec![vec![BigInt::zero(); dim]; dim];
+
+    // f as coefficient vector (28 entries, only first 6 non-zero)
+    let mut f_poly = vec![BigInt::zero(); dim];
+    for i in 0..6 {
+        f_poly[i] = coeffs[i].clone();
+    }
+
+    // f², f³
+    let f2_poly = poly_mul_trunc(&f_poly, &f_poly, max_deg);
+    let f3_poly = poly_mul_trunc(&f2_poly, &f_poly, max_deg);
+
+    // Scaling: entry at column (a,b) gets multiplied by x_big^(a+b)
+    let mut x_pows = vec![BigInt::one(); max_deg + 1];
+    for i in 1..=max_deg {
+        x_pows[i] = &x_pows[i - 1] * x_big;
+    }
+
+    // Helper: build a row for p^k * x^shift_a*y^shift_b * poly_coeffs, scaled
+    let build_row = |poly: &[BigInt], shift_a: usize, shift_b: usize, pk: &BigInt| -> Vec<BigInt> {
+        let mut row = vec![BigInt::zero(); dim];
+        for col in 0..dim {
+            let (a, b) = col_to_mono(col);
+            if a < shift_a || b < shift_b { continue; }
+            let src_col = mono_to_col(a - shift_a, b - shift_b);
+            if src_col >= poly.len() { continue; }
+            if poly[src_col].is_zero() { continue; }
+            row[col] = pk * &poly[src_col] * &x_pows[a + b];
+        }
+        row
+    };
+
+    let p2 = p * p;
+    let p3 = &p2 * p;
+
+    // Row 0: f³ scaled
+    mat[0] = build_row(&f3_poly, 0, 0, &BigInt::one());
+
+    // Rows 1-6: p * x^sa*y^sb * f², (sa,sb) with sa+sb ≤ 2
+    let mut row_idx = 1usize;
+    for d in 0..=2usize {
+        for sb in 0..=d {
+            let sa = d - sb;
+            mat[row_idx] = build_row(&f2_poly, sa, sb, p);
+            row_idx += 1;
+        }
+    }
+    // row_idx = 7 now
+
+    // Rows 7-21: p² * x^sa*y^sb * f, (sa,sb) with sa+sb ≤ 4
+    for d in 0..=4usize {
+        for sb in 0..=d {
+            let sa = d - sb;
+            mat[row_idx] = build_row(&f_poly, sa, sb, &p2);
+            row_idx += 1;
+        }
+    }
+    // row_idx = 22 now
+
+    // Fill any zero diagonal entry with the row's NATURAL block p-power
+    // (NOT a blanket p³, which over-inflates the p·f² and p²·f rows and pushes
+    //  the root vector above the HG bound). Mirrors the disciplined m=2 build:
+    //   row 0      (f³)      → p⁰
+    //   rows 1-6   (p·f²)    → p¹
+    //   rows 7-21  (p²·f)    → p²
+    //   rows 22-27 (diag)    → p³
+    let row_pk = |i: usize| -> BigInt {
+        if i == 0 { BigInt::one() }
+        else if i <= 6 { p.clone() }
+        else if i <= 21 { p2.clone() }
+        else { p3.clone() }
+    };
+    for i in 0..dim {
+        if mat[i][i].is_zero() {
+            let (a, b) = col_to_mono(i);
+            mat[i][i] = &row_pk(i) * &x_pows[a + b];
+        }
+    }
+    // The last 6 rows (22-27) introduce their monomials at p³ (k=0 block).
+    for i in 22..dim {
+        let (a, b) = col_to_mono(i);
+        mat[i][i] = &p3 * &x_pows[a + b];
+    }
+
+    mat
+}
+
+impl LatticePruner {
+    /// Bivarié m=3 (Jochemsz-May) : teste si la paire (δ∈[0,X), ε∈[0,X)) peut contenir
+    /// une solution de S₃(A+δ, B+ε, x_P) ≡ 0 (mod p).
+    /// Essaie les 9 combinaisons GLV (β^i·A, β^j·B) — De-GLV fix.
+    /// Matrice 28×28, borne p⁶/28. false = REJET prouvé.
+    pub fn is_block_pair_viable_m3(&self, start_a: &BigInt, start_b: &BigInt, block_bits: u32) -> bool {
+        let x_big = BigInt::one() << block_bits as usize;
+        let (_i, _j, coeffs) = find_glv_coeffs(start_a, start_b, &self.target_x, &self.p);
+        if coeffs[0].is_zero() { return true; }
+        let mat = build_macaulay_bivariate_m3(&coeffs, &x_big, &self.p);
+
+        // PNC Kill Switch (dim=28, ~5µs vs ~2s LLL complet)
+        if is_dead_fast(&mat) { return false; }
+
+        let reduced = lll_reduce_bigint(mat);
+        let shortest_norm_sq = reduced.iter()
+            .map(|row| norm_sq_bigint(row))
+            .filter(|n| !n.is_zero())
+            .min()
+            .unwrap_or_else(BigInt::zero);
+        // HG m=3, dim=28 : survie si norm < p³/√28
+        let p3 = &self.p * &self.p * &self.p;
+        let bound_sq = (&p3 * &p3) / 28i64;
+        shortest_norm_sq < bound_sq
+    }
 }

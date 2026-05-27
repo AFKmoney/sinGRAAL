@@ -257,6 +257,100 @@ fn pt_dbl(a: Pt) -> Pt {
     Pt { x: x3, y: y3, inf: false }
 }
 
+// ─── Jacobian coordinates ─────────────────────────────────────────────────────
+//
+// Jacobian point (X:Y:Z) represents affine (X/Z², Y/Z³).
+// Avoids per-step field inversion in batch baby-table construction.
+
+#[derive(Clone, Copy)]
+pub struct PtJ { pub x: Fe, pub y: Fe, pub z: Fe, pub inf: bool }
+
+pub const INFJ: PtJ = PtJ { x: [0;4], y: [1,0,0,0], z: [0;4], inf: true };
+
+/// Mixed Jacobian+Affine addition: (X1:Y1:Z1) + (x2:y2:1) → Jacobian
+/// Cost: 7M + 4S (no inversion)
+pub fn ptj_add_affine(p: PtJ, q: Pt) -> PtJ {
+    if p.inf { return ptj_from_affine(q); }
+    if q.inf { return p; }
+    let z1sq = fp_sqr(p.z);          // Z1²
+    let z1cu = fp_mul(z1sq, p.z);    // Z1³
+    let u2   = fp_mul(q.x, z1sq);    // X2·Z1²
+    let s2   = fp_mul(q.y, z1cu);    // Y2·Z1³
+    let h    = fp_sub(u2, p.x);      // H = X2·Z1² - X1
+    let r    = fp_sub(s2, p.y);      // R = Y2·Z1³ - Y1
+    if h == [0;4] {
+        if r == [0;4] { return ptj_double(p); }
+        return INFJ;
+    }
+    let h2   = fp_sqr(h);            // H²
+    let h3   = fp_mul(h2, h);        // H³
+    let x1h2 = fp_mul(p.x, h2);     // X1·H²
+    let x3   = fp_sub(fp_sub(fp_sqr(r), h3), fp_add(x1h2, x1h2));
+    let y3   = fp_sub(fp_mul(r, fp_sub(x1h2, x3)), fp_mul(p.y, h3));
+    let z3   = fp_mul(p.z, h);
+    PtJ { x: x3, y: y3, z: z3, inf: false }
+}
+
+/// Jacobian doubling: cost 4M + 6S (secp256k1 a=0)
+pub fn ptj_double(p: PtJ) -> PtJ {
+    if p.inf || p.y == [0;4] { return INFJ; }
+    let y2  = fp_sqr(p.y);           // Y²
+    let s   = fp_mul([4,0,0,0], fp_mul(p.x, y2));  // 4XY²
+    let m   = fp_mul([3,0,0,0], fp_sqr(fp_sqr(p.x)));  // 3X² (a=0 → use 3X²)
+    // Actually m = 3*X1^2 (since a=0 for secp256k1)
+    let m2  = fp_mul([3,0,0,0], fp_sqr(p.x));      // 3X²
+    let x3  = fp_sub(fp_sqr(m2), fp_add(s, s));    // M²-2S
+    let y3  = fp_sub(fp_mul(m2, fp_sub(s, x3)), fp_mul([8,0,0,0], fp_sqr(y2)));
+    let z3  = fp_mul(fp_add(p.y, p.y), p.z);       // 2Y·Z
+    let _ = s; let _ = m;  // suppress warnings from incorrect first attempt
+    PtJ { x: x3, y: y3, z: z3, inf: false }
+}
+
+pub fn ptj_from_affine(p: Pt) -> PtJ {
+    if p.inf { INFJ } else { PtJ { x: p.x, y: p.y, z: [1,0,0,0], inf: false } }
+}
+
+pub fn ptj_to_affine(p: PtJ) -> Pt {
+    if p.inf { return INF; }
+    let iz   = fp_inv(p.z);
+    let iz2  = fp_sqr(iz);
+    let iz3  = fp_mul(iz2, iz);
+    Pt { x: fp_mul(p.x, iz2), y: fp_mul(p.y, iz3), inf: false }
+}
+
+/// Batch convert Jacobian points to affine using 1 field inversion total.
+/// Input: slice of (X, Y, Z). Output: fills (x, y) for each.
+/// Points with Z=0 (INF) are left as INF in affine output.
+pub fn ptj_batch_to_affine(pts: &[PtJ]) -> Vec<Pt> {
+    let n = pts.len();
+    if n == 0 { return vec![]; }
+    // Compute partial products of Z values
+    let mut prods: Vec<Fe> = vec![[0;4]; n];
+    prods[0] = if pts[0].inf { [1,0,0,0] } else { pts[0].z };
+    for i in 1..n {
+        prods[i] = if pts[i].inf { prods[i-1] } else { fp_mul(prods[i-1], pts[i].z) };
+    }
+    // Single inversion of the product
+    let mut acc = fp_inv(prods[n-1]);
+    let mut result = vec![INF; n];
+    // Back-substitution
+    for i in (1..n).rev() {
+        if !pts[i].inf {
+            let iz = fp_mul(acc, prods[i-1]);
+            let iz2 = fp_sqr(iz);
+            let iz3 = fp_mul(iz2, iz);
+            result[i] = Pt { x: fp_mul(pts[i].x, iz2), y: fp_mul(pts[i].y, iz3), inf: false };
+            acc = fp_mul(acc, pts[i].z);
+        }
+    }
+    if !pts[0].inf {
+        let iz2 = fp_sqr(acc);
+        let iz3 = fp_mul(iz2, acc);
+        result[0] = Pt { x: fp_mul(pts[0].x, iz2), y: fp_mul(pts[0].y, iz3), inf: false };
+    }
+    result
+}
+
 pub fn scalar_mul(mut p: Pt, mut k: Fe) -> Pt {
     let mut r = INF;
     loop {

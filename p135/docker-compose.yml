@@ -1,0 +1,47 @@
+version: "3.9"
+
+services:
+  solver:
+    build:
+      context: ..
+      dockerfile: p135/Dockerfile
+    image: singraal-p135:latest
+    environment:
+      # Obligatoires — coordonnées du puzzle #135
+      TARGET_X: ${TARGET_X:-PUZZLE135_X}
+      TARGET_Y: ${TARGET_Y:-PUZZLE135_Y}
+
+      # Espace de recherche
+      RANGE_BITS: ${RANGE_BITS:-135}
+
+      # Taille des tiles (2^BLOCK_BITS). RAM : 16 GB @ 20, 64 GB @ 22, 256 GB @ 24
+      BLOCK_BITS: ${BLOCK_BITS:-20}
+
+      # Dimension de la demi-grille GLV (0 = auto = ceil(range/2)+2, max 64)
+      HALF_BITS: ${HALF_BITS:-0}
+
+      # Niveau Jochemsz-May : 3 = matrice 28×28 (optimal), 2 = 15×15
+      M_LEVEL: ${M_LEVEL:-3}
+
+      # Threads CPU (0 = tous les cœurs)
+      THREADS: ${THREADS:-0}
+
+      # Mode solver : solve (full stack) | optimized | parallel | dispatch
+      SOLVER_MODE: ${SOLVER_MODE:-solve}
+
+    volumes:
+      - solver_data:/data
+    restart: unless-stopped
+
+    # GPU NVIDIA — décommenter pour activer
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  solver_data:
+    driver: local
