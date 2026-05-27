@@ -1104,14 +1104,26 @@ pub fn build_macaulay_bivariate_m3(coeffs: &[BigInt; 6], x_big: &BigInt, p: &Big
     }
     // row_idx = 22 now
 
-    // Fill any zero diagonal entries with p³ * X^(a+b)
+    // Fill any zero diagonal entry with the row's NATURAL block p-power
+    // (NOT a blanket p³, which over-inflates the p·f² and p²·f rows and pushes
+    //  the root vector above the HG bound). Mirrors the disciplined m=2 build:
+    //   row 0      (f³)      → p⁰
+    //   rows 1-6   (p·f²)    → p¹
+    //   rows 7-21  (p²·f)    → p²
+    //   rows 22-27 (diag)    → p³
+    let row_pk = |i: usize| -> BigInt {
+        if i == 0 { BigInt::one() }
+        else if i <= 6 { p.clone() }
+        else if i <= 21 { p2.clone() }
+        else { p3.clone() }
+    };
     for i in 0..dim {
         if mat[i][i].is_zero() {
             let (a, b) = col_to_mono(i);
-            mat[i][i] = &p3 * &x_pows[a + b];
+            mat[i][i] = &row_pk(i) * &x_pows[a + b];
         }
     }
-    // Ensure the last 6 rows (22-27) are p³ diagonal
+    // The last 6 rows (22-27) introduce their monomials at p³ (k=0 block).
     for i in 22..dim {
         let (a, b) = col_to_mono(i);
         mat[i][i] = &p3 * &x_pows[a + b];
