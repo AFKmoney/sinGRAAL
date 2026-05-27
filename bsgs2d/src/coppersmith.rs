@@ -384,6 +384,114 @@ pub fn norm_sq_bigint(v: &[BigInt]) -> BigInt {
     v.iter().map(|x| x * x).sum()
 }
 
+// ─── LLL multi-vecteurs : tous les vecteurs courts ───────────────────────────
+//
+// Au lieu de ne garder que le minimum, retourne TOUS les vecteurs de la base
+// réduite dont la norme² < bound_sq.
+// Avantage : plusieurs vecteurs courts → plusieurs candidats δ → moins de faux-négatifs.
+// Coût additionnel : négligeable (O(n) comparaisons après la réduction LLL).
+pub fn lll_all_short_vectors(mat: Vec<Vec<BigInt>>, bound_sq: &BigInt) -> Vec<Vec<BigInt>> {
+    let reduced = lll_reduce_bigint(mat);
+    reduced.into_iter()
+        .filter(|row| {
+            let ns = norm_sq_bigint(row);
+            !ns.is_zero() && &ns < bound_sq
+        })
+        .collect()
+}
+
+// ─── Extraction directe de δ depuis un vecteur LLL court ─────────────────────
+//
+// Un vecteur court v = (v₀, v₁, v₂, ...) représente un polynôme en δ/X :
+//   h(δ) = v₀ + v₁·(δ/X) + v₂·(δ/X)² + ...
+//   ≡ 0 (mod p) si δ = δ_vrai
+//
+// On cherche δ ∈ [0, X) solution de h(δ) = 0 mod p.
+// Pour les 3 premiers coefficients (degré ≤ 2) : formule quadratique mod p.
+//
+// Retourne les valeurs de δ trouvées (peut être vide si aucune racine dans [0, X)).
+pub fn extract_delta_from_lll_vector(
+    v: &[BigInt],
+    x_big: &BigInt,  // X = 2^block_bits
+    p: &BigInt,
+) -> Vec<BigInt> {
+    if v.len() < 2 { return vec![]; }
+
+    // Polynôme h(δ) = v₀·X² + v₁·X·δ + v₂·δ²  (en multipliant par X² pour éliminer fractions)
+    // → c₂·δ² + c₁·δ + c₀ = 0 mod p
+    let c0 = fp_mod_ext(&(&v[0] * x_big * x_big), p);
+    let c1 = fp_mod_ext(&(&v[1] * x_big), p);
+    let c2 = if v.len() >= 3 { fp_mod_ext(&v[2], p) } else { BigInt::zero() };
+
+    let mut roots = vec![];
+
+    if c2.is_zero() {
+        // Linéaire : c₁·δ + c₀ = 0 → δ = -c₀/c₁
+        if !c1.is_zero() {
+            let inv_c1 = fp_inv_ext(&c1, p);
+            let delta = fp_mod_ext(&(-&c0 * &inv_c1), p);
+            if &delta < x_big {
+                roots.push(delta);
+            }
+        }
+    } else {
+        // Quadratique : discriminant Δ = c₁² - 4·c₀·c₂
+        let disc = fp_mod_ext(&(&c1 * &c1 - 4 * &c0 * &c2), p);
+        // sqrt mod p : p ≡ 3 (mod 4) → sqrt = disc^((p+1)/4)
+        let pm1o4 = (p + 1u32) >> 2;
+        let sqrtd = disc.modpow(&pm1o4, p);
+        let check = fp_mod_ext(&(&sqrtd * &sqrtd), p);
+        if check == disc {
+            let inv_2c2 = fp_inv_ext(&fp_mod_ext(&(2 * &c2), p), p);
+            let r1 = fp_mod_ext(&((-&c1 + &sqrtd) * &inv_2c2), p);
+            let r2 = fp_mod_ext(&((-&c1 - &sqrtd) * &inv_2c2), p);
+            for r in [r1, r2] {
+                if &r < x_big { roots.push(r); }
+            }
+        }
+        // Cas discriminant = 0 : racine double
+        if disc.is_zero() {
+            let inv_2c2 = fp_inv_ext(&fp_mod_ext(&(2 * &c2), p), p);
+            let r = fp_mod_ext(&(-&c1 * &inv_2c2), p);
+            if &r < x_big { roots.push(r); }
+        }
+    }
+
+    roots
+}
+
+fn fp_mod_ext(a: &BigInt, p: &BigInt) -> BigInt {
+    ((a % p) + p) % p
+}
+
+fn fp_inv_ext(a: &BigInt, p: &BigInt) -> BigInt {
+    if a.is_zero() { return BigInt::zero(); }
+    a.modpow(&(p - 2u32), p)
+}
+
+// ─── LLL réduit + extraction de tous les δ candidats ─────────────────────────
+//
+// Combine lll_all_short_vectors + extract_delta_from_lll_vector.
+// Pour une matrice Macaulay bivariate, retourne tous les δ plausibles.
+// Chaque δ correspond à un décalage x-coordonnée depuis l'ancre A.
+pub fn lll_extract_all_deltas(
+    mat: Vec<Vec<BigInt>>,
+    bound_sq: &BigInt,
+    x_big: &BigInt,
+    p: &BigInt,
+) -> Vec<BigInt> {
+    let short_vecs = lll_all_short_vectors(mat, bound_sq);
+    let mut deltas = vec![];
+    for v in &short_vecs {
+        let mut new_deltas = extract_delta_from_lll_vector(v, x_big, p);
+        deltas.append(&mut new_deltas);
+    }
+    // Dédupliquer
+    deltas.sort();
+    deltas.dedup();
+    deltas
+}
+
 // ─── Filtre de Coppersmith principal ─────────────────────────────────────────
 
 pub struct LatticePruner {

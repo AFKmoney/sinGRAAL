@@ -49,11 +49,13 @@ mod lll;
 mod coppersmith;
 mod lll_earlyabort;
 mod dispatcher;
+mod glv4d;
 
 use clap::Parser;
 use secp::*;
 use std::collections::HashMap;
 use std::time::Instant;
+use rayon;
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -117,10 +119,6 @@ struct Args {
     #[arg(long)]
     estimate_only: bool,
 
-    /// Benchmark du filtre PNC direct (S₃ quadratique exact, CPU fallback).
-    #[arg(long)]
-    pnc_bench: bool,
-
     /// Auto-test : générer k aléatoire, chercher, vérifier.
     #[arg(long)]
     selftest: bool,
@@ -152,6 +150,14 @@ struct Args {
     /// Test Golden Block Dispatcher : vérifie que la tuile solution survit au filtre.
     #[arg(long)]
     golden_dispatch: bool,
+
+    /// Dispatcher parallèle Rayon (innovations #24 GLV 6-aut + #28 batch + #30 multi-k LLL).
+    #[arg(long)]
+    parallel: bool,
+
+    /// Nombre de threads Rayon (défaut : tous les cœurs disponibles).
+    #[arg(long, default_value = "0")]
+    threads: usize,
 }
 
 // ─── Utilitaires scalaires ───────────────────────────────────────────────────
@@ -977,25 +983,12 @@ fn main() {
         return;
     }
 
-    // ── Benchmark filtre PNC direct (S₃ quadratique exact) ──────────────────
+    // ── Benchmark filtre PNC (Kill Switch Cohen 2.6.7 exact) ───────────────
     if args.pnc_bench {
-        use coppersmith::fe_to_bigint;
         let block_bits = args.block_bits.unwrap_or(5);
-        let tx         = fe_to_bigint(GX); // use generator x as surrogate target
-        let p          = fe_to_bigint(secp::FIELD_P);
-        let filter     = cuda_filter::DirectFilter::new(tx, block_bits, p);
-        let n_pairs    = 10_000usize;
-        eprintln!("[pnc-bench] S₃ direct filter  block_bits={block_bits}  n_pairs={n_pairs}");
-        let t0 = std::time::Instant::now();
-        let rej = filter.benchmark_rejection_rate(n_pairs);
-        let elapsed = t0.elapsed().as_secs_f64();
-        eprintln!("[pnc-bench] Taux de rejet : {:.2}%  ({:.3}s  →  {:.0} paires/s)",
-            rej * 100.0, elapsed, n_pairs as f64 / elapsed);
-        eprintln!("[pnc-bench] Interprétation :");
-        eprintln!("  ~100%  → PNC tue quasi tout en O(field_mul)");
-        eprintln!("  <100%  → faux positifs (paires sans solution dans [A, A+X)×[B, B+X))");
-        eprintln!("  Note   : CPU scan couvre seulement x1=A (1 point) par paire");
-        eprintln!("           GPU scan couvre TOUS les x1 ∈ [A, A+2^block_bits)");
+        eprintln!("[pnc-bench] Kill Switch PNC  block_bits={block_bits}");
+        let stats = lll_earlyabort::benchmark_killswitch(15, 1000);
+        stats.print();
     }
 
     // ── Benchmark filtre Coppersmith univarié ────────────────────────────────
@@ -1109,7 +1102,15 @@ fn main() {
         return;
     }
 
-    let result = if args.dispatch {
+    // Configurer Rayon avant tout dispatch parallèle
+    if args.threads > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(args.threads)
+            .build_global()
+            .unwrap_or(());
+    }
+
+    let result = if args.parallel || args.dispatch {
         let block_bits = args.block_bits.unwrap_or_else(|| {
             let bb = ((args.range_bits + 3) / 4).max(3).min(22);
             eprintln!("[auto] dispatcher block_bits = {bb}");
@@ -1124,7 +1125,12 @@ fn main() {
         cfg.half_bits = half_bits;
         cfg.m_level   = args.m_level;
         cfg.verbose   = true;
-        dispatcher::run_dispatcher(&cfg)
+        if args.parallel {
+            eprintln!("[main] Mode dispatcher PARALLÈLE Rayon (innovations #24+#28+#30)");
+            dispatcher::run_dispatcher_parallel(&cfg)
+        } else {
+            dispatcher::run_dispatcher(&cfg)
+        }
     } else if args.semaev {
         let block_bits = args.block_bits.unwrap_or_else(|| {
             let bb = ((args.range_bits + 3) / 4).max(3).min(20);
