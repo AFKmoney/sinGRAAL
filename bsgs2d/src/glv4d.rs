@@ -24,6 +24,8 @@ use crate::secp::{
     LAMBDA, LAMBDA2, FIELD_N,
     G, INF,
     fe_lt,
+    PtJ, INFJ, ptj_from_affine, ptj_add_affine, ptj_batch_to_affine,
+    fp_mul, fp_sqr,
 };
 
 // ─── Inverses des 6 automorphismes ───────────────────────────────────────────
@@ -197,61 +199,74 @@ pub fn brute_scalar_block_6aut(
     range_bits: u32,
 ) -> Option<Fe> {
     if block_bits > 25 { return None; }
-    let x = 1u64 << block_bits;
-
-    let a_pt = fe_from_u64_scalar(a_scalar);
-    let a_pt = if a_scalar == 0 { INF } else { scalar_mul(G, a_pt) };
+    let x = (1u64 << block_bits) as usize;
     let phi_g = phi_point(G);
-    // b_pt_start représente k_r = b_scalar (b_scalar=0 → INF = 0·φG, PAS φG).
-    // Bug corrigé : l'ancien code démarrait à φG (k_r=1), décalant tout d'un cran
-    // et empêchant de tester k_r=0 → aucune clé avec k₂=0 (toutes les clés < 2^189,
-    // dont puzzle #135) n'était jamais trouvée.
-    let b_pt_start = if b_scalar == 0 { INF } else {
-        scalar_mul(phi_g, fe_from_u64_scalar(b_scalar))
-    };
+
+    // ── Pré-calcul des lignes (a_scalar+δ)·G en affine via batch-inversion ────
+    // row_pt[δ] = (a_scalar+δ)·G.  Construction incrémentale en Jacobien
+    // (ptj_add_affine : 7M+4S, zéro inversion), puis 1 seule inversion par lot.
+    let a_pt = if a_scalar == 0 { INF } else { scalar_mul(G, fe_from_u64_scalar(a_scalar)) };
+    let mut rows_j: Vec<PtJ> = Vec::with_capacity(x);
+    let mut cur = ptj_from_affine(a_pt);
+    for _ in 0..x {
+        rows_j.push(cur);
+        cur = ptj_add_affine(cur, G);
+    }
+    let rows: Vec<Pt> = ptj_batch_to_affine(&rows_j);
+
+    // ── Pré-calcul des colonnes (b_scalar+ε)·φG en affine via batch-inversion ─
+    // col[ε] = (b_scalar+ε)·φG.  b_scalar=0 → col[0] = INF (k_r=0).
+    let b_pt0 = if b_scalar == 0 { INF } else { scalar_mul(phi_g, fe_from_u64_scalar(b_scalar)) };
+    let mut cols_j: Vec<PtJ> = Vec::with_capacity(x);
+    let mut curb = ptj_from_affine(b_pt0);
+    for _ in 0..x {
+        cols_j.push(curb);
+        curb = ptj_add_affine(curb, phi_g);
+    }
+    let cols: Vec<Pt> = ptj_batch_to_affine(&cols_j);
 
     // Pré-calcule les 6 cibles automorphiques
     let auts = build_6aut_targets(target);
 
-    let mut row_pt = a_pt;
-    for delta in 0u64..x {
-        let mut b_pt = b_pt_start;
-        for eps in 0u64..x {
-            {
-                // sum = row_pt + b_pt, en gérant les points à l'infini
-                // (k_l=0 → row_pt=INF, k_r=0 → b_pt=INF).
-                let sum = if row_pt.inf { b_pt }
-                          else if b_pt.inf { row_pt }
-                          else { pt_add(row_pt, b_pt) };
-                if !sum.inf {
-                    // Tester les 6 cibles
-                    for aut in &auts {
-                        if sum.x == aut.target_x && sum.y == aut.target_y {
-                            let k_l = fe_from_u64_scalar(a_scalar.wrapping_add(delta));
-                            let k_r = fe_from_u64_scalar(b_scalar.wrapping_add(eps));
-                            let k_sum = sc_add(k_l, sc_mul(LAMBDA, k_r));
-                            let k = sc_mul(aut.alpha_inv, k_sum);
-                            if in_range_bsgs(k, range_bits) {
-                                let check = scalar_mul(G, k);
-                                if check.x == target.x && check.y == target.y {
-                                    return Some(k);
-                                }
-                            }
-                            // Aussi négatif : k_sum pourrait être -k
-                            let k_neg = sc_mul(aut.alpha_inv, sc_neg(k_sum));
-                            if in_range_bsgs(k_neg, range_bits) {
-                                let check = scalar_mul(G, k_neg);
-                                if check.x == target.x && check.y == target.y {
-                                    return Some(k_neg);
-                                }
-                            }
+    // ── Boucle chaude : sommes en Jacobien, comparaison par produit croisé ────
+    // sum (X:Y:Z) == aut (x,y) affine  ⟺  X == x·Z²  ET  Y == y·Z³.
+    // Aucune inversion par somme (gain ~100× vs addition affine).
+    for delta in 0..x {
+        let rp = rows[delta];
+        for eps in 0..x {
+            let cp = cols[eps];
+            let sum_j: PtJ = if rp.inf { ptj_from_affine(cp) }
+                             else if cp.inf { ptj_from_affine(rp) }
+                             else { ptj_add_affine(ptj_from_affine(rp), cp) };
+            if sum_j.inf { continue; }
+
+            let z2 = fp_sqr(sum_j.z);
+            let z3 = fp_mul(z2, sum_j.z);
+
+            for aut in &auts {
+                if sum_j.x == fp_mul(aut.target_x, z2)
+                    && sum_j.y == fp_mul(aut.target_y, z3)
+                {
+                    let k_l = fe_from_u64_scalar(a_scalar.wrapping_add(delta as u64));
+                    let k_r = fe_from_u64_scalar(b_scalar.wrapping_add(eps as u64));
+                    let k_sum = sc_add(k_l, sc_mul(LAMBDA, k_r));
+                    let k = sc_mul(aut.alpha_inv, k_sum);
+                    if in_range_bsgs(k, range_bits) {
+                        let check = scalar_mul(G, k);
+                        if check.x == target.x && check.y == target.y {
+                            return Some(k);
+                        }
+                    }
+                    let k_neg = sc_mul(aut.alpha_inv, sc_neg(k_sum));
+                    if in_range_bsgs(k_neg, range_bits) {
+                        let check = scalar_mul(G, k_neg);
+                        if check.x == target.x && check.y == target.y {
+                            return Some(k_neg);
                         }
                     }
                 }
             }
-            b_pt = pt_add(b_pt, phi_g);
         }
-        row_pt = pt_add(row_pt, G);
     }
     None
 }
