@@ -202,7 +202,11 @@ pub fn brute_scalar_block_6aut(
     let a_pt = fe_from_u64_scalar(a_scalar);
     let a_pt = if a_scalar == 0 { INF } else { scalar_mul(G, a_pt) };
     let phi_g = phi_point(G);
-    let b_pt_start = if b_scalar == 0 { phi_g } else {
+    // b_pt_start représente k_r = b_scalar (b_scalar=0 → INF = 0·φG, PAS φG).
+    // Bug corrigé : l'ancien code démarrait à φG (k_r=1), décalant tout d'un cran
+    // et empêchant de tester k_r=0 → aucune clé avec k₂=0 (toutes les clés < 2^189,
+    // dont puzzle #135) n'était jamais trouvée.
+    let b_pt_start = if b_scalar == 0 { INF } else {
         scalar_mul(phi_g, fe_from_u64_scalar(b_scalar))
     };
 
@@ -213,8 +217,12 @@ pub fn brute_scalar_block_6aut(
     for delta in 0u64..x {
         let mut b_pt = b_pt_start;
         for eps in 0u64..x {
-            if !row_pt.inf && !b_pt.inf {
-                let sum = pt_add(row_pt, b_pt);
+            {
+                // sum = row_pt + b_pt, en gérant les points à l'infini
+                // (k_l=0 → row_pt=INF, k_r=0 → b_pt=INF).
+                let sum = if row_pt.inf { b_pt }
+                          else if b_pt.inf { row_pt }
+                          else { pt_add(row_pt, b_pt) };
                 if !sum.inf {
                     // Tester les 6 cibles
                     for aut in &auts {

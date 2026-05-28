@@ -1286,10 +1286,28 @@ pub fn run_full_stack(cfg: &DispatcherConfig) -> Option<Fe> {
     };
 
     let step      = 1u64 << cfg.block_bits.min(63);
-    let half_bits = cfg.half_bits;
-    let n_blocks  = if half_bits > cfg.block_bits {
-        1u64 << (half_bits - cfg.block_bits).min(30)
+
+    // ── Cas dégénéré GLV (range_bits ≤ 189) ──────────────────────────────────
+    // Pour k < 2^189, la décomposition GLV donne k₂ = 0 et k₁ = k (cf. CLAUDE.md).
+    // Le tile solution est donc sur la colonne b = 0, et l'axe-a doit couvrir
+    // TOUT range_bits (pas seulement range/2). Sinon le tile solution est hors
+    // grille et --solve ne trouve jamais la clé.
+    let glv_degenerate = cfg.range_bits <= 189;
+
+    let (a_axis_bits, b_axis_bits) = if glv_degenerate {
+        (cfg.range_bits, 0u32)        // axe-a = clé entière, axe-b = {0}
+    } else {
+        (cfg.half_bits, cfg.half_bits) // GLV équilibré : k₁,k₂ ≈ 2^half_bits
+    };
+
+    let half_bits = a_axis_bits;       // pour l'affichage
+    let n_blocks_a = if a_axis_bits > cfg.block_bits {
+        1u64 << (a_axis_bits - cfg.block_bits).min(30)
     } else { 1u64 };
+    let n_blocks_b = if b_axis_bits > cfg.block_bits {
+        1u64 << (b_axis_bits - cfg.block_bits).min(30)
+    } else { 1u64 };
+    let n_blocks = n_blocks_a.max(n_blocks_b);
 
     // #6 AnchorTable L2
     let t_build = std::time::Instant::now();
@@ -1324,18 +1342,18 @@ pub fn run_full_stack(cfg: &DispatcherConfig) -> Option<Fe> {
 
     let anchors = Arc::new(anchors);
 
-    // #7 Rayon — boucle externe parallèle sur ia
-    (0u64..n_blocks).into_par_iter().for_each(|ia| {
+    // #7 Rayon — boucle externe parallèle sur ia (axe-a)
+    (0u64..n_blocks_a).into_par_iter().for_each(|ia| {
         if found.load(Ordering::Relaxed) { return; }
 
         let anch     = Arc::clone(&anchors);
         let a_x      = anch.a_bigint(ia, &p);
         let a_scalar = ia.wrapping_mul(step);
 
-        // Blocs de 16 ib pour localité L1 (#6)
+        // Blocs de 16 ib pour localité L1 (#6) — axe-b
         let mut ib = 0u64;
-        while ib < n_blocks {
-            let end = (ib + 16).min(n_blocks);
+        while ib < n_blocks_b {
+            let end = (ib + 16).min(n_blocks_b);
             for jb in ib..end {
                 if found.load(Ordering::Relaxed) { return; }
                 tiles_done.fetch_add(1, Ordering::Relaxed);
@@ -1343,44 +1361,35 @@ pub fn run_full_stack(cfg: &DispatcherConfig) -> Option<Fe> {
                 let b_x      = anch.b_bigint(jb, &p);
                 let b_scalar = jb.wrapping_mul(step);
 
-                // #2 Coefficients S₃ bivarié + recherche GLV combo
-                let (_, _, coeffs) = find_glv_coeffs(&a_x, &b_x, &x_p, &p);
-                let is_hit = coeffs[0].is_zero();
+                // ── Filtrage de tile ──────────────────────────────────────────
+                // Pour les petites tiles (block_bits ≤ 14), le brute-force 6-aut
+                // est moins cher qu'un LLL ⇒ on saute le filtre et on brute-force
+                // directement (le brute-force est la vérité terrain : il trouve
+                // ET vérifie la clé).
+                //
+                // Pour les grandes tiles, on applique le PNC Kill-Switch RAPIDE
+                // (is_dead_fast : GS partiel entier, ~µs) qui tue les tiles
+                // prouvées vides sans payer le LLL BigInt complet par tile.
+                if cfg.block_bits > 14 {
+                    // #2 Coefficients S₃ bivarié + recherche GLV combo
+                    let (_, _, coeffs) = find_glv_coeffs(&a_x, &b_x, &x_p, &p);
+                    let is_hit = coeffs[0].is_zero();
 
-                // #4 LLL m=3 kill certifié (early-abort sur min‖b*_k‖²)
-                let mat = build_macaulay_bivariate_m3(&coeffs, &x_big, &p);
-                let reduced = if is_hit {
-                    mat
-                } else {
-                    match lll_reduce_bigint_killcheck(mat, &bound_sq) {
-                        None => {
-                            // KILL certifié : aucune racine dans [A,A+X)×[B,B+X)
+                    if !is_hit {
+                        // #4 PNC Kill-Switch rapide (certifié : zéro faux positif)
+                        let mat = build_macaulay_bivariate_m3(&coeffs, &x_big, &p);
+                        if is_dead_fast(&mat) {
                             tiles_killed.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
-                        Some(r) => r,
                     }
-                };
 
-                // Test final post-LLL (double-check)
-                let min_norm = reduced.iter()
-                    .map(|r| norm_sq_bigint(r))
-                    .filter(|ns| !ns.is_zero())
-                    .min()
-                    .unwrap_or_else(BigInt::zero);
-
-                if !is_hit && &min_norm >= &bound_sq {
-                    tiles_killed.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-
-                // Tile survivante
-                tiles_survived.fetch_add(1, Ordering::Relaxed);
-                if cfg.verbose {
-                    eprintln!("[full-stack] ✓ SURVIVANT a={a_scalar} b={b_scalar} \
-                               norm²≈2^{:.1}  t={:.1}s",
-                        min_norm.bits() as f64,
-                        t0.elapsed().as_secs_f64());
+                    // Tile survivante
+                    tiles_survived.fetch_add(1, Ordering::Relaxed);
+                    if cfg.verbose {
+                        eprintln!("[full-stack] ✓ SURVIVANT a={a_scalar} b={b_scalar}  t={:.1}s",
+                            t0.elapsed().as_secs_f64());
+                    }
                 }
 
                 // #5 6-aut brute scalaire (block_bits ≤ 25)
