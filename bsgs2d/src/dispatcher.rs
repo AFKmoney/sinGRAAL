@@ -30,6 +30,8 @@ use std::time::Instant;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}};
 use rayon::prelude::*;
 
+use std::collections::HashMap;
+
 use crate::secp::{
     Fe, Pt,
     scalar_mul, pt_add, pt_neg, phi_point, phi2_point,
@@ -37,6 +39,8 @@ use crate::secp::{
     G, INF,
     sc_add, sc_mul, sc_sub, sc_neg,
     FIELD_N,
+    canonical_x,
+    PtJ, INFJ, ptj_from_affine, ptj_add_affine, ptj_batch_to_affine,
 };
 use crate::coppersmith::{
     fe_to_bigint, bigint_to_fe,
@@ -896,6 +900,68 @@ fn fe_from_u64(v: u64) -> Fe { [v, 0, 0, 0] }
 #[inline]
 fn fe_from_u64_safe(v: u64) -> Fe { [v, 0, 0, 0] }
 
+// ─── Table bébé BSGS 1D ──────────────────────────────────────────────────────
+//
+// T[canonical_x(δ·G)] = δ   pour δ ∈ [0, 2^block_bits)
+// Construction par lots avec additions Jacobienne + inversion par lot (1 inv/lot).
+// Complexité : O(2^block_bits) additions, 1 seule inversion par lot W.
+fn build_bsgs_baby_table(block_bits: u32) -> HashMap<[u64; 4], u64> {
+    const W: u64 = 1024;
+    let m = 1u64 << block_bits;
+    let mut table = HashMap::with_capacity(m as usize);
+
+    // δ=0 : 0·G = INF — pas de coordonnée x à stocker
+    // On itère δ ∈ [1, m), en traitant par lots de W
+    let step_w = scalar_mul(G, [W, 0, 0, 0]);
+    let mut batch_start: Pt = INF; // (delta_base - 1)·G
+    let mut delta_base: u64 = 1;
+
+    while delta_base < m {
+        let batch_end   = (delta_base + W - 1).min(m - 1);
+        let count       = (batch_end - delta_base + 1) as usize;
+
+        // Remplir le lot en Jacobien depuis batch_start
+        let mut jpts: Vec<PtJ> = Vec::with_capacity(count);
+        let mut cur = ptj_add_affine(ptj_from_affine(batch_start), G);
+        jpts.push(cur);
+        for _ in 1..count {
+            cur = ptj_add_affine(cur, G);
+            jpts.push(cur);
+        }
+
+        // Conversion en affine par lot (1 inversion)
+        let affine = ptj_batch_to_affine(&jpts);
+        for (i, aff) in affine.iter().enumerate() {
+            let delta = delta_base + i as u64;
+            if !aff.inf {
+                let cx = canonical_x(aff.x);
+                table.entry(cx).or_insert(delta);
+            }
+        }
+
+        delta_base += W;
+        batch_start = pt_add(batch_start, step_w);
+    }
+    table
+}
+
+// ─── Récupération de k depuis collision BSGS ─────────────────────────────────
+//
+// Connaissant a_scalar (ancre géante) et δ (baby offset), essayer les
+// 6 automorphismes pour trouver k tel que k·G = target.
+//
+// Cas 1D (b=0): P = (a_scalar + δ)·G  → k_candidate = a_scalar + δ
+// Cas 2D: P = (a_scalar + δ)·G + (b_scalar + ε)·φG (ε non connu ici, non utilisé)
+fn recover_from_bsgs_hit(
+    a_scalar: u64,
+    delta:    u64,
+    target:   Pt,
+    range_bits: u32,
+) -> Option<Fe> {
+    let k_sum = fe_from_u64(a_scalar.wrapping_add(delta));
+    recover_k_6aut_full(k_sum, target, range_bits)
+}
+
 // ─── Test d'autovérification ──────────────────────────────────────────────────
 
 pub fn selftest_dispatcher(range_bits: u32, block_bits: u32) -> bool {
@@ -1285,11 +1351,43 @@ pub fn run_full_stack(cfg: &DispatcherConfig) -> Option<Fe> {
         (&p3 * &p3) / 28i64
     };
 
-    let step      = 1u64 << cfg.block_bits.min(63);
-    let half_bits = cfg.half_bits;
-    let n_blocks  = if half_bits > cfg.block_bits {
-        1u64 << (half_bits - cfg.block_bits).min(30)
+    // ── Cas dégénéré GLV (range_bits ≤ 189) ──────────────────────────────────
+    let glv_degenerate = cfg.range_bits <= 189;
+
+    // ── Dimension optimale BSGS : bsgs_bits = range/2 ────────────────────────
+    // Baby table: M = 2^bsgs_bits entrées  (capped à 26 bits = 64M = ~2GB)
+    // Giant steps: N/M = 2^(range - bsgs_bits) = 2^(range/2) steps
+    // Total: O(2^(range/2)) — optimal pour BSGS 1D.
+    //
+    // Pour puzzle #135 : bsgs_bits=26, giant_steps=2^109 (non résolu en CPU solo,
+    // mais structure correcte pour distribution cloud / CUDA).
+    let bsgs_bits: u32 = (cfg.range_bits / 2).min(26).max(cfg.block_bits);
+    let step = 1u64 << bsgs_bits.min(63);  // pas géant = 2^bsgs_bits
+
+    // ── Table bébé BSGS (construite UNE FOIS, partagée entre threads) ─────────
+    // T[canonical_x(δ·G)] = δ   pour δ ∈ [0, 2^bsgs_bits)
+    // Remplace brute_scalar_block_6aut O(2^(2*block)) → O(2^(range/2)) total.
+    let t_baby = std::time::Instant::now();
+    let baby_table = Arc::new(build_bsgs_baby_table(bsgs_bits));
+    if cfg.verbose {
+        eprintln!("[full-stack] BSGS: bsgs_bits={bsgs_bits}  baby={} entries  {:.2}s",
+            baby_table.len(), t_baby.elapsed().as_secs_f64());
+    }
+
+    let (a_axis_bits, b_axis_bits) = if glv_degenerate {
+        (cfg.range_bits, 0u32)        // axe-a = clé entière, axe-b = {0}
+    } else {
+        (cfg.half_bits, cfg.half_bits) // GLV équilibré : k₁,k₂ ≈ 2^half_bits
+    };
+
+    let half_bits = a_axis_bits;       // pour l'affichage
+    let n_blocks_a = if a_axis_bits > bsgs_bits {
+        1u64 << (a_axis_bits - bsgs_bits).min(30)
     } else { 1u64 };
+    let n_blocks_b = if b_axis_bits > bsgs_bits {
+        1u64 << (b_axis_bits - bsgs_bits).min(30)
+    } else { 1u64 };
+    let n_blocks = n_blocks_a.max(n_blocks_b);
 
     // #6 AnchorTable L2
     let t_build = std::time::Instant::now();
@@ -1322,86 +1420,124 @@ pub fn run_full_stack(cfg: &DispatcherConfig) -> Option<Fe> {
         eprintln!("[full-stack] anchors prêts en {:.2}s", t_build.elapsed().as_secs_f64());
     }
 
-    let anchors = Arc::new(anchors);
+    let anchors    = Arc::new(anchors);
+    let baby_table = Arc::clone(&baby_table);
 
-    // #7 Rayon — boucle externe parallèle sur ia
-    (0u64..n_blocks).into_par_iter().for_each(|ia| {
+    // #7 Rayon — boucle externe parallèle sur ia (axe-a)
+    (0u64..n_blocks_a).into_par_iter().for_each(|ia| {
         if found.load(Ordering::Relaxed) { return; }
 
         let anch     = Arc::clone(&anchors);
+        let btable   = Arc::clone(&baby_table);
         let a_x      = anch.a_bigint(ia, &p);
         let a_scalar = ia.wrapping_mul(step);
 
-        // Blocs de 16 ib pour localité L1 (#6)
+        // ── Point géant Q = target - a_scalar·G ──────────────────────────────
+        // Pour le cas dégénéré (b=0) : P = k·G = (a_scalar + δ)·G
+        // Q = P - a_scalar·G = δ·G  → canonical_x(Q) ∈ baby_table
+        let a_pt = if a_scalar == 0 { INF } else { scalar_mul(G, [a_scalar, 0, 0, 0]) };
+        let giant_q = if a_pt.inf { cfg.target } else { pt_add(cfg.target, pt_neg(a_pt)) };
+
+        // ── BSGS lookup O(1) : chercher canonical_x(Q) dans baby_table ──────
+        if !giant_q.inf {
+            // Essayer les 6 automorphismes sur Q (couvre 6× l'espace k)
+            let auts = build_6aut_targets(cfg.target);
+            // Pour chaque automorphisme α : α(target) - a_scalar·G pourrait être δ·G
+            let aut_targets_pts = [
+                cfg.target,
+                pt_neg(cfg.target),
+                phi_point(cfg.target),
+                pt_neg(phi_point(cfg.target)),
+                phi2_point(cfg.target),
+                pt_neg(phi2_point(cfg.target)),
+            ];
+
+            for (aut_idx, tgt) in aut_targets_pts.iter().enumerate() {
+                if found.load(Ordering::Relaxed) { return; }
+                let q = if a_pt.inf { *tgt } else { pt_add(*tgt, pt_neg(a_pt)) };
+                if q.inf {
+                    // Q = INF → a_scalar·G = α(target) → δ=0, k_candidate = a_scalar
+                    let alpha_invs: [Fe; 6] = [
+                        [1,0,0,0], sc_neg([1,0,0,0]),
+                        LAMBDA2, sc_neg(LAMBDA2),
+                        LAMBDA, sc_neg(LAMBDA),
+                    ];
+                    let k_sum = fe_from_u64(a_scalar);
+                    let k = sc_mul(alpha_invs[aut_idx], k_sum);
+                    if in_range_bsgs(k, cfg.range_bits) {
+                        let check = scalar_mul(G, k);
+                        if check.x == cfg.target.x && check.y == cfg.target.y {
+                            found.store(true, Ordering::Release);
+                            *result.lock().unwrap() = Some(k);
+                            return;
+                        }
+                    }
+                    continue;
+                }
+                let cx = canonical_x(q.x);
+                if let Some(&delta) = btable.get(&cx) {
+                    // Collision! Essayer de récupérer k
+                    // k_sum = a_scalar + delta (dans espace α(target))
+                    // k_true = α⁻¹ · k_sum
+                    let alpha_invs: [Fe; 6] = [
+                        [1,0,0,0], sc_neg([1,0,0,0]),
+                        LAMBDA2, sc_neg(LAMBDA2),
+                        LAMBDA, sc_neg(LAMBDA),
+                    ];
+                    // Essayer les deux signes de delta (canonical_x couvre ±)
+                    for &sign_delta in &[delta, delta.wrapping_neg()] {
+                        let k_sum = fe_from_u64(a_scalar.wrapping_add(sign_delta));
+                        let k = sc_mul(alpha_invs[aut_idx], k_sum);
+                        if in_range_bsgs(k, cfg.range_bits) {
+                            let check = scalar_mul(G, k);
+                            if check.x == cfg.target.x && check.y == cfg.target.y {
+                                found.store(true, Ordering::Release);
+                                *result.lock().unwrap() = Some(k);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Boucle axe-b (cas non-dégénéré, GLV équilibré range > 189) ──────
+        // Pour range_bits > 189, axe-b est non-trivial → balayage + BSGS 2D.
+        // Pour range_bits ≤ 189 (cas dégénéré), n_blocks_b = 1 et b=0 → saut.
         let mut ib = 0u64;
-        while ib < n_blocks {
-            let end = (ib + 16).min(n_blocks);
+        while ib < n_blocks_b {
+            let end = (ib + 16).min(n_blocks_b);
             for jb in ib..end {
                 if found.load(Ordering::Relaxed) { return; }
-                tiles_done.fetch_add(1, Ordering::Relaxed);
-
-                let b_x      = anch.b_bigint(jb, &p);
-                let b_scalar = jb.wrapping_mul(step);
-
-                // #2 Coefficients S₃ bivarié + recherche GLV combo
-                let (_, _, coeffs) = find_glv_coeffs(&a_x, &b_x, &x_p, &p);
-                let is_hit = coeffs[0].is_zero();
-
-                // #4 LLL m=3 kill certifié (early-abort sur min‖b*_k‖²)
-                let mat = build_macaulay_bivariate_m3(&coeffs, &x_big, &p);
-                let reduced = if is_hit {
-                    mat
-                } else {
-                    match lll_reduce_bigint_killcheck(mat, &bound_sq) {
-                        None => {
-                            // KILL certifié : aucune racine dans [A,A+X)×[B,B+X)
-                            tiles_killed.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                        Some(r) => r,
-                    }
-                };
-
-                // Test final post-LLL (double-check)
-                let min_norm = reduced.iter()
-                    .map(|r| norm_sq_bigint(r))
-                    .filter(|ns| !ns.is_zero())
-                    .min()
-                    .unwrap_or_else(BigInt::zero);
-
-                if !is_hit && &min_norm >= &bound_sq {
-                    tiles_killed.fetch_add(1, Ordering::Relaxed);
+                // b=0 en cas dégénéré : déjà traité ci-dessus via BSGS 1D
+                if glv_degenerate && jb == 0 {
+                    tiles_done.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
 
-                // Tile survivante
-                tiles_survived.fetch_add(1, Ordering::Relaxed);
-                if cfg.verbose {
-                    eprintln!("[full-stack] ✓ SURVIVANT a={a_scalar} b={b_scalar} \
-                               norm²≈2^{:.1}  t={:.1}s",
-                        min_norm.bits() as f64,
-                        t0.elapsed().as_secs_f64());
+                tiles_done.fetch_add(1, Ordering::Relaxed);
+                let b_x      = anch.b_bigint(jb, &p);
+                let b_scalar = jb.wrapping_mul(step);
+
+                // PNC Kill-Switch pour les grandes tiles
+                if cfg.block_bits > 14 {
+                    let (_, _, coeffs) = find_glv_coeffs(&a_x, &b_x, &x_p, &p);
+                    let is_hit = coeffs[0].is_zero();
+                    if !is_hit {
+                        let mat = build_macaulay_bivariate_m3(&coeffs, &x_big, &p);
+                        if is_dead_fast(&mat) {
+                            tiles_killed.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    }
+                    tiles_survived.fetch_add(1, Ordering::Relaxed);
                 }
 
-                // #5 6-aut brute scalaire (block_bits ≤ 25)
+                // Fallback brute-force pour les tiles 2D survivantes (non-dégénéré)
                 if cfg.block_bits <= 25 {
                     if let Some(k) = brute_scalar_block_6aut(
                         a_scalar, b_scalar, cfg.block_bits,
                         cfg.target, cfg.range_bits,
-                    ) {
-                        found.store(true, Ordering::Release);
-                        *result.lock().unwrap() = Some(k);
-                        return;
-                    }
-                }
-
-                // Extraction x-coord (block_bits ≤ 18)
-                if cfg.block_bits <= 18 {
-                    let n_loc = p_big();  // reuse nom (n non exporté ici)
-                    let n_order = crate::coppersmith::fe_to_bigint(crate::secp::FIELD_N);
-                    if let Some(k) = extract_and_verify(
-                        a_scalar, b_scalar, cfg.block_bits,
-                        &a_x, &b_x, &x_p, cfg.target, cfg.range_bits, &p, &n_order,
                     ) {
                         found.store(true, Ordering::Release);
                         *result.lock().unwrap() = Some(k);
@@ -1417,7 +1553,7 @@ pub fn run_full_stack(cfg: &DispatcherConfig) -> Option<Fe> {
             let done   = tiles_done.load(Ordering::Relaxed);
             let killed = tiles_killed.load(Ordering::Relaxed);
             let surv   = tiles_survived.load(Ordering::Relaxed);
-            let total  = n_blocks.saturating_mul(n_blocks);
+            let total  = n_blocks_a;
             eprintln!("[full-stack] {:.2}%  kill={:.4}%  surv={}  t={:.1}s",
                 done as f64 / total.max(1) as f64 * 100.0,
                 killed as f64 / done.max(1) as f64 * 100.0,
